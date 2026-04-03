@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	minSizeForEmptyRebuild  = 512
+	minSizeForEmptyRebuild  = 100
 	shrinkAbsoluteThreshold = 10240
 	shrinkRatioThreshold    = 0.65
 	migrationBatchSize      = 4096

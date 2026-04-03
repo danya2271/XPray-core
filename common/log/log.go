@@ -29,9 +29,6 @@ func (m *GeneralMessage) String() string {
 
 // Record writes a message into log stream.
 func Record(msg Message) {
-	if h := logHandler.Load(); h != nil {
-		(*h).Handle(msg)
-	}
 }
 
 type SeverityLogger interface {
