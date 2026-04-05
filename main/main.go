@@ -4,6 +4,9 @@ import (
 	"flag"
 	"os"
 
+	// "net/http"
+	// _ "net/http/pprof"
+
 	"github.com/xtls/xray-core/main/commands/base"
 	_ "github.com/xtls/xray-core/main/distro/all"
 )
@@ -19,6 +22,11 @@ func main() {
 		},
 		base.RootCommand.Commands...,
 	)
+	// if port := os.Getenv("XRAY_PPROF_PORT"); port != "" {
+	// 	go func() {
+	// 		http.ListenAndServe("127.0.0.1:" + port, nil)
+	// 	}()
+	// }
 	base.Execute()
 }
 
