@@ -3,11 +3,11 @@ package splithttp
 import (
 	"bytes"
 	"encoding/base64"
-	"fmt"
 	"io"
 	mathrand "math/rand"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/xtls/xray-core/common"
@@ -72,7 +72,7 @@ func (c *Config) GetRequestHeaderWithPayload(payload []byte) http.Header {
 		chunkSize := min(int(c.GetNormalizedUplinkChunkSize().rand()), len(encodedData))
 		chunk := encodedData[:chunkSize]
 		encodedData = encodedData[chunkSize:]
-		headerKey := fmt.Sprintf("%s-%d", key, i)
+		headerKey := key + "-" + strconv.Itoa(i)
 		header.Set(headerKey, chunk)
 	}
 
@@ -89,7 +89,7 @@ func (c *Config) GetRequestCookiesWithPayload(payload []byte) []*http.Cookie {
 		chunkSize := min(int(c.GetNormalizedUplinkChunkSize().rand()), len(encodedData))
 		chunk := encodedData[:chunkSize]
 		encodedData = encodedData[chunkSize:]
-		cookieName := fmt.Sprintf("%s_%d", key, i)
+		cookieName := key + "_" + strconv.Itoa(i)
 		cookies = append(cookies, &http.Cookie{Name: cookieName, Value: chunk})
 	}
 
