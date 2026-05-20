@@ -284,7 +284,16 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		case PlacementBody:
 			payload = bodyPayload
 		case PlacementAuto:
-			payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
+			switch {
+			case len(headerPayload) > 0 && len(cookiePayload) == 0 && len(bodyPayload) == 0:
+				payload = headerPayload
+			case len(headerPayload) == 0 && len(cookiePayload) > 0 && len(bodyPayload) == 0:
+				payload = cookiePayload
+			case len(headerPayload) == 0 && len(cookiePayload) == 0:
+				payload = bodyPayload
+			default:
+				payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
+			}
 		}
 
 		if len(payload) > scMaxEachPostBytes {

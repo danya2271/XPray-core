@@ -288,6 +288,18 @@ func createHTTPClient(dest net.Destination, streamSettings *internet.MemoryStrea
 
 func init() {
 	common.Must(internet.RegisterTransportDialer(protocolName, Dial))
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		for range ticker.C {
+			globalDialerAccess.Lock()
+			for key, manager := range globalDialerMap {
+				if !manager.HasActiveClients() {
+					delete(globalDialerMap, key)
+				}
+			}
+			globalDialerAccess.Unlock()
+		}
+	}()
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
