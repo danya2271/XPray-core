@@ -593,13 +593,13 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 	buffer := buf.MultiBufferContainer{}
 	common.Must2(buffer.Write(b))
 
-	var writed int
-	for _, buff := range buffer.MultiBuffer {
-		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
-		if err != nil {
-			return writed, err
-		}
-		writed += int(buff.Len())
+	mb := buffer.MultiBuffer
+	buffer.MultiBuffer = nil
+
+	err := w.WriteMultiBuffer(mb)
+	if err != nil {
+		buf.ReleaseMulti(mb)
+		return 0, err
 	}
-	return writed, nil
+	return len(b), nil
 }
