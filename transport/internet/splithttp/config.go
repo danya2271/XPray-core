@@ -5,13 +5,13 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	mathrand "math/rand"
 	"math/rand/v2"
 	"net/http"
 	"strings"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
-	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/utils"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/transport/internet"
@@ -510,7 +510,13 @@ func (c *RangeConfig) rand() int32 {
 	if c == nil {
 		return 0
 	}
-	return int32(crypto.RandBetween(int64(c.From), int64(c.To)))
+	if c.From == c.To {
+		return c.From
+	}
+	if c.From > c.To {
+		return c.From
+	}
+	return c.From + mathrand.Int31n(c.To-c.From+1)
 }
 
 // predefined
