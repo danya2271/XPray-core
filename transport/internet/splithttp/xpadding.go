@@ -37,6 +37,8 @@ type XPaddingConfig struct {
 	Method    PaddingMethod
 }
 
+var paddingRepeatX = strings.Repeat("X", 16384)
+
 func randStringFromCharset(n int, charset string) (string, bool) {
 	if n <= 0 || len(charset) == 0 {
 		return "", false
@@ -133,14 +135,23 @@ func GeneratePadding(method PaddingMethod, length int) string {
 
 	switch method {
 	case PaddingMethodRepeatX:
+		if length <= len(paddingRepeatX) {
+			return paddingRepeatX[:length]
+		}
 		return strings.Repeat("X", length)
 	case PaddingMethodTokenish:
 		paddingValue := GenerateTokenishPaddingBase62(length)
 		if paddingValue == "" {
+			if length <= len(paddingRepeatX) {
+				return paddingRepeatX[:length]
+			}
 			return strings.Repeat("X", length)
 		}
 		return paddingValue
 	default:
+		if length <= len(paddingRepeatX) {
+			return paddingRepeatX[:length]
+		}
 		return strings.Repeat("X", length)
 	}
 }
