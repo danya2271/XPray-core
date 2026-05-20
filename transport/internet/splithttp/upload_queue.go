@@ -19,13 +19,13 @@ type Packet struct {
 }
 
 type uploadQueue struct {
-	reader        atomic.Pointer[httpServerConn]
-	pushedPackets chan Packet
-	heap          uploadHeap
-	nextSeq       uint64
-	maxPackets    int
-	closed        *done.Instance
-	pendingPayload  []byte
+	reader         atomic.Pointer[httpServerConn]
+	pushedPackets  chan Packet
+	heap           uploadHeap
+	nextSeq        uint64
+	maxPackets     int
+	closed         *done.Instance
+	pendingPayload []byte
 }
 
 func NewUploadQueue(maxPackets int) *uploadQueue {
