@@ -2,14 +2,38 @@ package internet
 
 import (
 	"context"
+	"encoding/binary"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/sys/unix"
 )
+
+func setTcpBrutal(fd uintptr, rate uint64, cwndGain uint32) error {
+	// Create a packed 12-byte buffer
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint64(buf[0:8], rate)
+	binary.LittleEndian.PutUint32(buf[8:12], cwndGain)
+
+	// Call setsockopt with the packed binary buffer
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_SETSOCKOPT,
+		fd,
+		syscall.SOL_TCP,                  // Level 6 (IPPROTO_TCP)
+		23301,                            // Opt: TCP_BRUTAL_PARAMS
+		uintptr(unsafe.Pointer(&buf[0])), // Pointer to the 12-byte buffer
+		12,                               // Buffer length
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
 
 // applyOutboundSocketOptions applies socket options for outbound connection.
 // note that unlike other part of Xray, this function needs network with speified network stack(tcp4/tcp6/udp4/udp6)
@@ -77,6 +101,22 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 				continue
 			}
 			level := 0x6 // default TCP
+			if custom.Type == "brutal" {
+				// Expects format "rate,cwnd_gain" e.g., "2000000,15"
+				parts := strings.Split(custom.Value, ",")
+				if len(parts) != 2 {
+					return errors.New("invalid brutal parameter format, expected 'rate,cwnd_gain'")
+				}
+				rate, err1 := strconv.ParseUint(parts[0], 10, 64)
+				cwndGain, err2 := strconv.ParseUint(parts[1], 10, 32)
+				if err1 != nil || err2 != nil {
+					return errors.New("failed to parse brutal rate or cwnd_gain").Base(err1)
+				}
+				if err := setTcpBrutal(fd, rate, uint32(cwndGain)); err != nil {
+					return errors.New("failed to set TCP_BRUTAL_PARAMS").Base(err)
+				}
+				continue // Handled, proceed to next custom option
+			}
 			var opt int
 			if len(custom.Opt) == 0 {
 				return errors.New("No opt!")
@@ -182,7 +222,27 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 				if !strings.HasPrefix(network, custom.Network) {
 					continue
 				}
+<<<<<<< HEAD
 				level := 0x6 // default TCP
+=======
+				if custom.Type == "brutal" {
+					// Expects format "rate,cwnd_gain" e.g., "2000000,15"
+					parts := strings.Split(custom.Value, ",")
+					if len(parts) != 2 {
+						return errors.New("invalid brutal parameter format, expected 'rate,cwnd_gain'")
+					}
+					rate, err1 := strconv.ParseUint(parts[0], 10, 64)
+					cwndGain, err2 := strconv.ParseUint(parts[1], 10, 32)
+					if err1 != nil || err2 != nil {
+						return errors.New("failed to parse brutal rate or cwnd_gain").Base(err1)
+					}
+					if err := setTcpBrutal(fd, rate, uint32(cwndGain)); err != nil {
+						return errors.New("failed to set TCP_BRUTAL_PARAMS").Base(err)
+					}
+					continue // Handled, proceed to next custom option
+				}
+				var level = 0x6 // default TCP
+>>>>>>> d544a4bf (sockopt-linux: Add support for configuring tcp-brutal parameters)
 				var opt int
 				if len(custom.Opt) == 0 {
 					return errors.New("No opt!")
