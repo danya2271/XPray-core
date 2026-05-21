@@ -2,14 +2,36 @@ package internet
 
 import (
 	"context"
+	"encoding/binary"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/sys/unix"
 )
+
+func setTcpBrutal(fd uintptr, rate uint64, cwndGain uint32) error {
+	buf := make([]byte, 12)
+	binary.LittleEndian.PutUint64(buf[0:8], rate)
+	binary.LittleEndian.PutUint32(buf[8:12], cwndGain)
+
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_SETSOCKOPT,
+		fd,
+		syscall.SOL_TCP,
+		23301,
+		uintptr(unsafe.Pointer(&buf[0])),
+		12,
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
 
 // applyOutboundSocketOptions applies socket options for outbound connection.
 // note that unlike other part of Xray, this function needs network with speified network stack(tcp4/tcp6/udp4/udp6)
@@ -77,6 +99,21 @@ func applyOutboundSocketOptions(network string, address string, fd uintptr, conf
 				continue
 			}
 			level := 0x6 // default TCP
+			if custom.Type == "brutal" {
+				parts := strings.Split(custom.Value, ",")
+				if len(parts) != 2 {
+					return errors.New("invalid brutal parameter format, expected 'rate,cwnd_gain'")
+				}
+				rate, err1 := strconv.ParseUint(parts[0], 10, 64)
+				cwndGain, err2 := strconv.ParseUint(parts[1], 10, 32)
+				if err1 != nil || err2 != nil {
+					return errors.New("failed to parse brutal rate or cwnd_gain").Base(err1)
+				}
+				if err := setTcpBrutal(fd, rate, uint32(cwndGain)); err != nil {
+					return errors.New("failed to set TCP_BRUTAL_PARAMS").Base(err)
+				}
+				continue
+			}
 			var opt int
 			if len(custom.Opt) == 0 {
 				return errors.New("No opt!")
@@ -185,6 +222,21 @@ func applyInboundSocketOptions(network string, fd uintptr, config *SocketConfig)
 				continue
 			}
 			level := 0x6 // default TCP
+				if custom.Type == "brutal" {
+					parts := strings.Split(custom.Value, ",")
+					if len(parts) != 2 {
+						return errors.New("invalid brutal parameter format, expected 'rate,cwnd_gain'")
+					}
+					rate, err1 := strconv.ParseUint(parts[0], 10, 64)
+					cwndGain, err2 := strconv.ParseUint(parts[1], 10, 32)
+					if err1 != nil || err2 != nil {
+						return errors.New("failed to parse brutal rate or cwnd_gain").Base(err1)
+					}
+					if err := setTcpBrutal(fd, rate, uint32(cwndGain)); err != nil {
+						return errors.New("failed to set TCP_BRUTAL_PARAMS").Base(err)
+					}
+					continue
+				}
 			var opt int
 			if len(custom.Opt) == 0 {
 				return errors.New("No opt!")
