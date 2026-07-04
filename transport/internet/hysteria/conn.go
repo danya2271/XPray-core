@@ -15,6 +15,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
+const maxStackFramePayload = 1024
+
 type interConn struct {
 	stream *quic.Stream
 	local  net.Addr
@@ -35,7 +37,22 @@ func (c *interConn) Read(b []byte) (int, error) {
 func (c *interConn) Write(b []byte) (int, error) {
 	if c.client {
 		c.client = false
-		if _, err := c.stream.Write(append(quicvarint.Append(nil, FrameTypeTCPRequest), b...)); err != nil {
+		var header [8]byte
+		frameHeader := quicvarint.Append(header[:0], FrameTypeTCPRequest)
+		if len(b) <= maxStackFramePayload {
+			var framed [maxStackFramePayload + 8]byte
+			n := copy(framed[:], frameHeader)
+			copy(framed[n:], b)
+			if _, err := c.stream.Write(framed[:n+len(b)]); err != nil {
+				return 0, err
+			}
+			return len(b), nil
+		}
+
+		if _, err := c.stream.Write(frameHeader); err != nil {
+			return 0, err
+		}
+		if _, err := c.stream.Write(b); err != nil {
 			return 0, err
 		}
 		return len(b), nil
