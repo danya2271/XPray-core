@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -90,11 +91,10 @@ type InterConn struct {
 	local  net.Addr
 	remote net.Addr
 
-	id     uint32
-	ch     chan []byte
-	time   time.Time
-	mutex  sync.Mutex
-	closed bool
+	id       uint32
+	ch       chan []byte
+	lastSeen atomic.Int64
+	closed   atomic.Bool
 
 	write func(p []byte) error
 	close func()
@@ -106,16 +106,11 @@ func (i *InterConn) User() *protocol.MemoryUser {
 }
 
 func (c *InterConn) Time() time.Time {
-	c.mutex.Lock()
-	v := c.time
-	c.mutex.Unlock()
-	return v
+	return time.Unix(0, c.lastSeen.Load())
 }
 
 func (c *InterConn) Update() {
-	c.mutex.Lock()
-	c.time = time.Now()
-	c.mutex.Unlock()
+	c.lastSeen.Store(time.Now().UnixNano())
 }
 
 func (c *InterConn) Read(p []byte) (int, error) {
@@ -131,7 +126,7 @@ func (c *InterConn) Read(p []byte) (int, error) {
 }
 
 func (c *InterConn) Write(p []byte) (int, error) {
-	if c.closed {
+	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
 	binary.BigEndian.PutUint32(p, c.id)
@@ -181,8 +176,7 @@ type udpSessionManager struct {
 }
 
 func (m *udpSessionManager) close(udpConn *InterConn) {
-	if !udpConn.closed {
-		udpConn.closed = true
+	if !udpConn.closed.Swap(true) {
 		close(udpConn.ch)
 		delete(m.m, udpConn.id)
 	}
@@ -255,6 +249,7 @@ func (m *udpSessionManager) udp() (*InterConn, error) {
 		id: m.next,
 		ch: make(chan []byte, udpMessageChanSize),
 	}
+	udpConn.Update()
 	udpConn.write = m.conn.SendDatagram
 	udpConn.close = func() {
 		m.Lock()
@@ -293,10 +288,10 @@ func (m *udpSessionManager) feed(id uint32, d []byte) {
 			local:  m.conn.LocalAddr(),
 			remote: m.conn.RemoteAddr(),
 
-			id:   id,
-			ch:   make(chan []byte, udpMessageChanSize),
-			time: time.Now(),
+			id: id,
+			ch: make(chan []byte, udpMessageChanSize),
 		}
+		udpConn.Update()
 		udpConn.write = m.conn.SendDatagram
 		udpConn.close = func() {
 			m.Lock()
