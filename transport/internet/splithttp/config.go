@@ -329,7 +329,7 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 
 	if dataPlacement == PlacementBody || dataPlacement == PlacementAuto {
 		request.Header = c.GetRequestHeader()
-		request.Body = io.NopCloser(&buf.MultiBufferContainer{MultiBuffer: payload})
+		request.Body = newMultiBufferBody(payload)
 		request.ContentLength = int64(payload.Len())
 	} else {
 		data := make([]byte, payload.Len())
@@ -346,6 +346,12 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 		}
 	}
 
+	c.applyPacketRequestControls(request, sessionId, seqStr)
+
+	return nil
+}
+
+func (c *Config) applyPacketRequestControls(request *http.Request, sessionId string, seqStr string) {
 	length := int(c.GetNormalizedXPaddingBytes().rand())
 	config := XPaddingConfig{Length: length}
 
@@ -368,8 +374,20 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 
 	c.ApplyXPaddingToRequest(request, config)
 	c.ApplyMetaToRequest(request, sessionId, seqStr)
+}
 
-	return nil
+type multiBufferBody struct {
+	buf.MultiBufferContainer
+}
+
+func newMultiBufferBody(payload buf.MultiBuffer) io.ReadCloser {
+	return &multiBufferBody{
+		MultiBufferContainer: buf.MultiBufferContainer{MultiBuffer: payload},
+	}
+}
+
+func (b *multiBufferBody) Close() error {
+	return b.MultiBufferContainer.Close()
 }
 
 func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (sessionId string, seqStr string) {
