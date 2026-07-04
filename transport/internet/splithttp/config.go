@@ -331,18 +331,14 @@ func (c *Config) FillStreamRequest(request *http.Request, sessionId string, seqS
 func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqStr string, payload buf.MultiBuffer) error {
 	dataPlacement := c.GetNormalizedUplinkDataPlacement()
 
-	data := make([]byte, payload.Len())
-	payload.Copy(data)
-	buf.ReleaseMulti(payload)
-
 	if dataPlacement == PlacementBody || dataPlacement == PlacementAuto {
 		request.Header = c.GetRequestHeader()
-		request.Body = io.NopCloser(bytes.NewReader(data))
-		request.ContentLength = int64(len(data))
-		request.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(data)), nil
-		}
+		request.Body = newMultiBufferBody(payload)
+		request.ContentLength = int64(payload.Len())
 	} else {
+		data := make([]byte, payload.Len())
+		payload.Copy(data)
+		buf.ReleaseMulti(payload)
 		switch dataPlacement {
 		case PlacementHeader:
 			request.Header = c.GetRequestHeaderWithPayload(data)
@@ -354,6 +350,12 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 		}
 	}
 
+	c.applyPacketRequestControls(request, sessionId, seqStr)
+
+	return nil
+}
+
+func (c *Config) applyPacketRequestControls(request *http.Request, sessionId string, seqStr string) {
 	length := int(c.GetNormalizedXPaddingBytes().rand())
 	config := XPaddingConfig{Length: length}
 
@@ -376,8 +378,20 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 
 	c.ApplyXPaddingToRequest(request, config)
 	c.ApplyMetaToRequest(request, sessionId, seqStr)
+}
 
-	return nil
+type multiBufferBody struct {
+	buf.MultiBufferContainer
+}
+
+func newMultiBufferBody(payload buf.MultiBuffer) io.ReadCloser {
+	return &multiBufferBody{
+		MultiBufferContainer: buf.MultiBufferContainer{MultiBuffer: payload},
+	}
+}
+
+func (b *multiBufferBody) Close() error {
+	return b.MultiBufferContainer.Close()
 }
 
 func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (sessionId string, seqStr string) {
