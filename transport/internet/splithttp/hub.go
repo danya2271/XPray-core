@@ -5,7 +5,6 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"net/http"
 	"runtime"
@@ -246,15 +245,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		dataPlacement := h.config.GetNormalizedUplinkDataPlacement()
 		var headerPayload []byte
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
-			var headerPayloadChunks []string
-			for i := 0; true; i++ {
-				chunk := request.Header.Get(fmt.Sprintf("%s-%d", uplinkDataKey, i))
-				if chunk == "" {
-					break
-				}
-				headerPayloadChunks = append(headerPayloadChunks, chunk)
-			}
-			headerPayloadEncoded := strings.Join(headerPayloadChunks, "")
+			headerPayloadEncoded := collectIndexedHeaderValues(request.Header, uplinkDataKey+"-")
 			headerPayload, err = base64.RawURLEncoding.DecodeString(headerPayloadEncoded)
 			if err != nil {
 				errors.LogInfo(context.Background(), "Invalid base64 in header's payload: ", err.Error())
@@ -265,16 +256,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		var cookiePayload []byte
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementCookie {
-			var cookiePayloadChunks []string
-			for i := 0; true; i++ {
-				cookieName := fmt.Sprintf("%s_%d", uplinkDataKey, i)
-				if c, _ := request.Cookie(cookieName); c != nil {
-					cookiePayloadChunks = append(cookiePayloadChunks, c.Value)
-				} else {
-					break
-				}
-			}
-			cookiePayloadEncoded := strings.Join(cookiePayloadChunks, "")
+			cookiePayloadEncoded := collectIndexedCookieValues(request, uplinkDataKey+"_")
 			cookiePayload, err = base64.RawURLEncoding.DecodeString(cookiePayloadEncoded)
 			if err != nil {
 				errors.LogInfo(context.Background(), "Invalid base64 in cookies' payload: ", err.Error())
@@ -396,6 +378,73 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		errors.LogInfo(context.Background(), "unsupported method: ", request.Method)
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func collectIndexedHeaderValues(header http.Header, prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	var chunks []string
+	for key, values := range header {
+		if len(values) == 0 || len(key) <= len(prefix) || !strings.EqualFold(key[:len(prefix)], prefix) {
+			continue
+		}
+		index, err := strconv.Atoi(key[len(prefix):])
+		if err != nil || index < 0 {
+			continue
+		}
+		chunks = ensureIndexedChunk(chunks, index)
+		chunks[index] = values[0]
+	}
+	return joinIndexedChunks(chunks)
+}
+
+func collectIndexedCookieValues(request *http.Request, prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	var chunks []string
+	for _, cookie := range request.Cookies() {
+		if len(cookie.Name) <= len(prefix) || !strings.HasPrefix(cookie.Name, prefix) {
+			continue
+		}
+		index, err := strconv.Atoi(cookie.Name[len(prefix):])
+		if err != nil || index < 0 {
+			continue
+		}
+		chunks = ensureIndexedChunk(chunks, index)
+		chunks[index] = cookie.Value
+	}
+	return joinIndexedChunks(chunks)
+}
+
+func ensureIndexedChunk(chunks []string, index int) []string {
+	if index < len(chunks) {
+		return chunks
+	}
+	return append(chunks, make([]string, index-len(chunks)+1)...)
+}
+
+func joinIndexedChunks(chunks []string) string {
+	if len(chunks) == 0 || chunks[0] == "" {
+		return ""
+	}
+	total := 0
+	for _, chunk := range chunks {
+		if chunk == "" {
+			break
+		}
+		total += len(chunk)
+	}
+	var builder strings.Builder
+	builder.Grow(total)
+	for _, chunk := range chunks {
+		if chunk == "" {
+			break
+		}
+		builder.WriteString(chunk)
+	}
+	return builder.String()
 }
 
 type httpServerConn struct {
