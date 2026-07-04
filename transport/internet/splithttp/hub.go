@@ -44,11 +44,7 @@ type requestHandler struct {
 
 type httpSession struct {
 	uploadQueue *uploadQueue
-	// for as long as the GET request is not opened by the client, this will be
-	// open ("undone"), and the session may be expired within a certain TTL.
-	// after the client connects, this becomes "done" and the session lives as
-	// long as the GET request.
-	isFullyConnected *done.Instance
+	reapTimer   *time.Timer
 }
 
 func (h *requestHandler) upsertSession(sessionId string) *httpSession {
@@ -68,25 +64,14 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 	}
 
 	s := &httpSession{
-		uploadQueue:      NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
-		isFullyConnected: done.New(),
+		uploadQueue: NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 	}
 
 	h.sessions.Store(sessionId, s)
-
-	shouldReap := done.New()
-	go func() {
-		time.Sleep(30 * time.Second)
-		shouldReap.Close()
-	}()
-	go func() {
-		select {
-		case <-shouldReap.Wait():
-			h.sessions.Delete(sessionId)
-			s.uploadQueue.Close()
-		case <-s.isFullyConnected.Wait():
-		}
-	}()
+	s.reapTimer = time.AfterFunc(30*time.Second, func() {
+		h.sessions.Delete(sessionId)
+		s.uploadQueue.Close()
+	})
 
 	return s
 }
@@ -331,7 +316,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
-			currentSession.isFullyConnected.Close()
+			currentSession.reapTimer.Stop()
 			defer h.sessions.Delete(sessionId)
 		}
 
