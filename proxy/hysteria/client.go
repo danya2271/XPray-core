@@ -236,16 +236,23 @@ type UDPReader struct {
 
 func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error) {
 	for {
-		var buf [hysteria.MaxDatagramFrameSize]byte
+		readBuf := p
+		if len(readBuf) < hysteria.MaxDatagramFrameSize {
+			var scratch [hysteria.MaxDatagramFrameSize]byte
+			readBuf = scratch[:]
+		}
 
-		n, err := r.reader.Read(buf[:])
+		n, err := r.reader.Read(readBuf)
 		if err != nil {
 			return 0, nil, err
 		}
 
-		msg, err := ParseUDPMessage(buf[:n])
+		msg, err := ParseUDPMessage(readBuf[:n])
 		if err != nil {
 			continue
+		}
+		if msg.FragCount > 1 {
+			msg.Data = append([]byte(nil), msg.Data...)
 		}
 
 		dfMsg := r.df.Feed(msg)
