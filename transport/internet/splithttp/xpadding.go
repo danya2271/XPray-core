@@ -50,9 +50,9 @@ func randStringFromCharset(n int, charset string) (string, bool) {
 	result := make([]byte, n)
 	i := 0
 
-	buf := make([]byte, 256)
+	var buf [256]byte
 	for i < n {
-		if _, err := rand.Read(buf); err != nil {
+		if _, err := rand.Read(buf[:]); err != nil {
 			return "", false
 		}
 		for _, rb := range buf {
