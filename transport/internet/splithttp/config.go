@@ -354,6 +354,12 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 		}
 	}
 
+	c.applyPacketRequestControls(request, sessionId, seqStr)
+
+	return nil
+}
+
+func (c *Config) applyPacketRequestControls(request *http.Request, sessionId string, seqStr string) {
 	length := int(c.GetNormalizedXPaddingBytes().rand())
 	config := XPaddingConfig{Length: length}
 
@@ -376,8 +382,20 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 
 	c.ApplyXPaddingToRequest(request, config)
 	c.ApplyMetaToRequest(request, sessionId, seqStr)
+}
 
-	return nil
+type multiBufferBody struct {
+	buf.MultiBufferContainer
+}
+
+func newMultiBufferBody(payload buf.MultiBuffer) io.ReadCloser {
+	return &multiBufferBody{
+		MultiBufferContainer: buf.MultiBufferContainer{MultiBuffer: payload},
+	}
+}
+
+func (b *multiBufferBody) Close() error {
+	return b.MultiBufferContainer.Close()
 }
 
 func (c *Config) ExtractMetaFromRequest(req *http.Request, path string) (sessionId string, seqStr string) {
