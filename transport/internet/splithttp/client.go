@@ -1,7 +1,6 @@
 package splithttp
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -101,14 +100,16 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
 	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, nil)
 	if err != nil {
+		buf.ReleaseMulti(payload)
 		return err
 	}
-	c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
 
 	if c.httpVersion != "1.1" {
+		c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
 		resp, err := c.client.Do(req)
 		if err != nil {
 			c.closed = true
+			common.Close(req.Body)
 			return err
 		}
 
@@ -119,13 +120,10 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 			return errors.New("bad status code:", resp.Status)
 		}
 	} else {
-		// stringify the entire HTTP/1.1 request so it can be
-		// safely retried. if instead req.Write is called multiple
-		// times, the body is already drained after the first
-		// request
-		requestBuff := new(bytes.Buffer)
-		requestBuff.Grow(512 + int(req.ContentLength))
-		common.Must(req.Write(requestBuff))
+		replayBody := c.prepareHTTP1PacketRequest(req, sessionId, seqStr, payload)
+		if replayBody {
+			defer buf.ReleaseMulti(payload)
+		}
 
 		var uploadConn any
 		var h1UploadConn *H1Conn
@@ -149,31 +147,88 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
 						c.closed = true
+						h1UploadConn.Close()
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)
-					defer resp.Body.Close()
+					resp.Body.Close()
+					h1UploadConn.UnreadedResponsesCount--
 					if resp.StatusCode != 200 {
+						h1UploadConn.Close()
 						return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
 					}
 				}
 			}
 
-			_, err := h1UploadConn.Write(requestBuff.Bytes())
+			if replayBody {
+				req.Body = &replayMultiBufferBody{payload: payload}
+			}
+			err := req.Write(h1UploadConn)
+			req.Body = nil
 			// if the write failed, we try another connection from
 			// the pool, until the write on a new connection fails.
 			// failed writes to a pooled connection are normal when
 			// the connection has been closed in the meantime.
 			if err == nil {
+				h1UploadConn.UnreadedResponsesCount++
 				break
 			} else if newConnection {
 				return err
+			} else {
+				h1UploadConn.Close()
 			}
 		}
 
 		c.uploadRawPool.Put(uploadConn)
 	}
 
+	return nil
+}
+
+func (c *DefaultDialerClient) prepareHTTP1PacketRequest(req *http.Request, sessionId string, seqStr string, payload buf.MultiBuffer) bool {
+	dataPlacement := c.transportConfig.GetNormalizedUplinkDataPlacement()
+	if dataPlacement != PlacementBody && dataPlacement != PlacementAuto {
+		c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
+		return false
+	}
+
+	req.Header = c.transportConfig.GetRequestHeader()
+	req.ContentLength = int64(payload.Len())
+	c.transportConfig.applyPacketRequestControls(req, sessionId, seqStr)
+	return true
+}
+
+type replayMultiBufferBody struct {
+	payload buf.MultiBuffer
+	index   int
+	offset  int32
+}
+
+func (b *replayMultiBufferBody) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for b.index < len(b.payload) {
+		buffer := b.payload[b.index]
+		if buffer == nil {
+			b.index++
+			b.offset = 0
+			continue
+		}
+		data := buffer.BytesFrom(b.offset)
+		if len(data) == 0 {
+			b.index++
+			b.offset = 0
+			continue
+		}
+		n := copy(p, data)
+		b.offset += int32(n)
+		return n, nil
+	}
+	return 0, io.EOF
+}
+
+func (b *replayMultiBufferBody) Close() error {
 	return nil
 }
 
