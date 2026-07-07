@@ -12,7 +12,17 @@ import (
 
 type weightScaler func(value, weight float64) float64
 
-var numberFinder = regexp.MustCompile(`\d+(\.\d+)?`)
+var numberFinder struct {
+	sync.Once
+	expr *regexp.Regexp
+}
+
+func getNumberFinder() *regexp.Regexp {
+	numberFinder.Do(func() {
+		numberFinder.expr = regexp.MustCompile(`\d+(\.\d+)?`)
+	})
+	return numberFinder.expr
+}
 
 // NewWeightManager creates a new WeightManager with settings
 func NewWeightManager(s []*StrategyWeight, defaultWeight float64, scaler weightScaler) *WeightManager {
@@ -61,7 +71,7 @@ func (s *WeightManager) findValue(tag string) float64 {
 			return float64(w.Value)
 		}
 		// auto weight from matched
-		numStr := numberFinder.FindString(matched)
+		numStr := getNumberFinder().FindString(matched)
 		if numStr == "" {
 			return s.defaultWeight
 		}
