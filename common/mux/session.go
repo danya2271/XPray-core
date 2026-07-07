@@ -189,6 +189,7 @@ func (s *Session) Close(locked bool) error {
 		runtime.Gosched()
 		// If the error set by ReturnAnError still exists, clear it.
 		s.input.(*pipe.Reader).Recover()
+		startXUDPManager()
 		XUDPManager.Lock()
 		if s.XUDP.Status == Active {
 			s.XUDP.Expire = time.Now().Add(time.Minute)
@@ -229,24 +230,27 @@ func (x *XUDP) Interrupt() {
 
 var XUDPManager struct {
 	sync.Mutex
-	Map map[[8]byte]*XUDP
+	startOnce sync.Once
+	Map       map[[8]byte]*XUDP
 }
 
-func init() {
-	XUDPManager.Map = make(map[[8]byte]*XUDP)
-	go func() {
-		for {
-			time.Sleep(time.Minute)
-			now := time.Now()
-			XUDPManager.Lock()
-			for id, x := range XUDPManager.Map {
-				if x.Status == Expiring && now.After(x.Expire) {
-					x.Interrupt()
-					delete(XUDPManager.Map, id)
-					errors.LogDebug(context.Background(), "XUDP del ", id)
+func startXUDPManager() {
+	XUDPManager.startOnce.Do(func() {
+		XUDPManager.Map = make(map[[8]byte]*XUDP)
+		go func() {
+			for {
+				time.Sleep(time.Minute)
+				now := time.Now()
+				XUDPManager.Lock()
+				for id, x := range XUDPManager.Map {
+					if x.Status == Expiring && now.After(x.Expire) {
+						x.Interrupt()
+						delete(XUDPManager.Map, id)
+						errors.LogDebug(context.Background(), "XUDP del ", id)
+					}
 				}
+				XUDPManager.Unlock()
 			}
-			XUDPManager.Unlock()
-		}
-	}()
+		}()
+	})
 }
