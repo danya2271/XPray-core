@@ -207,13 +207,23 @@ type MaskedMsgWrapper struct {
 	Mask6 int
 }
 
-var (
-	ipv4Regex = regexp.MustCompile(`(\d{1,3}\.){3}\d{1,3}`)
-	ipv6Regex = regexp.MustCompile(`(?:[\da-fA-F]{0,4}:[\da-fA-F]{0,4}){2,7}`)
-)
+var maskRegex struct {
+	sync.Once
+	ipv4 *regexp.Regexp
+	ipv6 *regexp.Regexp
+}
+
+func getMaskRegex() (*regexp.Regexp, *regexp.Regexp) {
+	maskRegex.Do(func() {
+		maskRegex.ipv4 = regexp.MustCompile(`(\d{1,3}\.){3}\d{1,3}`)
+		maskRegex.ipv6 = regexp.MustCompile(`(?:[\da-fA-F]{0,4}:[\da-fA-F]{0,4}){2,7}`)
+	})
+	return maskRegex.ipv4, maskRegex.ipv6
+}
 
 func (m *MaskedMsgWrapper) String() string {
 	str := m.Message.String()
+	ipv4Regex, ipv6Regex := getMaskRegex()
 
 	// Process ipv4
 	maskedMsg := ipv4Regex.ReplaceAllStringFunc(str, func(s string) string {
