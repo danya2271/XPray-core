@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/platform"
@@ -21,10 +22,11 @@ type Writer interface {
 type WriterCreator func() Writer
 
 type generalLogger struct {
-	creator WriterCreator
-	buffer  chan Message
-	access  *semaphore.Instance
-	done    *done.Instance
+	creator  WriterCreator
+	initOnce sync.Once
+	buffer   chan Message
+	access   *semaphore.Instance
+	done     *done.Instance
 }
 
 type serverityLogger struct {
@@ -36,9 +38,6 @@ type serverityLogger struct {
 func NewLogger(logWriterCreator WriterCreator) Handler {
 	return &generalLogger{
 		creator: logWriterCreator,
-		buffer:  make(chan Message, 128),
-		access:  semaphore.New(1),
-		done:    done.New(),
 	}
 }
 
@@ -46,9 +45,6 @@ func ReplaceWithSeverityLogger(serverity Severity) {
 	w := CreateStdoutLogWriter()
 	g := &generalLogger{
 		creator: w,
-		buffer:  make(chan Message, 128),
-		access:  semaphore.New(1),
-		done:    done.New(),
 	}
 	s := &serverityLogger{
 		inner:    g,
@@ -66,6 +62,14 @@ func (l *serverityLogger) Handle(msg Message) {
 	default:
 		l.inner.Handle(msg)
 	}
+}
+
+func (l *generalLogger) initialize() {
+	l.initOnce.Do(func() {
+		l.buffer = make(chan Message, 128)
+		l.access = semaphore.New(1)
+		l.done = done.New()
+	})
 }
 
 func (l *generalLogger) run() {
@@ -98,6 +102,8 @@ func (l *generalLogger) run() {
 }
 
 func (l *generalLogger) Handle(msg Message) {
+	l.initialize()
+
 	select {
 	case l.buffer <- msg:
 	default:
@@ -111,6 +117,7 @@ func (l *generalLogger) Handle(msg Message) {
 }
 
 func (l *generalLogger) Close() error {
+	l.initialize()
 	return l.done.Close()
 }
 
