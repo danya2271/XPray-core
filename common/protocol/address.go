@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -78,6 +79,33 @@ func NewAddressParser(options ...AddressOption) AddressSerializer {
 	}
 
 	return portLastAddressParser{ap: ap}
+}
+
+// NewLazyAddressParser creates an AddressSerializer that builds its parser on first use.
+func NewLazyAddressParser(options ...AddressOption) AddressSerializer {
+	return &lazyAddressParser{options: options}
+}
+
+type lazyAddressParser struct {
+	once    sync.Once
+	options []AddressOption
+	parser  AddressSerializer
+}
+
+func (p *lazyAddressParser) get() AddressSerializer {
+	p.once.Do(func() {
+		p.parser = NewAddressParser(p.options...)
+		p.options = nil
+	})
+	return p.parser
+}
+
+func (p *lazyAddressParser) ReadAddressPort(buffer *buf.Buffer, input io.Reader) (net.Address, net.Port, error) {
+	return p.get().ReadAddressPort(buffer, input)
+}
+
+func (p *lazyAddressParser) WriteAddressPort(writer io.Writer, addr net.Address, port net.Port) error {
+	return p.get().WriteAddressPort(writer, addr, port)
 }
 
 type portFirstAddressParser struct {

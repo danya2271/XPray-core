@@ -18,7 +18,7 @@ import (
 	"lukechampine.com/blake3"
 )
 
-var AddrParser = protocol.NewAddressParser(
+var AddrParser = protocol.NewLazyAddressParser(
 	protocol.AddressFamilyByte(byte(protocol.AddressTypeIPv4), net.AddressFamilyIPv4),
 	protocol.AddressFamilyByte(byte(protocol.AddressTypeDomain), net.AddressFamilyDomain),
 	protocol.AddressFamilyByte(byte(protocol.AddressTypeIPv6), net.AddressFamilyIPv6),

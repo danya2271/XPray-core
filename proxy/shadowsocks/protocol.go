@@ -21,7 +21,7 @@ const (
 	Version = 1
 )
 
-var addrParser = protocol.NewAddressParser(
+var addrParser = protocol.NewLazyAddressParser(
 	protocol.AddressFamilyByte(0x01, net.AddressFamilyIPv4),
 	protocol.AddressFamilyByte(0x04, net.AddressFamilyIPv6),
 	protocol.AddressFamilyByte(0x03, net.AddressFamilyDomain),
