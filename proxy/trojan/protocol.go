@@ -13,7 +13,7 @@ import (
 var (
 	crlf = []byte{'\r', '\n'}
 
-	addrParser = protocol.NewAddressParser(
+	addrParser = protocol.NewLazyAddressParser(
 		protocol.AddressFamilyByte(0x01, net.AddressFamilyIPv4),
 		protocol.AddressFamilyByte(0x04, net.AddressFamilyIPv6),
 		protocol.AddressFamilyByte(0x03, net.AddressFamilyDomain),
