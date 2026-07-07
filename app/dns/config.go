@@ -1,6 +1,8 @@
 package dns
 
 import (
+	"sync"
+
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
@@ -10,16 +12,26 @@ import (
 // References:
 // https://www.iana.org/assignments/special-use-domain-names/special-use-domain-names.xhtml
 // https://unix.stackexchange.com/questions/92441/whats-the-difference-between-local-home-and-lan
-var localTLDsAndDotlessDomainsRules = []*geodata.DomainRule{
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Regex, Value: "^[^.]+$"}}}, // This will only match domains without any dot
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "local"}}},
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "localdomain"}}},
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "localhost"}}},
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "lan"}}},
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "home.arpa"}}},
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "example"}}},
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "invalid"}}},
-	{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "test"}}},
+var localTLDsAndDotlessDomainsRules struct {
+	sync.Once
+	rules []*geodata.DomainRule
+}
+
+func getLocalTLDsAndDotlessDomainsRules() []*geodata.DomainRule {
+	localTLDsAndDotlessDomainsRules.Do(func() {
+		localTLDsAndDotlessDomainsRules.rules = []*geodata.DomainRule{
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Regex, Value: "^[^.]+$"}}}, // This will only match domains without any dot
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "local"}}},
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "localdomain"}}},
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "localhost"}}},
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "lan"}}},
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "home.arpa"}}},
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "example"}}},
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "invalid"}}},
+			{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Domain, Value: "test"}}},
+		}
+	})
+	return localTLDsAndDotlessDomainsRules.rules
 }
 
 func toNetIP(addrs []net.Address) ([]net.IP, error) {

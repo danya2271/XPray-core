@@ -100,8 +100,9 @@ func New(ctx context.Context, config *Config) (*DNS, error) {
 		updateRules := func(isLocalNameServer bool) {
 			// Prioritize local domains with specific TLDs or those without any dot for the local DNS
 			if isLocalNameServer {
-				effectiveRules = append(effectiveRules, localTLDsAndDotlessDomainsRules...)
-				for _, rule := range localTLDsAndDotlessDomainsRules {
+				localRules := getLocalTLDsAndDotlessDomainsRules()
+				effectiveRules = append(effectiveRules, localRules...)
+				for _, rule := range localRules {
 					matcherInfos = append(matcherInfos, &DomainMatcherInfo{
 						clientIdx:  uint16(clientIdx),
 						domainRule: rule.String(),
