@@ -45,6 +45,9 @@ func mergeConfigs(files []*core.ConfigSource) (*conf.Config, error) {
 		if file.Format == "json" && UseStrictJSON {
 			decoder = DecodeJSONConfigStrict
 		}
+		if decoder == nil {
+			return nil, errors.New("unsupported config format: ", file.Format).AtError()
+		}
 		c, err := decoder(r)
 		if err != nil {
 			return nil, errors.New("failed to decode config: ", file).Base(err)
@@ -70,10 +73,12 @@ type readerDecoder func(io.Reader) (*conf.Config, error)
 
 var ReaderDecoderByFormat = make(map[string]readerDecoder)
 
+func registerReaderDecoder(format string, decoder readerDecoder) {
+	ReaderDecoderByFormat[format] = decoder
+}
+
 func init() {
-	ReaderDecoderByFormat["json"] = DecodeJSONConfig
-	ReaderDecoderByFormat["yaml"] = DecodeYAMLConfig
-	ReaderDecoderByFormat["toml"] = DecodeTOMLConfig
+	registerReaderDecoder("json", DecodeJSONConfig)
 
 	core.ConfigBuilderForFiles = BuildConfig
 	core.ConfigMergedFormFiles = MergeConfigFromFiles

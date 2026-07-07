@@ -138,12 +138,8 @@ func getRegepxByFormat() string {
 	switch strings.ToLower(*format) {
 	case "json":
 		return `^.+\.(json|jsonc)$`
-	case "toml":
-		return `^.+\.toml$`
-	case "yaml", "yml":
-		return `^.+\.(yaml|yml)$`
 	default:
-		return `^.+\.(json|jsonc|toml|yaml|yml)$`
+		return `^.+\.(json|jsonc)$`
 	}
 }
 
@@ -181,7 +177,7 @@ func getConfigFilePath(verbose bool) cmdarg.Arg {
 	}
 
 	if workingDir, err := os.Getwd(); err == nil {
-		suffixes := []string{".json", ".jsonc", ".toml", ".yaml", ".yml"}
+		suffixes := []string{".json", ".jsonc"}
 		for _, suffix := range suffixes {
 			configFile := filepath.Join(workingDir, "config"+suffix)
 			if fileExists(configFile) {
