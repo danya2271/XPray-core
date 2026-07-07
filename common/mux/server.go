@@ -197,6 +197,7 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 		if err != nil {
 			return err
 		}
+		startXUDPManager()
 		XUDPManager.Lock()
 		x := XUDPManager.Map[meta.GlobalID]
 		if x == nil {
