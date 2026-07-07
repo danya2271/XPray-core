@@ -22,7 +22,17 @@ import (
 	"golang.org/x/crypto/x509roots/fallback/bundle"
 )
 
-var globalSessionCache = tls.NewLRUClientSessionCache(128)
+var globalSessionCache struct {
+	sync.Once
+	cache tls.ClientSessionCache
+}
+
+func getGlobalSessionCache() tls.ClientSessionCache {
+	globalSessionCache.Do(func() {
+		globalSessionCache.cache = tls.NewLRUClientSessionCache(128)
+	})
+	return globalSessionCache.cache
+}
 
 // ParseCertificate converts a cert.Certificate to Certificate.
 func ParseCertificate(c *cert.Certificate) *Certificate {
@@ -373,7 +383,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 
 	if c == nil {
 		return &tls.Config{
-			ClientSessionCache:     globalSessionCache,
+			ClientSessionCache:     getGlobalSessionCache(),
 			RootCAs:                root,
 			SessionTicketsDisabled: true,
 		}
@@ -386,7 +396,7 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	}
 	config := &tls.Config{
 		Rand:                   randCarrier,
-		ClientSessionCache:     globalSessionCache,
+		ClientSessionCache:     getGlobalSessionCache(),
 		RootCAs:                root,
 		NextProtos:             slices.Clone(c.NextProtocol),
 		SessionTicketsDisabled: !c.EnableSessionResumption,
