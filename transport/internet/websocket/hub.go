@@ -27,7 +27,17 @@ type requestHandler struct {
 	socketSettings *internet.SocketConfig
 }
 
-var replacer = strings.NewReplacer("+", "-", "/", "_", "=", "")
+var earlyDataHeaderReplacer struct {
+	sync.Once
+	replacer *strings.Replacer
+}
+
+func getEarlyDataHeaderReplacer() *strings.Replacer {
+	earlyDataHeaderReplacer.Do(func() {
+		earlyDataHeaderReplacer.replacer = strings.NewReplacer("+", "-", "/", "_", "=", "")
+	})
+	return earlyDataHeaderReplacer.replacer
+}
 
 var upgrader = &websocket.Upgrader{
 	ReadBufferSize:   0,
@@ -53,7 +63,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	var extraReader io.Reader
 	responseHeader := http.Header{}
 	if str := request.Header.Get("Sec-WebSocket-Protocol"); str != "" {
-		if ed, err := base64.RawURLEncoding.DecodeString(replacer.Replace(str)); err == nil && len(ed) > 0 {
+		if ed, err := base64.RawURLEncoding.DecodeString(getEarlyDataHeaderReplacer().Replace(str)); err == nil && len(ed) > 0 {
 			extraReader = bytes.NewReader(ed)
 			responseHeader.Set("Sec-WebSocket-Protocol", str)
 		}
