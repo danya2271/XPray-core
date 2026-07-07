@@ -1,3 +1,5 @@
+//go:build xray_geodata
+
 package conf_test
 
 import (

@@ -1,3 +1,5 @@
+//go:build xray_shadowsocks
+
 package conf
 
 import (

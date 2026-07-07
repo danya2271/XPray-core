@@ -1,3 +1,5 @@
+//go:build xray_observatory
+
 package conf
 
 import (

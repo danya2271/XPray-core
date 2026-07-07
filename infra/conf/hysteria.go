@@ -16,9 +16,16 @@ type HysteriaClientConfig struct {
 	Port    uint16   `json:"port"`
 }
 
+func checkHysteriaVersion(version int32) error {
+	if version == 0 || version == 2 {
+		return nil
+	}
+	return errors.New("version != 2")
+}
+
 func (c *HysteriaClientConfig) Build() (proto.Message, error) {
-	if c.Version != 2 {
-		return nil, errors.New("version != 2")
+	if err := checkHysteriaVersion(c.Version); err != nil {
+		return nil, err
 	}
 
 	config := &hysteria.ClientConfig{}
@@ -43,8 +50,8 @@ type HysteriaServerConfig struct {
 }
 
 func (c *HysteriaServerConfig) Build() (proto.Message, error) {
-	if c.Version != 2 {
-		return nil, errors.New("version != 2")
+	if err := checkHysteriaVersion(c.Version); err != nil {
+		return nil, err
 	}
 
 	config := new(hysteria.ServerConfig)

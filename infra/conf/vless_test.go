@@ -1,3 +1,5 @@
+//go:build xray_vless_inbound
+
 package conf_test
 
 import (

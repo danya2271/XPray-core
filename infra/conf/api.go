@@ -1,3 +1,5 @@
+//go:build xray_api
+
 package conf
 
 import (

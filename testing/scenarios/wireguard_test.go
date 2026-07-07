@@ -1,3 +1,5 @@
+//go:build xray_wireguard
+
 package scenarios
 
 import (

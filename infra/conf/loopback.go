@@ -1,3 +1,5 @@
+//go:build xray_loopback
+
 package conf
 
 import (
