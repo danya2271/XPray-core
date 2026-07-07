@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"math/big"
 	"slices"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -160,33 +161,17 @@ func copyConfig(c *tls.Config) *utls.Config {
 	return config
 }
 
-func init() {
-	bigInt, _ := rand.Int(rand.Reader, big.NewInt(int64(len(ModernFingerprints))))
-	stopAt := int(bigInt.Int64())
-	i := 0
-	for _, v := range ModernFingerprints {
-		if i == stopAt {
-			PresetFingerprints["random"] = v
-			break
-		}
-		i++
-	}
-	weights := utls.DefaultWeights
-	weights.TLSVersMax_Set_VersionTLS13 = 1
-	weights.FirstKeyShare_Set_CurveP256 = 0
-	randomized := utls.HelloRandomizedALPN
-	randomized.Seed, _ = utls.NewPRNGSeed()
-	randomized.Weights = &weights
-	randomizednoalpn := utls.HelloRandomizedNoALPN
-	randomizednoalpn.Seed, _ = utls.NewPRNGSeed()
-	randomizednoalpn.Weights = &weights
-	PresetFingerprints["randomized"] = &randomized
-	PresetFingerprints["randomizednoalpn"] = &randomizednoalpn
-}
-
 func GetFingerprint(name string) (fingerprint *utls.ClientHelloID) {
 	if name == "" {
 		return &utls.HelloChrome_Auto
+	}
+	switch name {
+	case "random":
+		return getRandomFingerprint()
+	case "randomized":
+		return getRandomizedFingerprint()
+	case "randomizednoalpn":
+		return getRandomizedNoALPNFingerprint()
 	}
 	if fingerprint = PresetFingerprints[name]; fingerprint != nil {
 		return
@@ -198,6 +183,65 @@ func GetFingerprint(name string) (fingerprint *utls.ClientHelloID) {
 		return
 	}
 	return
+}
+
+var randomFingerprint struct {
+	sync.Once
+	fingerprint *utls.ClientHelloID
+}
+
+func getRandomFingerprint() *utls.ClientHelloID {
+	randomFingerprint.Do(func() {
+		bigInt, err := rand.Int(rand.Reader, big.NewInt(int64(len(ModernFingerprints))))
+		stopAt := 0
+		if err == nil {
+			stopAt = int(bigInt.Int64())
+		}
+		i := 0
+		for _, v := range ModernFingerprints {
+			if i == stopAt {
+				randomFingerprint.fingerprint = v
+				return
+			}
+			i++
+		}
+		randomFingerprint.fingerprint = &utls.HelloChrome_Auto
+	})
+	return randomFingerprint.fingerprint
+}
+
+var randomizedFingerprints struct {
+	sync.Once
+	alpn   *utls.ClientHelloID
+	noALPN *utls.ClientHelloID
+}
+
+func initRandomizedFingerprints() {
+	randomizedFingerprints.Do(func() {
+		weights := utls.DefaultWeights
+		weights.TLSVersMax_Set_VersionTLS13 = 1
+		weights.FirstKeyShare_Set_CurveP256 = 0
+
+		randomized := utls.HelloRandomizedALPN
+		randomized.Seed, _ = utls.NewPRNGSeed()
+		randomized.Weights = &weights
+		randomizedFingerprints.alpn = &randomized
+
+		randomizednoalpn := utls.HelloRandomizedNoALPN
+		randomizednoalpn.Seed, _ = utls.NewPRNGSeed()
+		randomizednoalpn.Weights = &weights
+		randomizedFingerprints.noALPN = &randomizednoalpn
+	})
+}
+
+func getRandomizedFingerprint() *utls.ClientHelloID {
+	initRandomizedFingerprints()
+	return randomizedFingerprints.alpn
+}
+
+func getRandomizedNoALPNFingerprint() *utls.ClientHelloID {
+	initRandomizedFingerprints()
+	return randomizedFingerprints.noALPN
 }
 
 var PresetFingerprints = map[string]*utls.ClientHelloID{
