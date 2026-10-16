@@ -46,7 +46,7 @@ func mergeConfigs(files []*core.ConfigSource) (*conf.Config, error) {
 			decoder = DecodeJSONConfigStrict
 		}
 		if decoder == nil {
-			return nil, errors.New("unsupported config format: ", file.Format).AtError()
+			return nil, errors.New("unsupported config format: ", file.Format)
 		}
 		c, err := decoder(r)
 		if err != nil {
