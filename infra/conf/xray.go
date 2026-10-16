@@ -36,22 +36,19 @@ var (
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
-		"block":       func() interface{} { return new(BlackholeConfig) },
-		"blackhole":   func() interface{} { return new(BlackholeConfig) },
-		"loopback":    func() interface{} { return new(LoopbackConfig) },
-		"direct":      func() interface{} { return new(FreedomConfig) },
-		"freedom":     func() interface{} { return new(FreedomConfig) },
-		"http":        func() interface{} { return new(HTTPClientConfig) },
-		"shadowsocks": func() interface{} { return new(ShadowsocksClientConfig) },
-		"socks":       func() interface{} { return new(SocksClientConfig) },
-		"vless":       func() interface{} { return new(VLessOutboundConfig) },
-		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
-		"trojan":      func() interface{} { return new(TrojanClientConfig) },
-		"hysteria":    func() interface{} { return new(HysteriaClientConfig) },
-		"masque":      func() interface{} { return new(MasqueClientConfig) },
-		"dns":         func() interface{} { return new(DNSOutboundConfig) },
-		"hysteria2":   func() interface{} { return new(HysteriaClientConfig) },
-		"hy2":         func() interface{} { return new(HysteriaClientConfig) },
+		"block":     func() interface{} { return new(BlackholeConfig) },
+		"blackhole": func() interface{} { return new(BlackholeConfig) },
+		"direct":    func() interface{} { return new(FreedomConfig) },
+		"freedom":   func() interface{} { return new(FreedomConfig) },
+		"http":      func() interface{} { return new(HTTPClientConfig) },
+		"socks":     func() interface{} { return new(SocksClientConfig) },
+		"vless":     func() interface{} { return new(VLessOutboundConfig) },
+		"trojan":    func() interface{} { return new(TrojanClientConfig) },
+		"hysteria":  func() interface{} { return new(HysteriaClientConfig) },
+		"masque":    func() interface{} { return new(MasqueClientConfig) },
+		"dns":       func() interface{} { return new(DNSOutboundConfig) },
+		"hysteria2": func() interface{} { return new(HysteriaClientConfig) },
+		"hy2":       func() interface{} { return new(HysteriaClientConfig) },
 	}, "protocol", "settings")
 )
 
