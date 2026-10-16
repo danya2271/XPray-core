@@ -30,22 +30,20 @@ import (
 
 // Handler implements outbound.Handler.
 type Handler struct {
-	tag             string
-	senderSettings  *proxyman.SenderConfig
-	streamSettings  *internet.MemoryStreamConfig
-	proxyConfig     proto.Message
-	proxy           proxy.Outbound
-	mux             *mux.ClientManager
-	xudp            *mux.ClientManager
-	udp443          string
+	tag            string
+	senderSettings *proxyman.SenderConfig
+	streamSettings *internet.MemoryStreamConfig
+	proxyConfig    proto.Message
+	proxy          proxy.Outbound
+	mux            *mux.ClientManager
+	xudp           *mux.ClientManager
+	udp443         string
 }
 
 // NewHandler creates a new Handler based on the given configuration.
 func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbound.Handler, error) {
-	v := core.MustFromContext(ctx)
 	h := &Handler{
-		tag:             config.Tag,
-		outboundManager: v.GetFeature(outbound.ManagerType()).(outbound.Manager),
+		tag: config.Tag,
 	}
 
 	if config.SenderSettings != nil {

@@ -1,7 +1,6 @@
 package splithttp
 
 import (
-	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
