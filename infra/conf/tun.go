@@ -1,3 +1,5 @@
+//go:build xray_tun
+
 package conf
 
 import (

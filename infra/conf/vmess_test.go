@@ -1,3 +1,5 @@
+//go:build xray_vmess
+
 package conf_test
 
 import (

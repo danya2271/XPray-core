@@ -1,3 +1,5 @@
+//go:build xray_full_conf
+
 package conf_test
 
 import (

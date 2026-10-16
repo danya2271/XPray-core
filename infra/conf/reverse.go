@@ -1,3 +1,5 @@
+//go:build xray_reverse
+
 package conf
 
 import (

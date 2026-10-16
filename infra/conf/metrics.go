@@ -1,3 +1,5 @@
+//go:build xray_metrics
+
 package conf
 
 import (

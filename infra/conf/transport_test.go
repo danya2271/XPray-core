@@ -1,3 +1,5 @@
+//go:build xray_finalmask
+
 package conf_test
 
 import (

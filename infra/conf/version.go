@@ -1,3 +1,5 @@
+//go:build xray_version
+
 package conf
 
 import (
