@@ -9,7 +9,6 @@ import (
 
 	"github.com/xtls/xray-core/app/dispatcher"
 	"github.com/xtls/xray-core/app/proxyman"
-	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
@@ -29,15 +28,11 @@ var (
 		"tunnel":        func() interface{} { return new(DokodemoConfig) },
 		"dokodemo-door": func() interface{} { return new(DokodemoConfig) },
 		"http":          func() interface{} { return new(HTTPServerConfig) },
-		"shadowsocks":   func() interface{} { return new(ShadowsocksServerConfig) },
 		"mixed":         func() interface{} { return new(SocksServerConfig) },
 		"socks":         func() interface{} { return new(SocksServerConfig) },
-		"vless":         func() interface{} { return new(VLessInboundConfig) },
-		"vmess":         func() interface{} { return new(VMessInboundConfig) },
 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
 		"hysteria":      func() interface{} { return new(HysteriaServerConfig) },
 		"masque":        func() interface{} { return new(MasqueServerConfig) },
-		"tun":           func() interface{} { return new(TunConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
@@ -55,6 +50,8 @@ var (
 		"hysteria":    func() interface{} { return new(HysteriaClientConfig) },
 		"masque":      func() interface{} { return new(MasqueClientConfig) },
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
+		"hysteria2":   func() interface{} { return new(HysteriaClientConfig) },
+		"hy2":         func() interface{} { return new(HysteriaClientConfig) },
 	}, "protocol", "settings")
 )
 
@@ -437,13 +434,6 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	}, nil
 }
 
-type StatsConfig struct{}
-
-// Build implements Buildable.
-func (c *StatsConfig) Build() (*stats.Config, error) {
-	return &stats.Config{}, nil
-}
-
 type EnvConfig map[string]string
 
 func (c EnvConfig) Override(o EnvConfig) {
@@ -457,22 +447,22 @@ type Config struct {
 	// left for returning error
 	Transport map[string]json.RawMessage `json:"transport"`
 
-	Env              EnvConfig               `json:"env"`
-	LogConfig        *LogConfig              `json:"log"`
-	RouterConfig     *RouterConfig           `json:"routing"`
-	DNSConfig        *DNSConfig              `json:"dns"`
-	InboundConfigs   []InboundDetourConfig   `json:"inbounds"`
-	OutboundConfigs  []OutboundDetourConfig  `json:"outbounds"`
-	Policy           *PolicyConfig           `json:"policy"`
-	API              *APIConfig              `json:"api"`
-	Metrics          *MetricsConfig          `json:"metrics"`
-	Stats            *StatsConfig            `json:"stats"`
-	Reverse          *ReverseConfig          `json:"reverse"`
-	FakeDNS          *FakeDNSConfig          `json:"fakeDns"`
-	Observatory      *ObservatoryConfig      `json:"observatory"`
-	BurstObservatory *BurstObservatoryConfig `json:"burstObservatory"`
-	Version          *VersionConfig          `json:"version"`
-	Geodata          *GeodataConfig          `json:"geodata"`
+	Env              EnvConfig              `json:"env"`
+	LogConfig        *LogConfig             `json:"log"`
+	RouterConfig     *RouterConfig          `json:"routing"`
+	DNSConfig        *DNSConfig             `json:"dns"`
+	InboundConfigs   []InboundDetourConfig  `json:"inbounds"`
+	OutboundConfigs  []OutboundDetourConfig `json:"outbounds"`
+	Policy           *PolicyConfig          `json:"policy"`
+	API              *json.RawMessage       `json:"api"`
+	Metrics          *json.RawMessage       `json:"metrics"`
+	Stats            *json.RawMessage       `json:"stats"`
+	Reverse          *json.RawMessage       `json:"reverse"`
+	FakeDNS          *json.RawMessage       `json:"fakeDns"`
+	Observatory      *json.RawMessage       `json:"observatory"`
+	BurstObservatory *json.RawMessage       `json:"burstObservatory"`
+	Version          *json.RawMessage       `json:"version"`
+	Geodata          *json.RawMessage       `json:"geodata"`
 }
 
 func (c *Config) findInboundTag(tag string) int {
@@ -495,6 +485,36 @@ func (c *Config) findOutboundTag(tag string) int {
 		}
 	}
 	return found
+}
+
+func rejectDisabledConfig(name string, raw *json.RawMessage) error {
+	if raw == nil {
+		return nil
+	}
+	return errors.New(`"` + name + `" config is disabled in this distro build`)
+}
+
+func (c *Config) rejectDisabledConfigs() error {
+	disabled := []struct {
+		name string
+		raw  *json.RawMessage
+	}{
+		{"api", c.API},
+		{"metrics", c.Metrics},
+		{"stats", c.Stats},
+		{"reverse", c.Reverse},
+		{"fakeDns", c.FakeDNS},
+		{"observatory", c.Observatory},
+		{"burstObservatory", c.BurstObservatory},
+		{"version", c.Version},
+		{"geodata", c.Geodata},
+	}
+	for _, item := range disabled {
+		if err := rejectDisabledConfig(item.name, item.raw); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Override method accepts another Config overrides the current attribute
@@ -603,34 +623,15 @@ func (c *Config) Build() (*core.Config, error) {
 	if err := PostProcessConfigureFile(c); err != nil {
 		return nil, errors.New("failed to post-process configuration file").Base(err)
 	}
+	if err := c.rejectDisabledConfigs(); err != nil {
+		return nil, err
+	}
 
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 		},
-	}
-
-	if c.API != nil {
-		apiConf, err := c.API.Build()
-		if err != nil {
-			return nil, errors.New("failed to build API configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(apiConf))
-	}
-	if c.Metrics != nil {
-		metricsConf, err := c.Metrics.Build()
-		if err != nil {
-			return nil, errors.New("failed to build metrics configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(metricsConf))
-	}
-	if c.Stats != nil {
-		statsConf, err := c.Stats.Build()
-		if err != nil {
-			return nil, errors.New("failed to build stats configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(statsConf))
 	}
 
 	var logConfMsg *serial.TypedMessage
@@ -666,58 +667,6 @@ func (c *Config) Build() (*core.Config, error) {
 		}
 		config.App = append(config.App, serial.ToTypedMessage(pc))
 	}
-
-	if c.Reverse != nil {
-		return nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)
-		r, err := c.Reverse.Build()
-		if err != nil {
-			return nil, errors.New("failed to build reverse configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
-	}
-
-	if c.FakeDNS != nil {
-		r, err := c.FakeDNS.Build()
-		if err != nil {
-			return nil, errors.New("failed to build fake DNS configuration").Base(err)
-		}
-		config.App = append([]*serial.TypedMessage{serial.ToTypedMessage(r)}, config.App...)
-	}
-
-	if c.Observatory != nil {
-		r, err := c.Observatory.Build()
-		if err != nil {
-			return nil, errors.New("failed to build observatory configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
-	}
-
-	if c.BurstObservatory != nil {
-		r, err := c.BurstObservatory.Build()
-		if err != nil {
-			return nil, errors.New("failed to build burst observatory configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
-	}
-
-	if c.Version != nil {
-		r, err := c.Version.Build()
-		if err != nil {
-			return nil, errors.New("failed to build version configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
-	}
-
-	if c.Geodata != nil {
-		r, err := c.Geodata.Build()
-		if err != nil {
-			return nil, errors.New("failed to build geodata configuration").Base(err)
-		}
-		config.App = append(config.App, serial.ToTypedMessage(r))
-	}
-
-	// Initialize the inbound module last to ensure inbound connections are handled correctly.
-	config.App = append(config.App, serial.ToTypedMessage(&proxyman.InboundConfig{}))
 
 	var inbounds []InboundDetourConfig
 
