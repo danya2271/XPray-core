@@ -49,6 +49,22 @@ func TestUDPReaderReadFromFragmentedDatagram(t *testing.T) {
 	}
 }
 
+func TestDefraggerHandlesInterleavedPackets(t *testing.T) {
+	d := &Defragger{}
+	if got := d.Feed(&UDPMessage{PacketID: 1, FragID: 0, FragCount: 2, Addr: "example.com:53", Data: []byte("a")}); got != nil {
+		t.Fatal("first fragment unexpectedly completed")
+	}
+	if got := d.Feed(&UDPMessage{PacketID: 2, FragID: 0, FragCount: 2, Addr: "example.com:53", Data: []byte("c")}); got != nil {
+		t.Fatal("second packet unexpectedly completed")
+	}
+	if got := d.Feed(&UDPMessage{PacketID: 1, FragID: 1, FragCount: 2, Addr: "example.com:53", Data: []byte("b")}); got == nil || string(got.Data) != "ab" {
+		t.Fatalf("first packet = %#v", got)
+	}
+	if got := d.Feed(&UDPMessage{PacketID: 2, FragID: 1, FragCount: 2, Addr: "example.com:53", Data: []byte("d")}); got == nil || string(got.Data) != "cd" {
+		t.Fatalf("second packet = %#v", got)
+	}
+}
+
 func makeFragmentPackets(t *testing.T, first []byte, second []byte) [][]byte {
 	t.Helper()
 	messages := []UDPMessage{

@@ -4,7 +4,6 @@ package splithttp
 // packets by a sequence number
 
 import (
-	"container/heap"
 	"io"
 	"sync/atomic"
 
@@ -71,8 +70,13 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 	}
 
 	if len(h.pendingPayload) > 0 {
-		n := copy(b, h.pendingPayload)
-		h.pendingPayload = h.pendingPayload[n:]
+		pending := h.pendingPayload
+		n := copy(b, pending)
+		if n == len(pending) {
+			h.pendingPayload = nil
+		} else {
+			h.pendingPayload = pending[n:]
+		}
 		return n, nil
 	}
 
@@ -82,14 +86,14 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 			if p.Reader != nil {
 				return p.Reader.Read(b)
 			}
-			heap.Push(&h.heap, p)
+			h.heap.push(p)
 		case <-h.closed.Wait():
 			return 0, io.EOF
 		}
 	}
 
 	for len(h.heap) > 0 {
-		packet := heap.Pop(&h.heap).(Packet)
+		packet := h.heap.pop()
 		n := 0
 
 		if packet.Seq == h.nextSeq {
@@ -111,10 +115,10 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 				// connection, and hope the application retries.
 				return 0, errors.New("packet queue is too large")
 			}
-			heap.Push(&h.heap, packet)
+			h.heap.push(packet)
 			select {
 			case p := <-h.pushedPackets:
-				heap.Push(&h.heap, p)
+				h.heap.push(p)
 			case <-h.closed.Wait():
 				return 0, io.EOF
 			}
@@ -124,23 +128,50 @@ func (h *uploadQueue) Read(b []byte) (int, error) {
 	return 0, nil
 }
 
-// heap code directly taken from https://pkg.go.dev/container/heap
 type uploadHeap []Packet
 
-func (h uploadHeap) Len() int           { return len(h) }
-func (h uploadHeap) Less(i, j int) bool { return h[i].Seq < h[j].Seq }
-func (h uploadHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-
-func (h *uploadHeap) Push(x any) {
-	// Push and Pop use pointer receivers because they modify the slice's length,
-	// not just its contents.
-	*h = append(*h, x.(Packet))
+func (h *uploadHeap) push(packet Packet) {
+	*h = append(*h, packet)
+	for index := len(*h) - 1; index > 0; {
+		parent := (index - 1) / 2
+		if (*h)[parent].Seq <= (*h)[index].Seq {
+			break
+		}
+		(*h)[parent], (*h)[index] = (*h)[index], (*h)[parent]
+		index = parent
+	}
 }
 
-func (h *uploadHeap) Pop() any {
+func (h *uploadHeap) pop() Packet {
 	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
+	last := len(old) - 1
+	packet := old[0]
+	if last == 0 {
+		old[0] = Packet{}
+		*h = old[:0]
+		return packet
+	}
+
+	old[0] = old[last]
+	old[last] = Packet{}
+	*h = old[:last]
+
+	for index := 0; ; {
+		left := index*2 + 1
+		if left >= len(*h) {
+			break
+		}
+		right := left + 1
+		smaller := left
+		if right < len(*h) && (*h)[right].Seq < (*h)[left].Seq {
+			smaller = right
+		}
+		if (*h)[index].Seq <= (*h)[smaller].Seq {
+			break
+		}
+		(*h)[index], (*h)[smaller] = (*h)[smaller], (*h)[index]
+		index = smaller
+	}
+
+	return packet
 }

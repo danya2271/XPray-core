@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -37,10 +38,12 @@ type client struct {
 	finalMask    *finalmask.FinalMask
 	quicParams   *internet.QuicParams
 
-	conn    *quic.Conn
-	tr      *quic.Transport
-	pktConn net.PacketConn
-	udpSM   *udpSessionManager
+	conn      *quic.Conn
+	tr        *quic.Transport
+	pktConn   net.PacketConn
+	udpSM     *udpSessionManager
+	aliveTCP  *atomic.Int64
+	lastAlive time.Time
 }
 
 func (c *client) status() status {
@@ -113,9 +116,9 @@ func (c *client) dial(ctx context.Context) error {
 	if quicParams.MaxIdleTimeout == 0 {
 		quicConfig.MaxIdleTimeout = 30 * time.Second
 	}
-	// if quicParams.KeepAlivePeriod == 0 {
-	// 	quicConfig.KeepAlivePeriod = 10 * time.Second
-	// }
+	if quicParams.KeepAlivePeriod == 0 {
+		quicConfig.KeepAlivePeriod = net.QuicgoH3KeepAlivePeriod
+	}
 
 	var pktConn net.PacketConn
 	var udpAddr net.Addr
@@ -219,6 +222,8 @@ func (c *client) dial(ctx context.Context) error {
 	c.pktConn = pktConn
 	c.tr = tr
 	c.conn = conn
+	c.aliveTCP = &atomic.Int64{}
+	c.lastAlive = time.Now()
 	c.udpSM = &udpSessionManager{
 		conn: conn,
 		m:    make(map[uint32]*InterConn),
@@ -251,13 +256,16 @@ func (c *client) tcp(ctx context.Context) (stat.Connection, error) {
 		return nil, err
 	}
 
+	c.lastAlive = time.Now()
+	c.aliveTCP.Add(1)
 	return &interConn{
 		stream: stream,
 		local:  c.conn.LocalAddr(),
 		remote: c.conn.RemoteAddr(),
 
-		client: true,
-		lock:   make(chan struct{}, 1),
+		client:   true,
+		lock:     make(chan struct{}, 1),
+		aliveTCP: c.aliveTCP,
 	}, nil
 }
 
@@ -279,13 +287,34 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 
 func (c *client) clean(force bool) {
 	c.lock <- struct{}{}
+	defer c.unlock()
 	if force {
 		c.forced = true
 	}
-	if status := c.status(); force && status != StatusNull || status == StatusInactive {
+
+	status := c.status()
+	if status == StatusInactive || force && status != StatusNull {
 		c.close()
+		return
 	}
-	c.unlock()
+	if status != StatusActive {
+		return
+	}
+
+	udpSessions := 0
+	if c.udpSM != nil {
+		c.udpSM.RLock()
+		udpSessions = len(c.udpSM.m)
+		c.udpSM.RUnlock()
+	}
+	if udpSessions == 0 && (c.aliveTCP == nil || c.aliveTCP.Load() == 0) {
+		if time.Since(c.lastAlive) >= net.ConnIdleTimeout {
+			c.close()
+			return
+		}
+	} else {
+		c.lastAlive = time.Now()
+	}
 }
 
 type dialerConf struct {

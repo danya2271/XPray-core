@@ -291,6 +291,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		InitialConnectionReceiveWindow: quicParams.InitConnReceiveWindow,
 		MaxConnectionReceiveWindow:     quicParams.MaxConnReceiveWindow,
 		MaxIdleTimeout:                 time.Duration(quicParams.MaxIdleTimeout) * time.Second,
+		KeepAlivePeriod:                time.Duration(quicParams.KeepAlivePeriod) * time.Second,
 		MaxIncomingStreams:             quicParams.MaxIncomingStreams,
 		DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery || (runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin"),
 		EnableDatagrams:                true,
