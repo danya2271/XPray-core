@@ -23,10 +23,12 @@ type interConn struct {
 	local  net.Addr
 	remote net.Addr
 
-	client bool
-	user   *protocol.MemoryUser
-	lock   chan struct{}
-	mu     sync.Mutex
+	client    bool
+	user      *protocol.MemoryUser
+	lock      chan struct{}
+	mu        sync.Mutex
+	closeOnce sync.Once
+	aliveTCP  *atomic.Int64
 }
 
 func (c *interConn) unlock() {
@@ -42,8 +44,12 @@ func (c *interConn) Read(b []byte) (int, error) {
 }
 
 func (c *interConn) Write(b []byte) (int, error) {
-	c.lock <- struct{}{}
-	defer c.unlock()
+	select {
+	case c.lock <- struct{}{}:
+		defer c.unlock()
+	case <-c.stream.Context().Done():
+		return 0, io.ErrClosedPipe
+	}
 
 	if c.client {
 		c.client = false
@@ -71,6 +77,12 @@ func (c *interConn) Write(b []byte) (int, error) {
 }
 
 func (c *interConn) Close() error {
+	if c.aliveTCP != nil {
+		c.closeOnce.Do(func() {
+			c.aliveTCP.Add(-1)
+		})
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	select {
