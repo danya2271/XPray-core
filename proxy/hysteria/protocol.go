@@ -270,15 +270,20 @@ func FragUDPMessage(m *UDPMessage, maxSize int) []UDPMessage {
 	return frags
 }
 
-// Defragger handles the defragmentation of UDP messages.
-// The current implementation can only handle one packet ID at a time.
-// If another packet arrives before a packet has received all fragments
-// in their entirety, any previous state is discarded.
+// Defragger handles the defragmentation of UDP messages while bounding the
+// number of incomplete packets retained for a connection.
 type Defragger struct {
-	pktID uint16
-	frags []*UDPMessage
-	count uint8
-	size  int // data size
+	slots      [8]fragmentSlot
+	generation uint64
+}
+
+type fragmentSlot struct {
+	pktID     uint16
+	fragCount uint8
+	count     uint8
+	size      int
+	lastSeen  uint64
+	fragments []*UDPMessage
 }
 
 func (d *Defragger) Feed(m *UDPMessage) *UDPMessage {
@@ -289,29 +294,61 @@ func (d *Defragger) Feed(m *UDPMessage) *UDPMessage {
 		// wtf is this?
 		return nil
 	}
-	if m.PacketID != d.pktID || m.FragCount != uint8(len(d.frags)) {
-		// new message, clear previous state
-		d.pktID = m.PacketID
-		d.frags = make([]*UDPMessage, m.FragCount)
-		d.frags[m.FragID] = m
-		d.count = 1
-		d.size = len(m.Data)
-	} else if d.frags[m.FragID] == nil {
-		d.frags[m.FragID] = m
-		d.count++
-		d.size += len(m.Data)
-		if int(d.count) == len(d.frags) {
-			// all fragments received, assemble
-			data := make([]byte, d.size)
-			off := 0
-			for _, frag := range d.frags {
-				off += copy(data[off:], frag.Data)
-			}
-			m.Data = data
-			m.FragID = 0
-			m.FragCount = 1
-			return m
+
+	d.generation++
+	slot := d.findSlot(m.PacketID)
+	if slot == nil || slot.fragCount != m.FragCount {
+		slot = d.newSlot(m.PacketID, m.FragCount)
+	}
+	slot.lastSeen = d.generation
+	if slot.fragments[m.FragID] != nil {
+		return nil
+	}
+	slot.fragments[m.FragID] = m
+	slot.count++
+	slot.size += len(m.Data)
+	if slot.count != slot.fragCount {
+		return nil
+	}
+
+	data := make([]byte, slot.size)
+	off := 0
+	for _, frag := range slot.fragments {
+		off += copy(data[off:], frag.Data)
+	}
+	m.Data = data
+	m.FragID = 0
+	m.FragCount = 1
+	*slot = fragmentSlot{}
+	return m
+}
+
+func (d *Defragger) findSlot(packetID uint16) *fragmentSlot {
+	for i := range d.slots {
+		if d.slots[i].fragments != nil && d.slots[i].pktID == packetID {
+			return &d.slots[i]
 		}
 	}
 	return nil
+}
+
+func (d *Defragger) newSlot(packetID uint16, fragCount uint8) *fragmentSlot {
+	selected := &d.slots[0]
+	for i := range d.slots {
+		slot := &d.slots[i]
+		if slot.fragments == nil {
+			selected = slot
+			break
+		}
+		if slot.lastSeen < selected.lastSeen {
+			selected = slot
+		}
+	}
+
+	*selected = fragmentSlot{
+		pktID:     packetID,
+		fragCount: fragCount,
+		fragments: make([]*UDPMessage, fragCount),
+	}
+	return selected
 }

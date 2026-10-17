@@ -2,9 +2,8 @@ package splithttp
 
 import (
 	"context"
-	"crypto/rand"
 	"math"
-	"math/big"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 
@@ -128,27 +127,36 @@ func (m *XmuxManager) getXmuxClient(ctx context.Context, create bool) *XmuxClien
 		return m.newXmuxClient()
 	}
 
-	xmuxClients := make([]*XmuxClient, 0)
 	if m.concurrency > 0 {
+		eligible := 0
 		for _, xmuxClient := range m.xmuxClients {
 			if xmuxClient.Running.Load() < m.concurrency {
-				xmuxClients = append(xmuxClients, xmuxClient)
+				eligible++
 			}
 		}
-	} else {
-		xmuxClients = m.xmuxClients
-	}
-
-	if len(xmuxClients) == 0 {
-		if !create {
-			return nil
+		if eligible == 0 {
+			if !create {
+				return nil
+			}
+			errors.LogDebug(ctx, "XMUX: creating xmuxClient because maxConcurrency was hit, xmuxClients = ", len(m.xmuxClients))
+			return m.newXmuxClient()
 		}
-		errors.LogDebug(ctx, "XMUX: creating xmuxClient because maxConcurrency was hit, xmuxClients = ", len(m.xmuxClients))
-		return m.newXmuxClient()
+
+		selected := rand.IntN(eligible)
+		for _, xmuxClient := range m.xmuxClients {
+			if xmuxClient.Running.Load() < m.concurrency {
+				if selected == 0 {
+					if xmuxClient.leftUsage > 0 {
+						xmuxClient.leftUsage -= 1
+					}
+					return xmuxClient
+				}
+				selected--
+			}
+		}
 	}
 
-	i, _ := rand.Int(rand.Reader, big.NewInt(int64(len(xmuxClients))))
-	xmuxClient := xmuxClients[i.Int64()]
+	xmuxClient := m.xmuxClients[rand.IntN(len(m.xmuxClients))]
 	if xmuxClient.leftUsage > 0 {
 		xmuxClient.leftUsage -= 1
 	}
