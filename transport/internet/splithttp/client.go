@@ -6,8 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/apernet/quic-go/http3"
 	"github.com/xtls/xray-core/common"
@@ -16,6 +18,19 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
 )
+
+var networkDiagSequence atomic.Uint64
+
+func nextNetworkDiagSample() uint64 {
+	if os.Getenv("XRAY_NET_DIAG") != "1" {
+		return 0
+	}
+	sequence := networkDiagSequence.Add(1)
+	if sequence%8 != 0 {
+		return 0
+	}
+	return sequence
+}
 
 // interface to abstract between use of browser dialer, vs net/http
 type DialerClient interface {
@@ -44,6 +59,8 @@ func (c *DefaultDialerClient) IsClosed() bool {
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
+	diagID := nextNetworkDiagSample()
+	startedAt := time.Now()
 	// this is done when the TCP/UDP connection to the server was established,
 	// and we can unblock the Dial function and print correct net addresses in
 	// logs
@@ -52,7 +69,28 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		GotConn: func(connInfo httptrace.GotConnInfo) {
 			remoteAddr = connInfo.Conn.RemoteAddr()
 			localAddr = connInfo.Conn.LocalAddr()
+			if diagID != 0 {
+				fmt.Printf(
+					"[XRAY_NET_DIAG][XHTTP] id=%d event=got_conn version=%s mode=%s wait_ms=%d reused=%t idle_ms=%d\n",
+					diagID,
+					c.httpVersion,
+					c.transportConfig.Mode,
+					time.Since(startedAt).Milliseconds(),
+					connInfo.Reused,
+					connInfo.IdleTime.Milliseconds(),
+				)
+			}
 			gotConn.Close()
+		},
+		GotFirstResponseByte: func() {
+			if diagID != 0 {
+				fmt.Printf(
+					"[XRAY_NET_DIAG][XHTTP] id=%d event=first_byte version=%s ttfb_ms=%d\n",
+					diagID,
+					c.httpVersion,
+					time.Since(startedAt).Milliseconds(),
+				)
+			}
 		},
 	})
 
@@ -98,6 +136,21 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 }
 
 func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessionId string, seqStr string, payload buf.MultiBuffer) error {
+	diagID := nextNetworkDiagSample()
+	startedAt := time.Now()
+	payloadBytes := payload.Len()
+	if diagID != 0 {
+		defer func() {
+			fmt.Printf(
+				"[XRAY_NET_DIAG][XHTTP] id=%d event=upload version=%s bytes=%d duration_ms=%d\n",
+				diagID,
+				c.httpVersion,
+				payloadBytes,
+				time.Since(startedAt).Milliseconds(),
+			)
+		}()
+	}
+
 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
 	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, nil)
 	if err != nil {

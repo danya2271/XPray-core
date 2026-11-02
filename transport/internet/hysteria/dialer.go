@@ -3,8 +3,10 @@ package hysteria
 import (
 	"context"
 	gotls "crypto/tls"
+	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -221,17 +223,22 @@ func (c *client) dial(ctx context.Context) error {
 	down, _ := strconv.ParseUint(resp.Header.Get(CommonHeaderCCRX), 10, 64)
 	errors.LogDebug(context.Background(), "ECHAccepted ", conn.ConnectionState().TLS.ECHAccepted)
 
+	selectedCongestion := "bbr"
 	switch quicParams.Congestion {
 	case "reno":
+		selectedCongestion = "reno"
 	case "bbr":
+		selectedCongestion = "bbr"
 		congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
 	case "", "brutal":
 		if quicParams.BrutalUp == 0 || down == 0 {
 			congestion.UseBBR(conn, bbr.Profile(quicParams.BbrProfile))
 		} else {
+			selectedCongestion = "brutal"
 			congestion.UseBrutal(conn, min(quicParams.BrutalUp, down), quicParams.BrutalDisableLossCompensation)
 		}
 	case "force-brutal":
+		selectedCongestion = "force-brutal"
 		congestion.UseBrutal(conn, quicParams.BrutalUp, quicParams.BrutalDisableLossCompensation)
 	default:
 		panic(quicParams.Congestion)
@@ -248,8 +255,47 @@ func (c *client) dial(ctx context.Context) error {
 		next: 1,
 	}
 	go c.udpSM.run()
+	if os.Getenv("XRAY_NET_DIAG") == "1" {
+		fmt.Printf("[XRAY_NET_DIAG][HYSTERIA] connected peer=%s cc=%s\n", c.dest, selectedCongestion)
+		go reportConnectionStats(conn, c.dest, c.aliveTCP, c.udpSM)
+	}
 
 	return nil
+}
+
+func reportConnectionStats(conn *quic.Conn, dest net.Destination, aliveTCP *atomic.Int64, udpSM *udpSessionManager) {
+	logStats := func() {
+		stats := conn.ConnectionStats()
+		udpSM.RLock()
+		udpSessions := len(udpSM.m)
+		udpSM.RUnlock()
+		fmt.Printf(
+			"[XRAY_NET_DIAG][HYSTERIA] peer=%s rtt_ms=%d/%d/%d tx_bytes=%d tx_packets=%d rx_bytes=%d rx_packets=%d lost_packets=%d tcp=%d udp=%d\n",
+			dest,
+			stats.LatestRTT.Milliseconds(),
+			stats.SmoothedRTT.Milliseconds(),
+			stats.MinRTT.Milliseconds(),
+			stats.BytesSent,
+			stats.PacketsSent,
+			stats.BytesReceived,
+			stats.PacketsReceived,
+			stats.PacketsLost,
+			aliveTCP.Load(),
+			udpSessions,
+		)
+	}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	logStats()
+	for {
+		select {
+		case <-conn.Context().Done():
+			return
+		case <-ticker.C:
+			logStats()
+		}
+	}
 }
 
 func (c *client) unlock() {

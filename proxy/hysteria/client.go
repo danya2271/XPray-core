@@ -254,9 +254,6 @@ func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error)
 		if msg.FragCount > 1 {
 			msg.Data = append([]byte(nil), msg.Data...)
 		}
-		if msg.FragCount > 1 {
-			msg.Data = append([]byte(nil), msg.Data...)
-		}
 
 		dfMsg := r.df.Feed(msg)
 		if dfMsg == nil {
