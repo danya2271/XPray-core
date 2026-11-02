@@ -665,6 +665,8 @@ func (c *Config) Build() (*core.Config, error) {
 		config.App = append(config.App, serial.ToTypedMessage(pc))
 	}
 
+	config.App = append(config.App, serial.ToTypedMessage(&proxyman.InboundConfig{}))
+
 	var inbounds []InboundDetourConfig
 
 	if len(c.InboundConfigs) > 0 {
