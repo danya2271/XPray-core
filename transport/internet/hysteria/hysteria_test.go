@@ -163,3 +163,81 @@ func TestDatagram(t *testing.T) {
 
 	cancel()
 }
+
+func TestRetryIfInactiveRedialsOnce(t *testing.T) {
+	connectionStatus := StatusInactive
+	openCalls := 0
+	redialCalls := 0
+
+	got, err := retryIfInactive(
+		context.Background(),
+		func() status { return connectionStatus },
+		func(context.Context) error {
+			redialCalls++
+			connectionStatus = StatusActive
+			return nil
+		},
+		func() (int, error) {
+			openCalls++
+			if openCalls == 1 {
+				return 0, errors.New("stale connection")
+			}
+			return 42, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 42 {
+		t.Fatalf("open result = %d, want 42", got)
+	}
+	if openCalls != 2 || redialCalls != 1 {
+		t.Fatalf("open calls = %d, redial calls = %d; want 2 and 1", openCalls, redialCalls)
+	}
+}
+
+func TestRetryIfInactiveDoesNotRedialLiveConnection(t *testing.T) {
+	streamLimitErr := &quic.StreamLimitReachedError{}
+	openCalls := 0
+	redialCalls := 0
+
+	_, err := retryIfInactive(
+		context.Background(),
+		func() status { return StatusActive },
+		func(context.Context) error {
+			redialCalls++
+			return nil
+		},
+		func() (int, error) {
+			openCalls++
+			return 0, streamLimitErr
+		},
+	)
+	if err != streamLimitErr {
+		t.Fatalf("open error = %v, want original stream-limit error", err)
+	}
+	if openCalls != 1 || redialCalls != 0 {
+		t.Fatalf("open calls = %d, redial calls = %d; want 1 and 0", openCalls, redialCalls)
+	}
+}
+
+func TestRetryIfInactiveReturnsRedialError(t *testing.T) {
+	dialErr := errors.New("redial failed")
+	openCalls := 0
+
+	_, err := retryIfInactive(
+		context.Background(),
+		func() status { return StatusInactive },
+		func(context.Context) error { return dialErr },
+		func() (int, error) {
+			openCalls++
+			return 0, errors.New("stale connection")
+		},
+	)
+	if err != dialErr {
+		t.Fatalf("retry error = %v, want redial error", err)
+	}
+	if openCalls != 1 {
+		t.Fatalf("open calls = %d, want 1", openCalls)
+	}
+}
