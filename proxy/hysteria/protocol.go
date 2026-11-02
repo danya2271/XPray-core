@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/apernet/quic-go/quicvarint"
 	"github.com/xtls/xray-core/common/errors"
@@ -16,6 +17,7 @@ const (
 	MaxAddressLength = 2048
 	MaxMessageLength = 2048
 	MaxPaddingLength = 4096
+	udpFragmentTTL   = 10 * time.Second
 
 	maxVarInt1 = 63
 	maxVarInt2 = 16383
@@ -273,40 +275,43 @@ func FragUDPMessage(m *UDPMessage, maxSize int) []UDPMessage {
 // Defragger handles the defragmentation of UDP messages while bounding the
 // number of incomplete packets retained for a connection.
 type Defragger struct {
-	slots      [8]fragmentSlot
-	generation uint64
+	slots [8]fragmentSlot
 }
 
 type fragmentSlot struct {
+	sessionID uint32
 	pktID     uint16
 	fragCount uint8
 	count     uint8
 	size      int
-	lastSeen  uint64
+	addr      string
+	lastSeen  time.Time
 	fragments []*UDPMessage
 }
 
 func (d *Defragger) Feed(m *UDPMessage) *UDPMessage {
-	if m.FragCount <= 1 {
+	if m.FragCount == 1 {
 		return m
 	}
-	if m.FragID >= m.FragCount {
-		// wtf is this?
+	if m.FragCount == 0 || m.FragID >= m.FragCount {
 		return nil
 	}
 
-	d.generation++
+	now := time.Now()
+	d.expire(now)
 	slot := d.findSlot(m.PacketID)
-	if slot == nil || slot.fragCount != m.FragCount {
-		slot = d.newSlot(m.PacketID, m.FragCount)
+	if slot == nil {
+		slot = d.newSlot(m, now)
+	} else if slot.sessionID != m.SessionID || slot.fragCount != m.FragCount || slot.addr != m.Addr {
+		*slot = newFragmentSlot(m, now)
 	}
-	slot.lastSeen = d.generation
 	if slot.fragments[m.FragID] != nil {
 		return nil
 	}
 	slot.fragments[m.FragID] = m
 	slot.count++
 	slot.size += len(m.Data)
+	slot.lastSeen = now
 	if slot.count != slot.fragCount {
 		return nil
 	}
@@ -316,11 +321,24 @@ func (d *Defragger) Feed(m *UDPMessage) *UDPMessage {
 	for _, frag := range slot.fragments {
 		off += copy(data[off:], frag.Data)
 	}
-	m.Data = data
-	m.FragID = 0
-	m.FragCount = 1
+	assembled := *m
+	assembled.SessionID = slot.sessionID
+	assembled.PacketID = slot.pktID
+	assembled.FragID = 0
+	assembled.FragCount = 1
+	assembled.Addr = slot.addr
+	assembled.Data = data
 	*slot = fragmentSlot{}
-	return m
+	return &assembled
+}
+
+func (d *Defragger) expire(now time.Time) {
+	for i := range d.slots {
+		slot := &d.slots[i]
+		if slot.fragments != nil && now.Sub(slot.lastSeen) > udpFragmentTTL {
+			*slot = fragmentSlot{}
+		}
+	}
 }
 
 func (d *Defragger) findSlot(packetID uint16) *fragmentSlot {
@@ -332,7 +350,7 @@ func (d *Defragger) findSlot(packetID uint16) *fragmentSlot {
 	return nil
 }
 
-func (d *Defragger) newSlot(packetID uint16, fragCount uint8) *fragmentSlot {
+func (d *Defragger) newSlot(m *UDPMessage, now time.Time) *fragmentSlot {
 	selected := &d.slots[0]
 	for i := range d.slots {
 		slot := &d.slots[i]
@@ -340,15 +358,22 @@ func (d *Defragger) newSlot(packetID uint16, fragCount uint8) *fragmentSlot {
 			selected = slot
 			break
 		}
-		if slot.lastSeen < selected.lastSeen {
+		if slot.lastSeen.Before(selected.lastSeen) {
 			selected = slot
 		}
 	}
 
-	*selected = fragmentSlot{
-		pktID:     packetID,
-		fragCount: fragCount,
-		fragments: make([]*UDPMessage, fragCount),
-	}
+	*selected = newFragmentSlot(m, now)
 	return selected
+}
+
+func newFragmentSlot(m *UDPMessage, now time.Time) fragmentSlot {
+	return fragmentSlot{
+		sessionID: m.SessionID,
+		pktID:     m.PacketID,
+		fragCount: m.FragCount,
+		addr:      m.Addr,
+		lastSeen:  now,
+		fragments: make([]*UDPMessage, m.FragCount),
+	}
 }
