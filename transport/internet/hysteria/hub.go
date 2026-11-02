@@ -46,8 +46,9 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 		h.Lock()
 		defer h.Unlock()
 
+		udpEnabled := h.addConn != nil
 		if h.auth {
-			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
+			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(udpEnabled))
 			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
 			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
 			w.WriteHeader(StatusAuthOK)
@@ -87,7 +88,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 				panic(quicParams.Congestion)
 			}
 
-			if h.validator != nil {
+			if udpEnabled {
 				udpSM := &udpSessionManager{
 					conn: h.conn,
 					m:    make(map[uint32]*InterConn),
@@ -100,7 +101,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 				go udpSM.run()
 			}
 
-			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(h.validator != nil))
+			w.Header().Set(ResponseHeaderUDPEnabled, strconv.FormatBool(udpEnabled))
 			w.Header().Set(CommonHeaderCCRX, strconv.FormatUint(h.quicParams.BrutalDown, 10))
 			w.Header().Set(CommonHeaderPadding, AuthResponsePadding.String())
 			w.WriteHeader(StatusAuthOK)
@@ -118,7 +119,11 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, err error) (bool, error) {
-	if err != nil || !h.auth {
+	h.Lock()
+	authenticated, user := h.auth, h.user
+	h.Unlock()
+
+	if err != nil || !authenticated {
 		return false, nil
 	}
 
@@ -133,7 +138,7 @@ func (h *httpHandler) StreamDispatcher(ft http3.FrameType, stream *quic.Stream, 
 			local:  h.conn.LocalAddr(),
 			remote: h.conn.RemoteAddr(),
 
-			user: h.user,
+			user: user,
 			lock: make(chan struct{}, 1),
 		})
 		return true, nil

@@ -181,11 +181,18 @@ type UDPWriter struct {
 }
 
 func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
-	msgN := msg.Serialize(w.buf[:])
-	if msgN < 0 {
-		return nil
+	packet := w.buf[:]
+	if msg.Size() > len(packet) {
+		packet = make([]byte, msg.Size())
 	}
-	_, err := w.writer.Write(w.buf[:msgN])
+	msgN := msg.Serialize(packet)
+	if msgN < 0 {
+		return go_errors.New("failed to serialize UDP message")
+	}
+	n, err := w.writer.Write(packet[:msgN])
+	if err == nil && n != msgN {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -210,6 +217,10 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if go_errors.As(err, &errTooLarge) {
 			msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
 			fMsgs := FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
+			if len(fMsgs) == 0 {
+				buf.ReleaseMulti(mb[i:])
+				return go_errors.New("UDP datagram cannot be fragmented to fit QUIC payload")
+			}
 			for _, fMsg := range fMsgs {
 				err := w.SendMessage(&fMsg)
 				if err != nil {
