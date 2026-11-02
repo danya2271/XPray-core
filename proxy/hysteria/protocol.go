@@ -173,7 +173,7 @@ func (m *UDPMessage) Serialize(buf []byte) int {
 	if len(buf) < m.Size() {
 		return -1
 	}
-	// binary.BigEndian.PutUint32(buf, m.SessionID)
+	binary.BigEndian.PutUint32(buf, m.SessionID)
 	binary.BigEndian.PutUint16(buf[4:], m.PacketID)
 	buf[6] = m.FragID
 	buf[7] = m.FragCount
@@ -254,7 +254,11 @@ func FragUDPMessage(m *UDPMessage, maxSize int) []UDPMessage {
 	}
 	off := 0
 	fragID := uint8(0)
-	fragCount := uint8((len(fullPayload) + maxPayloadSize - 1) / maxPayloadSize) // round up
+	fragmentCount := (len(fullPayload) + maxPayloadSize - 1) / maxPayloadSize
+	if fragmentCount > 255 {
+		return nil
+	}
+	fragCount := uint8(fragmentCount)
 	frags := make([]UDPMessage, fragCount)
 	for off < len(fullPayload) {
 		payloadSize := len(fullPayload) - off
@@ -311,6 +315,10 @@ func (d *Defragger) Feed(m *UDPMessage) *UDPMessage {
 	slot.fragments[m.FragID] = m
 	slot.count++
 	slot.size += len(m.Data)
+	if slot.size > hysteria.MaxUDPSize {
+		*slot = fragmentSlot{}
+		return nil
+	}
 	slot.lastSeen = now
 	if slot.count != slot.fragCount {
 		return nil

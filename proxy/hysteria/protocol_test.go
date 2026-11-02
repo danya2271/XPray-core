@@ -13,6 +13,7 @@ import (
 
 func TestParseUDPMessage(t *testing.T) {
 	msg := &UDPMessage{
+		SessionID: 11,
 		PacketID:  7,
 		FragCount: 1,
 		Addr:      "example.com:53",
@@ -28,7 +29,7 @@ func TestParseUDPMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.PacketID != msg.PacketID || parsed.FragCount != msg.FragCount || parsed.Addr != msg.Addr || string(parsed.Data) != string(msg.Data) {
+	if parsed.SessionID != msg.SessionID || parsed.PacketID != msg.PacketID || parsed.FragCount != msg.FragCount || parsed.Addr != msg.Addr || string(parsed.Data) != string(msg.Data) {
 		t.Fatalf("unexpected parsed message: %#v", parsed)
 	}
 }
@@ -89,6 +90,19 @@ func TestUDPWriterFragmentsMessageLargerThanScratchBuffer(t *testing.T) {
 	}
 	if !bytes.Equal(assembled.Data, payload) {
 		t.Fatal("reassembled payload differs from original")
+	}
+}
+
+func TestUDPWriterRejectsDatagramLargerThanMaxUDPSize(t *testing.T) {
+	writer := &datagramCaptureWriter{maxSize: 1200}
+	udpWriter := &UDPWriter{writer: writer, addr: "127.0.0.1:53"}
+	packet := buf.FromBytes(make([]byte, transportHysteria.MaxUDPSize+1))
+
+	if err := udpWriter.WriteMultiBuffer(buf.MultiBuffer{packet}); err == nil {
+		t.Fatal("oversized UDP datagram was accepted")
+	}
+	if len(writer.packets) != 0 {
+		t.Fatalf("sent %d datagrams, want none", len(writer.packets))
 	}
 }
 
@@ -166,6 +180,29 @@ func TestDefraggerResetsOnMetadataMismatch(t *testing.T) {
 func TestDefraggerRejectsZeroFragmentCount(t *testing.T) {
 	if got := (&Defragger{}).Feed(fragment(1, 9, 0, 0, "example.com:53", "payload")); got != nil {
 		t.Fatalf("zero-fragment packet = %#v, want nil", got)
+	}
+}
+
+func TestFragUDPMessageRejectsTooManyFragments(t *testing.T) {
+	msg := &UDPMessage{
+		Addr: "example.com:53",
+		Data: make([]byte, 256*256),
+	}
+	if got := FragUDPMessage(msg, msg.HeaderSize()+255); got != nil {
+		t.Fatalf("fragments = %d, want nil", len(got))
+	}
+}
+
+func TestDefraggerRejectsOversizedAssembly(t *testing.T) {
+	d := &Defragger{}
+	for id := uint8(0); id < 4; id++ {
+		got := d.Feed(fragment(1, 9, id, 4, "example.com:53", string(make([]byte, 1200))))
+		if got != nil {
+			t.Fatal("oversized assembly unexpectedly completed")
+		}
+	}
+	if d.slots[0].fragments != nil {
+		t.Fatal("oversized assembly was retained")
 	}
 }
 

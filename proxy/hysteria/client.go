@@ -211,6 +211,10 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			Addr:      addr,
 			Data:      b.Bytes(),
 		}
+		if len(msg.Data) > hysteria.MaxUDPSize {
+			buf.ReleaseMulti(mb[i:])
+			return go_errors.New("UDP datagram exceeds maximum size")
+		}
 
 		err := w.SendMessage(msg)
 		var errTooLarge *quic.DatagramTooLargeError
