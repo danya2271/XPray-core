@@ -1,9 +1,12 @@
 package hysteria
 
 import (
+	"bytes"
 	"io"
 	"testing"
 
+	"github.com/apernet/quic-go"
+	"github.com/xtls/xray-core/common/buf"
 	transportHysteria "github.com/xtls/xray-core/transport/internet/hysteria"
 )
 
@@ -49,6 +52,45 @@ func TestUDPReaderReadFromFragmentedDatagram(t *testing.T) {
 	}
 }
 
+func TestUDPWriterFragmentsMessageLargerThanScratchBuffer(t *testing.T) {
+	payload := make([]byte, 4090)
+	writer := &datagramCaptureWriter{maxSize: 1200}
+	udpWriter := &UDPWriter{
+		writer: writer,
+		addr:   "127.0.0.1:53",
+	}
+
+	packet := buf.New()
+	packet.Write(payload)
+	if err := udpWriter.WriteMultiBuffer(buf.MultiBuffer{packet}); err != nil {
+		t.Fatal(err)
+	}
+	if len(writer.packets) < 2 {
+		t.Fatalf("sent %d datagrams, want fragmented packet", len(writer.packets))
+	}
+
+	var (
+		defragger Defragger
+		assembled *UDPMessage
+	)
+	for _, datagram := range writer.packets {
+		msg, err := ParseUDPMessage(datagram)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assembled = defragger.Feed(msg)
+	}
+	if assembled == nil {
+		t.Fatal("fragments did not reassemble")
+	}
+	if len(assembled.Data) != len(payload) {
+		t.Fatalf("reassembled payload length = %d, want %d", len(assembled.Data), len(payload))
+	}
+	if !bytes.Equal(assembled.Data, payload) {
+		t.Fatal("reassembled payload differs from original")
+	}
+}
+
 func TestDefraggerHandlesInterleavedPackets(t *testing.T) {
 	d := &Defragger{}
 	if got := d.Feed(&UDPMessage{PacketID: 1, FragID: 0, FragCount: 2, Addr: "example.com:53", Data: []byte("a")}); got != nil {
@@ -63,6 +105,19 @@ func TestDefraggerHandlesInterleavedPackets(t *testing.T) {
 	if got := d.Feed(&UDPMessage{PacketID: 2, FragID: 1, FragCount: 2, Addr: "example.com:53", Data: []byte("d")}); got == nil || string(got.Data) != "cd" {
 		t.Fatalf("second packet = %#v", got)
 	}
+}
+
+type datagramCaptureWriter struct {
+	maxSize int
+	packets [][]byte
+}
+
+func (w *datagramCaptureWriter) Write(p []byte) (int, error) {
+	if len(p) > w.maxSize {
+		return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: int64(w.maxSize)}
+	}
+	w.packets = append(w.packets, append([]byte(nil), p...))
+	return len(p), nil
 }
 
 func makeFragmentPackets(t *testing.T, first []byte, second []byte) [][]byte {

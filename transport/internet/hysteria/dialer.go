@@ -219,7 +219,7 @@ func (c *client) dial(ctx context.Context) error {
 		return errors.New("auth failed code ", resp.StatusCode)
 	}
 
-	// udp, _ := strconv.ParseBool(resp.Header.Get(ResponseHeaderUDPEnabled))
+	udpEnabled := parseUDPEnabled(resp.Header.Get(ResponseHeaderUDPEnabled))
 	down, _ := strconv.ParseUint(resp.Header.Get(CommonHeaderCCRX), 10, 64)
 	errors.LogDebug(context.Background(), "ECHAccepted ", conn.ConnectionState().TLS.ECHAccepted)
 
@@ -249,12 +249,16 @@ func (c *client) dial(ctx context.Context) error {
 	c.conn = conn
 	c.aliveTCP = &atomic.Int64{}
 	c.lastAlive = time.Now()
-	c.udpSM = &udpSessionManager{
-		conn: conn,
-		m:    make(map[uint32]*InterConn),
-		next: 1,
+	if udpEnabled {
+		c.udpSM = &udpSessionManager{
+			conn: conn,
+			m:    make(map[uint32]*InterConn),
+			next: 1,
+		}
+		go c.udpSM.run()
+	} else {
+		c.udpSM = nil
 	}
-	go c.udpSM.run()
 	if os.Getenv("XRAY_NET_DIAG") == "1" {
 		fmt.Printf("[XRAY_NET_DIAG][HYSTERIA] connected peer=%s cc=%s\n", c.dest, selectedCongestion)
 		go reportConnectionStats(conn, c.dest, c.aliveTCP, c.udpSM)
@@ -266,9 +270,12 @@ func (c *client) dial(ctx context.Context) error {
 func reportConnectionStats(conn *quic.Conn, dest net.Destination, aliveTCP *atomic.Int64, udpSM *udpSessionManager) {
 	logStats := func() {
 		stats := conn.ConnectionStats()
-		udpSM.RLock()
-		udpSessions := len(udpSM.m)
-		udpSM.RUnlock()
+		udpSessions := 0
+		if udpSM != nil {
+			udpSM.RLock()
+			udpSessions = len(udpSM.m)
+			udpSM.RUnlock()
+		}
 		fmt.Printf(
 			"[XRAY_NET_DIAG][HYSTERIA] peer=%s rtt_ms=%d/%d/%d tx_bytes=%d tx_packets=%d rx_bytes=%d rx_packets=%d lost_packets=%d tcp=%d udp=%d\n",
 			dest,
@@ -347,10 +354,18 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.udpSM == nil {
+		return nil, errors.New("server does not support UDP relay")
+	}
 
 	return retryIfInactive(ctx, c.status, c.dial, func() (*InterConn, error) {
 		return c.udpSM.udp()
 	})
+}
+
+func parseUDPEnabled(value string) bool {
+	enabled, err := strconv.ParseBool(value)
+	return err == nil && enabled
 }
 
 func (c *client) clean(force bool) {

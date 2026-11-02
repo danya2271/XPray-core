@@ -7,11 +7,13 @@ import (
 	"errors"
 	"net"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 )
 
@@ -240,4 +242,46 @@ func TestRetryIfInactiveReturnsRedialError(t *testing.T) {
 	if openCalls != 1 {
 		t.Fatalf("open calls = %d, want 1", openCalls)
 	}
+}
+
+func TestParseUDPEnabled(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "true", want: true},
+		{value: "false", want: false},
+		{value: "", want: false},
+		{value: "invalid", want: false},
+	} {
+		if got := parseUDPEnabled(test.value); got != test.want {
+			t.Errorf("parseUDPEnabled(%q) = %v, want %v", test.value, got, test.want)
+		}
+	}
+}
+
+func TestStreamDispatcherAuthStateConcurrent(t *testing.T) {
+	handler := &httpHandler{}
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := range 1000 {
+			handler.Lock()
+			handler.auth = i%2 == 0
+			handler.user = &protocol.MemoryUser{}
+			handler.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			if _, err := handler.StreamDispatcher(0, nil, errors.New("ignored stream error")); err != nil {
+				t.Errorf("StreamDispatcher() error = %v", err)
+			}
+		}
+	}()
+
+	wg.Wait()
 }
