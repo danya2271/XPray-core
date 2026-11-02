@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common/buf"
@@ -107,6 +108,67 @@ func TestDefraggerHandlesInterleavedPackets(t *testing.T) {
 	}
 }
 
+func TestDefraggerExpiresStalePacketID(t *testing.T) {
+	d := &Defragger{}
+	if got := d.Feed(fragment(1, 9, 0, 2, "example.com:53", "old-")); got != nil {
+		t.Fatal("incomplete packet unexpectedly completed")
+	}
+	d.slots[0].lastSeen = time.Now().Add(-udpFragmentTTL - time.Second)
+
+	if got := d.Feed(fragment(1, 9, 0, 2, "example.com:53", "new-")); got != nil {
+		t.Fatal("first fresh fragment unexpectedly completed")
+	}
+	got := d.Feed(fragment(1, 9, 1, 2, "example.com:53", "data"))
+	if got == nil || string(got.Data) != "new-data" {
+		t.Fatalf("reassembled packet = %#v, want fresh payload", got)
+	}
+}
+
+func TestDefraggerResetsOnMetadataMismatch(t *testing.T) {
+	tests := []struct {
+		name       string
+		second     *UDPMessage
+		freshFirst *UDPMessage
+		wantAddr   string
+	}{
+		{
+			name:       "session ID",
+			second:     fragment(2, 9, 1, 2, "example.com:53", "new-"),
+			freshFirst: fragment(2, 9, 0, 2, "example.com:53", "fresh-"),
+			wantAddr:   "example.com:53",
+		},
+		{
+			name:       "address",
+			second:     fragment(1, 9, 1, 2, "other.example:53", "new-"),
+			freshFirst: fragment(1, 9, 0, 2, "other.example:53", "fresh-"),
+			wantAddr:   "other.example:53",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			d := &Defragger{}
+			if got := d.Feed(fragment(1, 9, 0, 2, "example.com:53", "stale-")); got != nil {
+				t.Fatal("incomplete packet unexpectedly completed")
+			}
+			if got := d.Feed(test.second); got != nil {
+				t.Fatal("metadata mismatch unexpectedly completed a packet")
+			}
+			if got := d.Feed(test.freshFirst); got == nil {
+				t.Fatal("matching fragments did not reassemble")
+			} else if want := "fresh-new-"; string(got.Data) != want || got.Addr != test.wantAddr || got.SessionID != test.freshFirst.SessionID {
+				t.Fatalf("reassembled packet = %#v, want payload %q at %q", got, want, test.wantAddr)
+			}
+		})
+	}
+}
+
+func TestDefraggerRejectsZeroFragmentCount(t *testing.T) {
+	if got := (&Defragger{}).Feed(fragment(1, 9, 0, 0, "example.com:53", "payload")); got != nil {
+		t.Fatalf("zero-fragment packet = %#v, want nil", got)
+	}
+}
+
 type datagramCaptureWriter struct {
 	maxSize int
 	packets [][]byte
@@ -118,6 +180,17 @@ func (w *datagramCaptureWriter) Write(p []byte) (int, error) {
 	}
 	w.packets = append(w.packets, append([]byte(nil), p...))
 	return len(p), nil
+}
+
+func fragment(sessionID uint32, packetID uint16, fragmentID, fragmentCount uint8, addr, data string) *UDPMessage {
+	return &UDPMessage{
+		SessionID: sessionID,
+		PacketID:  packetID,
+		FragID:    fragmentID,
+		FragCount: fragmentCount,
+		Addr:      addr,
+		Data:      []byte(data),
+	}
 }
 
 func makeFragmentPackets(t *testing.T, first []byte, second []byte) [][]byte {
