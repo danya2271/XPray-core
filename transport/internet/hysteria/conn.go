@@ -214,11 +214,12 @@ func (m *udpSessionManager) clean() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		m.RLock()
 		if m.closed {
+			m.RUnlock()
 			return
 		}
 
-		m.RLock()
 		now := time.Now()
 		timeoutConn := make([]*InterConn, 0, len(m.m))
 		for _, udpConn := range m.m {

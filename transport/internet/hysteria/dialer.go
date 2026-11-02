@@ -199,7 +199,7 @@ func (c *client) dial(ctx context.Context) error {
 		return errors.New("auth failed code ", resp.StatusCode)
 	}
 
-	// udp, _ := strconv.ParseBool(resp.Header.Get(ResponseHeaderUDPEnabled))
+	udpEnabled := parseUDPEnabled(resp.Header.Get(ResponseHeaderUDPEnabled))
 	down, _ := strconv.ParseUint(resp.Header.Get(CommonHeaderCCRX), 10, 64)
 	errors.LogDebug(context.Background(), "ECHAccepted ", conn.ConnectionState().TLS.ECHAccepted)
 
@@ -224,12 +224,16 @@ func (c *client) dial(ctx context.Context) error {
 	c.conn = conn
 	c.aliveTCP = &atomic.Int64{}
 	c.lastAlive = time.Now()
-	c.udpSM = &udpSessionManager{
-		conn: conn,
-		m:    make(map[uint32]*InterConn),
-		next: 1,
+	if udpEnabled {
+		c.udpSM = &udpSessionManager{
+			conn: conn,
+			m:    make(map[uint32]*InterConn),
+			next: 1,
+		}
+		go c.udpSM.run()
+	} else {
+		c.udpSM = nil
 	}
-	go c.udpSM.run()
 
 	return nil
 }
@@ -281,8 +285,16 @@ func (c *client) udp(ctx context.Context) (stat.Connection, error) {
 	if err != nil {
 		return nil, err
 	}
+	if c.udpSM == nil {
+		return nil, errors.New("server does not support UDP relay")
+	}
 
 	return c.udpSM.udp()
+}
+
+func parseUDPEnabled(value string) bool {
+	enabled, err := strconv.ParseBool(value)
+	return err == nil && enabled
 }
 
 func (c *client) clean(force bool) {
