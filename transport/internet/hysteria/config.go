@@ -22,6 +22,7 @@ const (
 	StatusAuthOK              = 233
 	FrameTypeTCPRequest       = 0x401
 	MaxDatagramFrameSize      = 1200
+	MaxUDPSize                = 4096
 	udpMessageChanSize        = 1024
 	idleCleanupInterval       = 1 * time.Second
 )
