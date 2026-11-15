@@ -15,12 +15,14 @@ pub mod engine;
 mod h3_transport;
 #[cfg(feature = "engine")]
 pub mod hopping;
+#[cfg(all(feature = "engine", any(target_os = "linux", target_os = "android")))]
+mod shared;
 #[cfg(feature = "probe")]
 pub mod socket;
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
-/// Version query only. No network engine lifecycle is exposed yet.
+/// Version of the setup/teardown and shared-memory storage ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn xhys_abi_version() -> u32 {
     ABI_VERSION

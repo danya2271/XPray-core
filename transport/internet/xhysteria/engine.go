@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -79,9 +80,18 @@ type PortHoppingConfig struct {
 }
 
 type frame struct {
-	kind byte
-	id   uint64
-	data []byte
+	kind    byte
+	id      uint64
+	data    []byte
+	storage *buf.Buffer
+}
+
+func (f *frame) release() {
+	if f.storage != nil {
+		f.storage.Release()
+		f.storage = nil
+	}
+	f.data = nil
 }
 
 func readFrame(r io.Reader) (frame, error) {
@@ -93,8 +103,15 @@ func readFrame(r io.Reader) (frame, error) {
 	if n > maxFrame || header[1] != 0 || header[2] != 0 || header[3] != 0 {
 		return frame{}, errors.New("invalid native frame")
 	}
-	f := frame{kind: header[0], id: binary.BigEndian.Uint64(header[4:]), data: make([]byte, int(n))}
+	f := frame{kind: header[0], id: binary.BigEndian.Uint64(header[4:])}
+	if n != 0 {
+		f.storage = buf.NewWithSize(int32(n))
+		f.data = f.storage.Extend(int32(n))
+	}
 	_, err := io.ReadFull(r, f.data)
+	if err != nil {
+		f.release()
+	}
 	return f, err
 }
 
@@ -113,7 +130,8 @@ func writeFrame(w io.Writer, f frame) error {
 
 type Engine struct {
 	handle        unsafe.Pointer
-	pipe          net.Conn
+	bridge        frameBridge
+	arenaBytes    int64
 	local, remote net.Addr
 	mu            sync.Mutex
 	flows         map[uint64]*Conn
@@ -123,25 +141,46 @@ type Engine struct {
 	closeOnce     sync.Once
 	wg            sync.WaitGroup
 	accept        func(*Conn)
+	submitMu      sync.Mutex
+	submitWG      sync.WaitGroup
+	stopping      bool
 }
 
 // Start duplicates the UDP descriptor in Rust; the caller still owns udp.
 func Start(ctx context.Context, config Config, udp *os.File, local, remote net.Addr, accept func(*Conn)) (*Engine, error) {
-	if uint32(C.xhys_abi_version()) != 1 {
+	if uint32(C.xhys_abi_version()) != 2 {
 		return nil, errors.New("native ABI version mismatch")
 	}
 	payload, err := json.Marshal(config)
 	if err != nil {
 		return nil, err
 	}
-	var fd C.int32_t
-	handle := C.xhys_engine_start((*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(payload))), C.uintptr_t(len(payload)), C.int32_t(udp.Fd()), &fd)
+	var handle unsafe.Pointer
+	var bridge frameBridge
+	var arenaBytes int64
+	if os.Getenv("XRAY_HYSTERIA_BRIDGE") != "socket" && (runtime.GOARCH == "arm64" || runtime.GOARCH == "amd64") {
+		var view C.XhysSharedView
+		handle = C.xhys_engine_start_shared((*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(payload))), C.uintptr_t(len(payload)), C.int32_t(udp.Fd()), &view)
+		if handle != nil {
+			bridge, err = sharedFromView(view)
+			arenaBytes = int64(view.len)
+		}
+	} else {
+		var fd C.int32_t
+		handle = C.xhys_engine_start((*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(payload))), C.uintptr_t(len(payload)), C.int32_t(udp.Fd()), &fd)
+		if handle != nil {
+			file := os.NewFile(uintptr(fd), "xhysteria-ipc")
+			var pipe net.Conn
+			pipe, err = net.FileConn(file)
+			file.Close()
+			if err == nil {
+				bridge = &socketBridge{pipe}
+			}
+		}
+	}
 	if handle == nil {
 		return nil, errors.New("native engine initialization failed")
 	}
-	file := os.NewFile(uintptr(fd), "xhysteria-ipc")
-	pipe, err := net.FileConn(file)
-	file.Close()
 	if err != nil {
 		C.xhys_engine_join(handle)
 		return nil, err
@@ -150,20 +189,34 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	pipe.SetReadDeadline(deadline)
-	stop := context.AfterFunc(ctx, func() { pipe.Close() })
-	ready, err := readFrame(pipe)
-	stop()
-	pipe.SetReadDeadline(time.Time{})
+	bridge.setReadDeadline(deadline)
+	stopped := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { bridge.close(); close(stopped) })
+	ready, err := bridge.read()
+	if !stop() {
+		<-stopped
+	}
+	bridge.setReadDeadline(time.Time{})
+	defer ready.release()
 	if err != nil || ready.kind != readyFrame {
-		pipe.Close()
+		bridge.close()
 		C.xhys_engine_join(handle)
 		if err != nil {
 			return nil, fmt.Errorf("native startup: %w", err)
 		}
 		return nil, fmt.Errorf("native startup: %s", ready.data)
 	}
-	e := &Engine{handle: handle, pipe: pipe, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept}
+	e := &Engine{handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept}
+	liveEngines.Add(1)
+	startedEngines.Add(1)
+	liveArenaBytes.Add(arenaBytes)
+	if config.Diagnostic {
+		mode := "socket"
+		if arenaBytes != 0 {
+			mode = "shared"
+		}
+		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] engine started bridge=%s arena_bytes=%d\n", mode, arenaBytes)
+	}
 	e.wg.Add(2)
 	go e.readLoop()
 	go e.writeLoop()
@@ -171,6 +224,10 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 }
 
 func (e *Engine) send(f frame, until time.Time) error {
+	if !e.beginSubmit() {
+		return net.ErrClosed
+	}
+	defer e.submitWG.Done()
 	var timeout <-chan time.Time
 	var timer *time.Timer
 	if !until.IsZero() {
@@ -191,10 +248,25 @@ func (e *Engine) send(f frame, until time.Time) error {
 	}
 }
 
+func (e *Engine) beginSubmit() bool {
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	if e.stopping {
+		return false
+	}
+	e.submitWG.Add(1)
+	return true
+}
+
 func (e *Engine) stop() {
 	e.closeOnce.Do(func() {
+		e.submitMu.Lock()
+		e.stopping = true
 		close(e.done)
-		e.pipe.Close()
+		e.submitMu.Unlock()
+		if e.bridge != nil {
+			e.bridge.close()
+		}
 		e.mu.Lock()
 		for _, c := range e.flows {
 			c.fail(net.ErrClosed)
@@ -207,24 +279,59 @@ func (e *Engine) stop() {
 func (e *Engine) Close() error {
 	e.stop()
 	e.wg.Wait()
+	e.submitWG.Wait()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.handle != nil {
 		C.xhys_engine_join(e.handle)
 		e.handle = nil
+		liveEngines.Add(-1)
+		liveArenaBytes.Add(-e.arenaBytes)
 	}
-	return nil
+	for {
+		select {
+		case f := <-e.out:
+			f.release()
+		default:
+			return nil
+		}
+	}
 }
+
+var liveEngines, startedEngines, liveArenaBytes atomic.Int64
+
+type RuntimeStats struct{ LiveEngines, StartedEngines, ArenaBytes int64 }
+
+func Stats() RuntimeStats {
+	return RuntimeStats{liveEngines.Load(), startedEngines.Load(), liveArenaBytes.Load()}
+}
+func (e *Engine) Done() <-chan struct{} { return e.done }
 
 func (e *Engine) writeLoop() {
 	defer e.wg.Done()
 	defer e.stop()
+	var batch [32]frame
 	for {
 		select {
 		case <-e.done:
 			return
 		case f := <-e.out:
-			if writeFrame(e.pipe, f) != nil {
+			batch[0] = f
+			n := 1
+		drain:
+			for n < len(batch) {
+				select {
+				case batch[n] = <-e.out:
+					n++
+				default:
+					break drain
+				}
+			}
+			err := e.bridge.writeBatch(batch[:n])
+			for i := range n {
+				batch[i].release()
+			}
+			if err != nil {
 				return
 			}
 		}
@@ -235,28 +342,32 @@ func (e *Engine) readLoop() {
 	defer e.wg.Done()
 	defer e.stop()
 	for {
-		f, err := readFrame(e.pipe)
+		f, err := e.bridge.read()
 		if err != nil {
 			return
 		}
 		if f.kind == errorFrame && f.id == 0 {
+			f.release()
 			return
 		}
 		e.mu.Lock()
 		c := e.flows[f.id]
 		if f.kind == incomingTCP || f.kind == incomingUDP {
 			if e.accept == nil || c != nil || len(e.flows) >= 128 {
+				f.release()
 				e.mu.Unlock()
 				e.send(frame{kind: closeFrame, id: f.id}, time.Now().Add(time.Second))
 				continue
 			}
 			if len(f.data) < 6 {
+				f.release()
 				e.mu.Unlock()
 				return
 			}
 			user := binary.BigEndian.Uint32(f.data)
 			peer, target, err := decodeAddress(f.data[4:])
 			if err != nil {
+				f.release()
 				e.mu.Unlock()
 				return
 			}
@@ -266,11 +377,13 @@ func (e *Engine) readLoop() {
 			}
 			dest, err := xnet.ParseDestination(network + string(target))
 			if err != nil {
+				f.release()
 				e.mu.Unlock()
 				return
 			}
 			remote, err := net.ResolveUDPAddr("udp", string(peer))
 			if err != nil {
+				f.release()
 				e.mu.Unlock()
 				return
 			}
@@ -279,22 +392,37 @@ func (e *Engine) readLoop() {
 			e.flows[f.id] = c
 			e.mu.Unlock()
 			go e.accept(c)
+			f.release()
 			continue
 		}
 		e.mu.Unlock()
 		if c == nil {
+			f.release()
 			continue
 		}
 		if f.kind == writableFrame {
+			f.release()
 			select {
 			case c.writeCredit <- struct{}{}:
 			default:
 			}
 			continue
 		}
+		c.mu.Lock()
+		if c.userClosed {
+			c.mu.Unlock()
+			f.release()
+			continue
+		}
+		queued := false
 		select {
 		case c.in <- f:
+			queued = true
 		default:
+		}
+		c.mu.Unlock()
+		if !queued {
+			f.release()
 			c.fail(errors.New("native receive queue capacity reached"))
 			e.mu.Lock()
 			delete(e.flows, c.id)
@@ -304,7 +432,7 @@ func (e *Engine) readLoop() {
 		if f.kind == errorFrame || f.kind == closeFrame {
 			err := error(io.EOF)
 			if f.kind == errorFrame {
-				err = fmt.Errorf("native flow: %s", f.data)
+				err = errors.New("native flow failed")
 			}
 			c.fail(err)
 			e.mu.Lock()
@@ -342,6 +470,7 @@ func (e *Engine) Open(ctx context.Context, target xnet.Destination) (*Conn, erro
 		c.Close()
 		return nil, net.ErrClosed
 	case f := <-c.in:
+		defer f.release()
 		if f.kind != openedFrame {
 			c.Close()
 			return nil, fmt.Errorf("native open: %s", f.data)
@@ -381,15 +510,19 @@ type Conn struct {
 	in                          chan frame
 	closed                      chan struct{}
 	once                        sync.Once
+	closeOnce                   sync.Once
+	closeErr                    error
 	mu                          sync.Mutex
 	readMu, writeMu             sync.Mutex
 	readDeadline, writeDeadline time.Time
 	changed                     chan struct{}
 	err                         error
 	pending                     []byte
+	pendingStorage              *buf.Buffer
 	writeCredit                 chan struct{}
 	eof                         bool
 	writeClosed                 bool
+	userClosed                  bool
 	OwnEngine                   bool
 }
 
@@ -410,15 +543,36 @@ func (c *Conn) fail(err error) {
 }
 
 func (c *Conn) Close() error {
-	c.fail(net.ErrClosed)
-	c.engine.mu.Lock()
-	delete(c.engine.flows, c.id)
-	c.engine.mu.Unlock()
-	err := c.engine.send(frame{kind: closeFrame, id: c.id}, time.Now().Add(time.Second))
-	if c.OwnEngine {
-		return c.engine.Close()
-	}
-	return err
+	c.closeOnce.Do(func() {
+		c.fail(net.ErrClosed)
+		c.mu.Lock()
+		c.userClosed = true
+		c.mu.Unlock()
+		c.engine.mu.Lock()
+		delete(c.engine.flows, c.id)
+		c.engine.mu.Unlock()
+		c.closeErr = c.engine.send(frame{kind: closeFrame, id: c.id}, time.Now().Add(time.Second))
+		c.readMu.Lock()
+		if c.pendingStorage != nil {
+			c.pendingStorage.Release()
+			c.pendingStorage = nil
+		}
+		c.pending = nil
+	drain:
+		for {
+			select {
+			case f := <-c.in:
+				f.release()
+			default:
+				break drain
+			}
+		}
+		c.readMu.Unlock()
+		if c.OwnEngine {
+			c.closeErr = c.engine.Close()
+		}
+	})
+	return c.closeErr
 }
 
 func (c *Conn) CloseWrite() error {
@@ -483,6 +637,7 @@ func (c *Conn) nextFrame() (frame, error) {
 func (c *Conn) received(f frame) (frame, error) {
 	if f.kind == dataFrame || f.kind == datagramFrame {
 		if err := c.engine.send(frame{kind: creditFrame, id: c.id}, time.Now().Add(10*time.Second)); err != nil {
+			f.release()
 			return frame{}, err
 		}
 	}
@@ -490,6 +645,12 @@ func (c *Conn) received(f frame) (frame, error) {
 }
 
 func (c *Conn) waitWrite(f *frame) error {
+	if f != nil {
+		if !c.engine.beginSubmit() {
+			return net.ErrClosed
+		}
+		defer c.engine.submitWG.Done()
+	}
 	for {
 		c.mu.Lock()
 		until, changed, err := c.writeDeadline, c.changed, c.err
@@ -566,18 +727,27 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 		switch f.kind {
 		case finFrame, closeFrame:
+			f.release()
 			c.eof = true
 			return 0, io.EOF
 		case errorFrame:
-			return 0, fmt.Errorf("native flow: %s", f.data)
+			err := fmt.Errorf("native flow: %s", f.data)
+			f.release()
+			return 0, err
 		case dataFrame:
 			c.pending = f.data
+			c.pendingStorage = f.storage
 		default:
+			f.release()
 			return 0, errors.New("unexpected native TCP frame")
 		}
 	}
 	n := copy(p, c.pending)
 	c.pending = c.pending[n:]
+	if len(c.pending) == 0 && c.pendingStorage != nil {
+		c.pendingStorage.Release()
+		c.pendingStorage = nil
+	}
 	return n, nil
 }
 
@@ -595,11 +765,14 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 	n := 0
 	for len(p) > 0 {
-		chunk := min(len(p), 32768)
+		chunk := min(len(p), 65536)
 		if err := c.awaitWriteCredit(); err != nil {
 			return n, err
 		}
-		if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: append([]byte(nil), p[:chunk]...)}); err != nil {
+		storage := buf.NewWithSize(int32(chunk))
+		storage.Write(p[:chunk])
+		if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: storage.Bytes(), storage: storage}); err != nil {
+			storage.Release()
 			return n, err
 		}
 		n += chunk
@@ -609,55 +782,125 @@ func (c *Conn) Write(p []byte) (int, error) {
 }
 
 func (c *Conn) ReadMultiBuffer() (buf.MultiBuffer, error) {
-	if c.target.Network == xnet.Network_TCP {
-		b := buf.NewWithSize(32768)
-		n, err := c.Read(b.Extend(32768))
-		if n == 0 {
-			b.Release()
-			return nil, err
-		}
-		b.Resize(0, int32(n))
-		return buf.MultiBuffer{b}, err
-	}
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
+	if c.target.Network == xnet.Network_TCP {
+		if c.eof {
+			return nil, io.EOF
+		}
+		if len(c.pending) != 0 {
+			b := c.pendingStorage
+			if b == nil {
+				b = buf.NewWithSize(int32(len(c.pending)))
+				b.Write(c.pending)
+			} else {
+				b.Advance(b.Len() - int32(len(c.pending)))
+			}
+			c.pending, c.pendingStorage = nil, nil
+			return buf.MultiBuffer{b}, nil
+		}
+		f, err := c.nextFrame()
+		if err != nil {
+			return nil, err
+		}
+		if f.kind != dataFrame {
+			defer f.release()
+			if f.kind == finFrame || f.kind == closeFrame {
+				c.eof = true
+				return nil, io.EOF
+			}
+			return nil, fmt.Errorf("native TCP flow: %s", f.data)
+		}
+		b := f.storage
+		if b == nil {
+			b = buf.NewWithSize(int32(len(f.data)))
+			b.Write(f.data)
+		}
+		return buf.MultiBuffer{b}, nil
+	}
 	f, err := c.nextFrame()
 	if err != nil {
 		return nil, err
 	}
 	if f.kind == closeFrame || f.kind == finFrame {
+		f.release()
 		return nil, io.EOF
 	}
 	if f.kind != datagramFrame {
+		f.release()
 		return nil, errors.New("native UDP flow failed")
 	}
 	address, payload, err := decodeAddress(f.data)
 	if err != nil || len(payload) > 4096 {
+		f.release()
 		return nil, errors.New("invalid native UDP datagram")
 	}
 	dest, err := xnet.ParseDestination("udp:" + string(address))
 	if err != nil {
+		f.release()
 		return nil, err
 	}
-	b := buf.NewWithSize(int32(len(payload)))
-	b.Write(payload)
+	b := f.storage
+	if b == nil {
+		b = buf.NewWithSize(int32(len(payload)))
+		b.Write(payload)
+	} else {
+		b.Advance(int32(len(f.data) - len(payload)))
+	}
 	b.UDP = &dest
 	return buf.MultiBuffer{b}, nil
 }
 
 func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	defer buf.ReleaseMulti(mb)
-	if c.target.Network == xnet.Network_UDP {
-		c.writeMu.Lock()
-		defer c.writeMu.Unlock()
-	}
-	for _, b := range mb {
-		if c.target.Network == xnet.Network_TCP {
-			if _, err := c.Write(b.Bytes()); err != nil {
+	defer func() { buf.ReleaseMulti(mb) }()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.target.Network == xnet.Network_TCP {
+		c.mu.Lock()
+		err, closed := c.err, c.writeClosed
+		c.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if closed {
+			return io.ErrClosedPipe
+		}
+		for len(mb) != 0 {
+			for len(mb) != 0 && mb[0].IsEmpty() {
+				mb[0].Release()
+				mb[0] = nil
+				mb = mb[1:]
+			}
+			if len(mb) == 0 {
+				break
+			}
+			if err := c.awaitWriteCredit(); err != nil {
 				return err
 			}
-			continue
+			storage := buf.NewWithSize(65536)
+			for len(mb) != 0 && storage.Len() < 65536 {
+				b := mb[0]
+				n := min(b.Len(), 65536-storage.Len())
+				storage.Write(b.BytesTo(n))
+				b.Advance(n)
+				if b.IsEmpty() {
+					b.Release()
+					mb[0] = nil
+					mb = mb[1:]
+				}
+			}
+			if storage.Len() == 0 {
+				storage.Release()
+				continue
+			}
+			if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: storage.Bytes(), storage: storage}); err != nil {
+				storage.Release()
+				return err
+			}
 		}
+		return nil
+	}
+	for _, b := range mb {
 		if b.Len() == 0 || b.Len() > 4096 {
 			return errors.New("native UDP size outside 1..4096")
 		}
@@ -665,9 +908,8 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if b.UDP != nil {
 			address = b.UDP.NetAddr()
 		}
-		data, err := encodeAddress(address, b.Bytes())
-		if err != nil {
-			return err
+		if len(address) == 0 || len(address) > 2048 {
+			return errors.New("invalid native UDP address")
 		}
 		c.mu.Lock()
 		closedErr := c.err
@@ -678,7 +920,14 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if err := c.awaitWriteCredit(); err != nil {
 			return err
 		}
-		if err := c.sendFrame(frame{kind: datagramFrame, id: c.id, data: data}); err != nil {
+		storage := buf.NewWithSize(int32(2+len(address)) + b.Len())
+		var size [2]byte
+		binary.BigEndian.PutUint16(size[:], uint16(len(address)))
+		storage.Write(size[:])
+		storage.WriteString(address)
+		storage.Write(b.Bytes())
+		if err := c.sendFrame(frame{kind: datagramFrame, id: c.id, data: storage.Bytes(), storage: storage}); err != nil {
+			storage.Release()
 			return err
 		}
 	}

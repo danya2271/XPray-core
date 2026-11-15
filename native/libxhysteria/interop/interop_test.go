@@ -274,7 +274,7 @@ func TestXrayClientAgainstNative(t *testing.T) {
 	}
 }
 
-func xrayServer(t *testing.T, masked bool) (string, string) {
+func xrayServer(t testing.TB, masked bool) (string, string) {
 	t.Helper()
 	certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
 	caPath := filepath.Join(t.TempDir(), "ca.pem")
@@ -349,7 +349,7 @@ func prototypeQuicParams() *internet.QuicParams {
 	return q
 }
 
-func echoTargets(t *testing.T) (string, string) {
+func echoTargets(t testing.TB) (string, string) {
 	t.Helper()
 	tcp, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

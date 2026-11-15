@@ -125,24 +125,80 @@ Port-hopping tests route through a multi-port UDP forwarder against both Go and
 native servers, with and without Salamander. The same TCP and fragmented UDP
 flows must survive at least two destination-port changes with stable local
 sockets; the base peer port is deliberately unreachable.
+Pool tests mix TCP and fragmented UDP on shared sessions, check that closing one
+flow preserves the others, and verify cleanup when the Xray instance stops.
+Ring tests exercise full queues, counter wraparound, notification wakeups, and
+buffer ownership after immediate slot reuse.
+
+## Session pooling and shared memory
+
+Linux/Android amd64 and arm64 use the shared-memory bridge by default. Each
+engine owns two bounded SPSC rings with 32 slots each and two nonblocking
+`eventfd` notification descriptors. The arena is 4,460,864 bytes (about 4.25 MiB),
+aligned to 64 bytes; ABI version 2 validates its layout during setup. A dedicated
+Go notification reader wakes both RX and blocked TX through Go netpoll. No CGO
+call is made to transfer traffic. The socket bridge remains available for
+comparison and rollback, and is the default on other supported architectures.
+
+Payloads are copied across the ownership boundary: Rust copies commands out of
+the ring, and Go copies events into pooled Xray buffers before releasing slots.
+Those buffers then pass directly to `ReadMultiBuffer`; native arena pointers
+never escape into Xray's forwarding buffers. This is not end-to-end zero-copy.
+TCP writes are coalesced up to 64 KiB; client reads aggregate available QUIC
+bytes without waiting to fill an entire chunk. Engine shutdown stops submissions,
+wakes blocked operations, joins dispatchers and Rust, then releases the arena.
+
+Each outbound lazily opens up to two QUIC sessions, sharing them across TCP and
+UDP flows with the same Xray instance, transport settings, and peer. Closing a
+flow preserves the session. There are 64 reserved flows per pooled session,
+a global limit of 16 pooled outbound sessions including handshakes in progress,
+and a 30-second idle timeout. A full pool waits for capacity with cancellation
+and a 10-second timeout. Closing its Xray instance or losing the native engine
+also retires sessions. A fixed negotiated Brutal rate restricts the pool to one
+session so pooling does not multiply the configured bandwidth allowance. This
+also covers an advertised RX limit when the local controller is BBR or Reno.
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `XRAY_HYSTERIA_NATIVE` | unset | `1` selects the native backend |
+| `XRAY_HYSTERIA_BRIDGE` | shared on amd64/arm64 | `socket` restores socket IPC |
+| `XRAY_HYSTERIA_POOL_SIZE` | `2` | `1..8` sessions per outbound; `0` restores per-flow engines |
+| `XRAY_NET_DIAG` | unset | `1` logs the active bridge and arena size |
+
+The existing Android native-backend preference still switches the entire backend
+to Go. Pool and bridge overrides are process environment settings; no additional
+Android preferences are required. Two active pooled sessions use about 8.5 MiB
+of ring storage. These figures exclude QUIC buffers, per-flow queues, native
+allocations, and Go heap usage, and the session limit does not include inbound
+listeners or explicitly selected per-flow engines.
+
+## Performance checks
+
+```sh
+bash native/libxhysteria/bench-linux.sh build_assets/native-perf
+# Also sample Rust stacks with Linux perf, if permitted by the host:
+XHYS_BENCH_PERF=1 bash native/libxhysteria/bench-linux.sh build_assets/native-perf
+```
+
+The harness compares Go, socket/shared bridges, and per-flow/pooled engines in
+separate processes. It records throughput, process CPU time, Go allocations,
+Go CPU/allocation profiles, and optional native stacks. See `PERFORMANCE.md`
+for methodology, measured results, and limitations. Profiling also identified
+and fixed an exact-size mismatch in Xray's regular buffer pool that had prevented
+buffer reuse in both Go and native traffic paths.
 
 ## Prototype boundaries
 
-This implementation is a copying, bounded socket-IPC baseline. Go uses netpoll
-on a Unix socket and CGO only for start/version/join; traffic does not call CGO.
-The shared-memory ring experiment in `src/ffi.rs` is not the active traffic path.
-No zero-copy or performance improvement is claimed yet.
-
-One native worker/QUIC connection is created for each outbound flow; the server
-uses one native worker per inbound listener. Connection pooling is still pending.
-Per-flow credits bound queued TCP data and apply backpressure; unread UDP
-datagrams are dropped when receive credits run out. Flow limits are currently
-128 per engine. QUIC's own buffers also consume memory.
+The server uses one native worker per inbound listener. Per-flow credits bound
+queued TCP data and apply backpressure; unread UDP datagrams are dropped when
+receive credits run out. Engine flow limits are currently 128; the outbound pool
+reserves at most 64 per session. The older standalone ring experiment in
+`src/ffi.rs` is separate from the active traffic ABI in `src/shared.rs`.
 
 The prototype supports Linux and an Android arm64 cross-build. Android native
-TCP throughput has been smoke-tested manually; hopping, UDP, sleep recovery,
-and network handover still need device validation. Windows notification/socket
-integration is pending.
+builds have been reported stable on a device; the new pooling/shared-memory
+path still needs device validation, particularly sleep recovery and network
+handover. Windows notification/socket integration is pending.
 Go creates and configures tunnel UDP sockets with Xray's system dialer/listener,
 then Rust duplicates the descriptor and owns packet I/O. This preserves socket
 controllers during setup, including Android protection where the embedding app

@@ -8,8 +8,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 )
+
+func TestEmptyTCPMultiBuffersPreserveWriteCredits(t *testing.T) {
+	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+	c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	c.SetWriteDeadline(time.Now().Add(time.Second))
+	for range 32 {
+		if err := c.WriteMultiBuffer(buf.MultiBuffer{buf.New(), buf.New()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(c.writeCredit) != 16 || len(e.out) != 0 {
+		t.Fatal("empty writes consumed credits or queued payload")
+	}
+}
 
 func TestChangingDeadlineInterruptsBlockedNativeReadAndWrite(t *testing.T) {
 	for _, write := range []bool{false, true} {

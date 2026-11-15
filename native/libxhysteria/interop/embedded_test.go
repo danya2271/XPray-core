@@ -194,7 +194,7 @@ func TestGoOutboundAgainstEmbeddedServer(t *testing.T) {
 	}
 }
 
-func embeddedClient(t *testing.T, server string, ca []byte, masked bool, hops ...*udphop.Config) *core.Instance {
+func embeddedClient(t testing.TB, server string, ca []byte, masked bool, hops ...*udphop.Config) *core.Instance {
 	t.Helper()
 	address, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {

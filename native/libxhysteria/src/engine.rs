@@ -5,7 +5,7 @@ use crate::{
     congestion,
     h3_transport::{self, Dispatch, Replay, Result},
     hopping::{self, HoppingSocket},
-    protocol,
+    protocol, shared,
     socket::MaskedSocket,
     udp::{Defragger, Message},
 };
@@ -491,8 +491,12 @@ async fn relay_client_tcp(
         Err("Go flow closed".into())
     };
     let down = async {
-        while let Some(chunk) = rx.read_chunk(65536, true).await? {
-            bus.payload(Frame::new(DATA, id, chunk.bytes)).await?;
+        // Quinn fills only the currently readable bytes, without waiting for a
+        // full 64 KiB. Coalescing ready QUIC fragments reduces bridge events.
+        let mut buffer = vec![0; 65536];
+        while let Some(n) = rx.read(&mut buffer).await? {
+            bus.payload(Frame::new(DATA, id, Bytes::copy_from_slice(&buffer[..n])))
+                .await?;
         }
         bus.send(Frame::new(FIN, id, Bytes::new())).await?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -778,10 +782,112 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
     Ok(())
 }
 
-async fn run(config: Config, socket: UdpSocket, bridge: tokio::net::UnixStream) -> Result<()> {
+enum Bridge {
+    Socket(tokio::net::UnixStream),
+    Shared(Arc<shared::Bridge>),
+}
+
+fn bridge_tasks(
+    bridge: Bridge,
+    mut outgoing: mpsc::Receiver<Frame>,
+    incoming: mpsc::Sender<Frame>,
+    tasks: &mut JoinSet<Result<()>>,
+) {
+    match bridge {
+        Bridge::Socket(bridge) => {
+            let (mut reader, mut writer) = bridge.into_split();
+            tasks.spawn(async move {
+                while let Some(frame) = outgoing.recv().await {
+                    write_frame(&mut writer, frame).await?;
+                }
+                Ok(())
+            });
+            tasks.spawn(async move {
+                while let Ok(frame) = read_frame(&mut reader).await {
+                    if incoming.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(())
+            });
+        }
+        Bridge::Shared(bridge) => {
+            tasks.spawn(bridge.clone().notifications());
+            let writer = bridge.clone();
+            tasks.spawn(async move {
+                while let Some(frame) = outgoing.recv().await {
+                    let mut pending = Some(frame);
+                    for _ in 0..32 {
+                        let Some(frame) = pending.take() else { break };
+                        loop {
+                            let changed = writer.changed.notified();
+                            tokio::pin!(changed);
+                            changed.as_mut().enable();
+                            if writer.closed() {
+                                return Ok(());
+                            }
+                            if writer.push(false, frame.kind, frame.id, &frame.data)? {
+                                break;
+                            }
+                            // Do not hold unpublished wakes while waiting for
+                            // the consumer to release a full event ring.
+                            writer.notify_go();
+                            changed.await;
+                        }
+                        pending = outgoing.try_recv().ok();
+                    }
+                    writer.notify_go();
+                    if let Some(frame) = pending {
+                        // The bounded batch ended with one prefetched frame.
+                        loop {
+                            let changed = writer.changed.notified();
+                            tokio::pin!(changed);
+                            changed.as_mut().enable();
+                            if writer.closed() {
+                                return Ok(());
+                            }
+                            if writer.push(false, frame.kind, frame.id, &frame.data)? {
+                                break;
+                            }
+                            changed.await;
+                        }
+                        writer.notify_go();
+                    }
+                }
+                Ok(())
+            });
+            tasks.spawn(async move {
+                loop {
+                    let changed = bridge.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if bridge.closed() {
+                        break;
+                    }
+                    let mut drained = false;
+                    while let Some((kind, id, data)) = bridge.pop(true)? {
+                        drained = true;
+                        if incoming.capacity() == 0 {
+                            bridge.notify_go();
+                        }
+                        if incoming.send(Frame::new(kind, id, data)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    if drained {
+                        bridge.notify_go();
+                    }
+                    changed.await;
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
     let ep = endpoint(&config, socket)?;
-    let (mut reader, mut writer) = bridge.into_split();
-    let (events, mut outgoing) = mpsc::channel(128);
+    let (events, outgoing) = mpsc::channel(128);
     let bus = Arc::new(Bus {
         events,
         flows: Mutex::new(HashMap::new()),
@@ -789,25 +895,8 @@ async fn run(config: Config, socket: UdpSocket, bridge: tokio::net::UnixStream) 
     });
     let config = Arc::new(config);
     let mut tasks = JoinSet::<Result<()>>::new();
-    tasks.spawn(async move {
-        while let Some(frame) = outgoing.recv().await {
-            write_frame(&mut writer, frame).await?;
-        }
-        Ok(())
-    });
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
-    tasks.spawn(async move {
-        loop {
-            let frame = match read_frame(&mut reader).await {
-                Ok(frame) => frame,
-                Err(_) => break,
-            };
-            if incoming_tx.send(frame).await.is_err() {
-                break;
-            }
-        }
-        Ok(())
-    });
+    bridge_tasks(bridge, outgoing, incoming_tx, &mut tasks);
     let mut client = None;
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let mut udp_enabled = false;
@@ -862,7 +951,10 @@ async fn run(config: Config, socket: UdpSocket, bridge: tokio::net::UnixStream) 
                         if !udp_enabled { bus.send(Frame::new(ERROR, id, "server disabled UDP")).await?; continue; }
                         let session = next_session;
                         next_session = next_session.checked_add(1).ok_or("UDP session IDs exhausted")?;
-                        let mut commands = bus.register(id, 0).await?;
+                        let Ok(mut commands) = bus.register(id, 0).await else {
+                            bus.send(Frame::new(ERROR, id, "native flow capacity reached")).await?;
+                            continue;
+                        };
                         sessions.lock().await.insert(session, id);
                         bus.send(Frame::new(OPENED, id, Bytes::new())).await?;
                         let connection = connection.clone(); let bus = bus.clone(); let sessions = sessions.clone();
@@ -911,6 +1003,7 @@ async fn run(config: Config, socket: UdpSocket, bridge: tokio::net::UnixStream) 
 
 pub struct Engine {
     worker: Option<JoinHandle<()>>,
+    shared: Option<Arc<shared::Bridge>>,
 }
 
 /// Starts one native worker. Input and output pointers must be valid for the call.
@@ -964,7 +1057,7 @@ pub unsafe extern "C" fn xhys_engine_start(
                         // Keep an error writer available when setup fails before the event pump starts.
                         let duplicate = unsafe { libc::dup(bridge.as_raw_fd()) };
                         let diagnostic = config.diagnostic;
-                        let result = run(config, udp, bridge).await;
+                        let result = run(config, udp, Bridge::Socket(bridge)).await;
                         if diagnostic && let Err(error) = &result {
                             eprintln!("[XRAY_NET_DIAG][XHYSTERIA] worker: {error}");
                         }
@@ -991,6 +1084,78 @@ pub unsafe extern "C" fn xhys_engine_start(
         }
         Ok(Engine {
             worker: Some(worker),
+            shared: None,
+        })
+    });
+    match result {
+        Ok(Ok(engine)) => Box::into_raw(Box::new(engine)).cast(),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// Starts the active shared-memory bridge. Both duplicated notification fds are
+/// transferred to Go; arena storage remains owned by the Engine until join.
+///
+/// # Safety
+/// Input pointers must be valid for the call. Go must cease every arena access
+/// before calling join, including accesses from pending read/write operations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_engine_start_shared(
+    config: *const u8,
+    len: usize,
+    udp_fd: i32,
+    out: *mut shared::View,
+) -> *mut c_void {
+    if config.is_null() || out.is_null() || len > 1024 * 1024 {
+        return std::ptr::null_mut();
+    }
+    let result = std::panic::catch_unwind(|| -> Result<Engine> {
+        let config: Config =
+            serde_json::from_slice(unsafe { std::slice::from_raw_parts(config, len) })?;
+        if config.users.len() > 1024
+            || (config.server && config.users.is_empty())
+            || config.tx_bps > i64::MAX as u64 / 2
+            || !["", "brutal", "force-brutal", "bbr", "reno"].contains(&config.congestion.as_str())
+            || (config.congestion == "force-brutal" && config.tx_bps == 0)
+        {
+            return Err("invalid native shared engine configuration".into());
+        }
+        let fd = unsafe { libc::fcntl(udp_fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let udp = unsafe { UdpSocket::from_raw_fd(fd) };
+        udp.set_nonblocking(true)?;
+        let bridge = shared::Bridge::new()?;
+        let owner = bridge.clone();
+        let worker = std::thread::Builder::new()
+            .name("xhysteria".into())
+            .spawn(move || {
+                let diagnostic = config.diagnostic;
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        runtime.block_on(run(config, udp, Bridge::Shared(bridge.clone())))
+                    }));
+                if diagnostic && !matches!(result, Ok(Ok(()))) {
+                    eprintln!("[XRAY_NET_DIAG][XHYSTERIA] shared worker: {result:?}");
+                }
+                bridge.close();
+            })?;
+        let view = match owner.view() {
+            Ok(view) => view,
+            Err(error) => {
+                owner.close();
+                let _ = worker.join();
+                return Err(error.into());
+            }
+        };
+        unsafe { *out = view };
+        Ok(Engine {
+            worker: Some(worker),
+            shared: Some(owner),
         })
     });
     match result {
@@ -1013,6 +1178,9 @@ pub unsafe extern "C" fn xhys_engine_join(engine: *mut c_void) {
         return;
     }
     let mut engine = unsafe { Box::from_raw(engine.cast::<Engine>()) };
+    if let Some(bridge) = &engine.shared {
+        bridge.close();
+    }
     if let Some(worker) = engine.worker.take() {
         let _ = worker.join();
     }

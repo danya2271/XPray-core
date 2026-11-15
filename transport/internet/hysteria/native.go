@@ -16,6 +16,7 @@ import (
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
@@ -186,22 +187,39 @@ func nativeDial(ctx context.Context, dest net.Destination, settings *internet.Me
 		config.ServerName = strings.Trim(dest.Address.String(), "[]")
 	}
 	dest.Network = net.Network_UDP
-	raw, err := internet.DialSystem(ctx, dest, settings.SocketSettings)
+	create := func(ctx context.Context) (*native.Engine, error) {
+		raw, err := internet.DialSystem(ctx, dest, settings.SocketSettings)
+		if err != nil {
+			return nil, err
+		}
+		defer raw.Close()
+		wrapped, ok := raw.(*net.PacketConnWrapper)
+		if !ok {
+			return nil, fmt.Errorf("native Hysteria cannot use a chained/custom outbound")
+		}
+		file, err := nativePacketFile(wrapped.PacketConn)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		current := config
+		current.Peer = raw.RemoteAddr().String()
+		return native.Start(ctx, current, file, raw.LocalAddr(), raw.RemoteAddr(), nil)
+	}
+	limit, err := nativePoolLimit(config)
 	if err != nil {
 		return nil, err
 	}
-	defer raw.Close()
-	wrapped, ok := raw.(*net.PacketConnWrapper)
-	if !ok {
-		return nil, fmt.Errorf("native Hysteria cannot use a chained/custom outbound")
+	if limit != 0 {
+		key := nativePoolKey{instance: core.FromContext(ctx), settings: settings, dest: dest, limit: limit, bridge: os.Getenv("XRAY_HYSTERIA_BRIDGE")}
+		pool := pooledNative.get(key)
+		conn, err := pool.open(ctx, target, create)
+		if err == stdnet.ErrClosed {
+			return pooledNative.get(key).open(ctx, target, create)
+		}
+		return conn, err
 	}
-	file, err := nativePacketFile(wrapped.PacketConn)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	config.Peer = raw.RemoteAddr().String()
-	engine, err := native.Start(ctx, config, file, raw.LocalAddr(), raw.RemoteAddr(), nil)
+	engine, err := create(ctx)
 	if err != nil {
 		return nil, err
 	}
