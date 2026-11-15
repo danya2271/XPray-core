@@ -211,6 +211,8 @@ func embeddedClient(t *testing.T, server string, ca []byte, masked bool) *core.I
 		})},
 		QuicParams: prototypeQuicParams(),
 	}
+	stream.QuicParams.MaxIdleTimeout = 45
+	stream.QuicParams.KeepAlivePeriod = 9
 	if masked {
 		stream.Udpmasks = []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: psk})}
 	}

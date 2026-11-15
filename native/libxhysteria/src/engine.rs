@@ -50,7 +50,7 @@ const WRITABLE: u8 = 14;
 const MAX_FRAME: usize = 65536 + 4096;
 const MAX_FLOWS: usize = 128;
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: bool,
@@ -68,6 +68,10 @@ pub struct Config {
     pub loss_compensation: bool,
     pub congestion: String,
     pub disable_pmtud: bool,
+    #[serde(default)]
+    pub max_idle_timeout: u64,
+    #[serde(default)]
+    pub keep_alive_period: u64,
     pub diagnostic: bool,
 }
 
@@ -268,11 +272,30 @@ fn roots(config: &Config) -> Result<rustls::RootCertStore> {
     Ok(roots)
 }
 
+fn quic_timers(config: &Config) -> Result<(Duration, Duration)> {
+    const MAX_TIMER_SECONDS: u64 = i64::MAX as u64 / 1_000_000_000;
+    if config.max_idle_timeout > MAX_TIMER_SECONDS || config.keep_alive_period > MAX_TIMER_SECONDS {
+        return Err("native QUIC timers exceed the Go duration range".into());
+    }
+    let idle = if config.max_idle_timeout == 0 {
+        30
+    } else {
+        config.max_idle_timeout
+    };
+    let alive = if config.keep_alive_period == 0 {
+        5
+    } else {
+        config.keep_alive_period
+    };
+    Ok((Duration::from_secs(idle), Duration::from_secs(alive)))
+}
+
 fn transport(config: &Config) -> Result<quinn::TransportConfig> {
+    let (idle, alive) = quic_timers(config)?;
     let mut t = quinn::TransportConfig::default();
     t.max_concurrent_bidi_streams(64u32.into())
-        .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
-        .keep_alive_interval(Some(Duration::from_secs(5)));
+        .max_idle_timeout(Some(idle.try_into()?))
+        .keep_alive_interval(Some(alive));
     t.datagram_receive_buffer_size(Some(256 * 1024));
     t.datagram_send_buffer_size(256 * 1024);
     t.assume_peer_max_datagram_frame_size(Some(1200));
@@ -971,5 +994,31 @@ pub unsafe extern "C" fn xhys_engine_join(engine: *mut c_void) {
     let mut engine = unsafe { Box::from_raw(engine.cast::<Engine>()) };
     if let Some(worker) = engine.worker.take() {
         let _ = worker.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quic_timers_preserve_defaults_and_profile_values() {
+        let mut config = Config::default();
+        assert_eq!(
+            quic_timers(&config).unwrap(),
+            (Duration::from_secs(30), Duration::from_secs(5))
+        );
+        config.max_idle_timeout = 45;
+        config.keep_alive_period = 9;
+        assert_eq!(
+            quic_timers(&config).unwrap(),
+            (Duration::from_secs(45), Duration::from_secs(9))
+        );
+        assert!(transport(&config).is_ok());
+        config.max_idle_timeout = u64::MAX;
+        assert!(transport(&config).is_err());
+        config.max_idle_timeout = 45;
+        config.keep_alive_period = u64::MAX;
+        assert!(transport(&config).is_err());
     }
 }

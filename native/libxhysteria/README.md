@@ -40,11 +40,18 @@ Use `-PxrayCargo=/path/to/cargo` or `-PxrayGo=/path/to/go` to override tools,
 and `-PxrayNative=false` for the old Go-only build. With `rebuildXray=true`,
 the same build runs before assembling the APK.
 
-Building in the module does **not** activate it. `bypclient` still launches
-Xray without `XRAY_HYSTERIA_NATIVE=1`. Its generated Hysteria configuration
-also needs changes before native activation: the prototype requires
-`disableChromeParrot=true` and rejects custom QUIC timers and UDP hopping.
-Do not enable the environment switch for those configurations unchanged.
+`bypclient` enables the native backend by default for supported Hysteria profiles.
+The **Settings > Network & DNS > Native Hysteria (Rust)** switch restores the Go
+backend when turned off. Reconnect the VPN after changing it. The preference is
+shared with the VPN process and isolated connectivity tests. Builds made with
+`-PxrayNative=false` disable this switch and use Go.
+
+The app sets `disableChromeParrot=true` and `XRAY_HYSTERIA_NATIVE=1` together,
+deriving the process environment from its saved configuration even on a fast
+restart. Profile QUIC idle/keepalive timers are passed to Rust. UDP hopping,
+unsupported UDP masks, and proxy chains select Go for the entire Xray process;
+their settings are preserved, not silently dropped. The VPN log identifies the
+selected backend and compatibility fallback reason.
 
 ## Enable the prototype
 
@@ -110,8 +117,8 @@ provides it; network handover and replacement sockets still need validation.
 
 Only Salamander is supported as a UDP mask, and only 404 HTTP masquerading is
 implemented. Unsupported masks, advanced TLS options, certificate reload,
-custom QUIC windows/timers, and user mutation are rejected explicitly. Restart
-the inbound to change its users. The native engine uses rustls/ring certificate
+custom QUIC windows/stream limits, and user mutation are rejected explicitly.
+Restart the inbound to change its users. The native engine uses rustls/ring certificate
 verification with bundled public roots and configured verification certificates;
 it does not implement Xray's ECH or QUIC/TLS fingerprint behavior.
 

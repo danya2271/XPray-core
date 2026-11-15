@@ -12,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -44,8 +45,12 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	if q.Congestion == "force-brutal" && q.BrutalUp == 0 {
 		return c, fmt.Errorf("force-brutal requires a positive send rate")
 	}
-	if q.InitStreamReceiveWindow != 0 || q.MaxStreamReceiveWindow != 0 || q.InitConnReceiveWindow != 0 || q.MaxConnReceiveWindow != 0 || q.MaxIdleTimeout != 0 || q.KeepAlivePeriod != 0 || q.MaxIncomingStreams != 0 || q.DisableStatelessReset {
-		return c, fmt.Errorf("native prototype does not support custom QUIC windows/timers/stream limits/reset policy")
+	if q.InitStreamReceiveWindow != 0 || q.MaxStreamReceiveWindow != 0 || q.InitConnReceiveWindow != 0 || q.MaxConnReceiveWindow != 0 || q.MaxIncomingStreams != 0 || q.DisableStatelessReset {
+		return c, fmt.Errorf("native prototype does not support custom QUIC windows/stream limits/reset policy")
+	}
+	const maxTimerSeconds = int64((1<<63 - 1) / time.Second)
+	if q.MaxIdleTimeout < 0 || q.MaxIdleTimeout > maxTimerSeconds || q.KeepAlivePeriod < 0 || q.KeepAlivePeriod > maxTimerSeconds {
+		return c, fmt.Errorf("native QUIC timers must be non-negative duration-safe seconds")
 	}
 	if len(t.EchServerKeys) != 0 || t.EchConfigList != "" || t.Fingerprint != "" || len(t.PinnedPeerCertSha256) != 0 || len(t.VerifyPeerCertByName) != 0 || t.UseSystemCa || t.RejectUnknownSni || t.MasterKeyLog != "" || len(t.CurvePreferences) != 0 || t.CipherSuites != "" || t.EnableSessionResumption || (t.MinVersion != "" && t.MinVersion != "1.3") || (t.MaxVersion != "" && t.MaxVersion != "1.3") {
 		return c, fmt.Errorf("native prototype does not support the selected advanced TLS settings")
@@ -63,6 +68,8 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	}
 	c.Congestion = q.Congestion
 	c.DisablePMTUD = q.DisablePathMtuDiscovery || runtime.GOOS == "android"
+	c.MaxIdleTimeout = uint64(q.MaxIdleTimeout)
+	c.KeepAlivePeriod = uint64(q.KeepAlivePeriod)
 	c.LossCompensation = !q.BrutalDisableLossCompensation
 	c.Diagnostic = os.Getenv("XRAY_NET_DIAG") == "1"
 	for _, entry := range t.Certificate {

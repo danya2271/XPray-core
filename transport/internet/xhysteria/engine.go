@@ -66,6 +66,8 @@ type Config struct {
 	LossCompensation bool     `json:"loss_compensation"`
 	Congestion       string   `json:"congestion"`
 	DisablePMTUD     bool     `json:"disable_pmtud"`
+	MaxIdleTimeout   uint64   `json:"max_idle_timeout"`
+	KeepAlivePeriod  uint64   `json:"keep_alive_period"`
 	Diagnostic       bool     `json:"diagnostic"`
 }
 
