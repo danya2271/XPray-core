@@ -26,6 +26,36 @@ func TestBufferClear(t *testing.T) {
 	}
 }
 
+func TestRegularBufferCapacityMatchesReleasePool(t *testing.T) {
+	for range 32 {
+		buffer := New()
+		if cap(buffer.Bytes()) != Size {
+			t.Fatalf("managed capacity %d cannot return to the %d-byte pool", cap(buffer.Bytes()), Size)
+		}
+		buffer.Write([]byte("reused"))
+		buffer.Release()
+		buffer.Release()
+		stack := StackNew()
+		if cap(stack.Bytes()) != Size {
+			t.Fatalf("stack buffer has incompatible pool capacity: %d", cap(stack.Bytes()))
+		}
+		if !stack.IsEmpty() {
+			t.Fatal("reused buffer retained its previous length")
+		}
+		stack.Release()
+	}
+}
+
+func BenchmarkRegularBufferReuse(b *testing.B) {
+	b.ReportAllocs()
+	b.SetBytes(Size)
+	for b.Loop() {
+		buffer := New()
+		buffer.Extend(32)
+		buffer.Release()
+	}
+}
+
 func TestBufferIsEmpty(t *testing.T) {
 	buffer := New()
 	defer buffer.Release()

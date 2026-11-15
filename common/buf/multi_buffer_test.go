@@ -178,7 +178,7 @@ func TestCompact(t *testing.T) {
 func TestCompactWithConsumed(t *testing.T) {
 	// make a consumed buffer (a.Start != 0)
 	a := New()
-	for range 8192 {
+	for range Size {
 		common.Must2(a.WriteString("a"))
 	}
 	a.Read(make([]byte, 2))
@@ -191,7 +191,7 @@ func TestCompactWithConsumed(t *testing.T) {
 	mb := MultiBuffer{a, b}
 	cmb := Compact(mb)
 	mbc := &MultiBufferContainer{mb}
-	mbc.Read(make([]byte, 8190))
+	mbc.Read(make([]byte, Size-2))
 
 	if w := cmb.String(); w != "bb" {
 		t.Error("unexpected Compact result ", w)

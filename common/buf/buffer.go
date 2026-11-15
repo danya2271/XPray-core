@@ -2,6 +2,7 @@ package buf
 
 import (
 	"io"
+	"sync"
 
 	"github.com/xtls/xray-core/common/bytespool"
 	"github.com/xtls/xray-core/common/errors"
@@ -15,7 +16,9 @@ const (
 
 var ErrBufferFull = errors.New("buffer is full")
 
-var pool = bytespool.GetPool(Size)
+// bytespool rounds 4096 up to 8192, while managed Release accepts only Size.
+// Keep an exact-sized pool so regular buffers are actually reused.
+var pool = &sync.Pool{New: func() any { return make([]byte, Size) }}
 
 // ownership represents the data owner of the buffer.
 type ownership uint8
@@ -37,7 +40,7 @@ type Buffer struct {
 	UDP       *net.Destination
 }
 
-// New creates a Buffer with 0 length and 8K capacity, managed.
+// New creates a managed Buffer with zero length and Size capacity.
 func New() *Buffer {
 	buf := pool.Get().([]byte)
 	if cap(buf) >= Size {
