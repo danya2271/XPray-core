@@ -24,4 +24,5 @@ message Config {
   string masq_string = 10;
   map<string, string> masq_string_headers = 11;
   int32 masq_string_status_code = 12;
+  bool native = 13;
 }

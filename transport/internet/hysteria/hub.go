@@ -199,7 +199,7 @@ func (l *Listener) Close() error {
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
-	if nativeRequested() {
+	if nativeRequested(streamSettings) {
 		return nativeListen(ctx, address, port, streamSettings, handler)
 	}
 	if address.Family().IsDomain() {

@@ -1,4 +1,4 @@
-//go:build xray_loopback
+//go:build xray_loopback || xray_server
 
 package conf
 

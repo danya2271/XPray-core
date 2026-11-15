@@ -2,7 +2,6 @@ package hysteria
 
 import (
 	"context"
-	"os"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -26,7 +25,6 @@ type Server struct {
 	config        *ServerConfig
 	validator     *account.Validator
 	policyManager policy.Manager
-	nativeBackend bool
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -54,7 +52,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		config:        config,
 		validator:     validator,
 		policyManager: p,
-		nativeBackend: os.Getenv("XRAY_HYSTERIA_NATIVE") == "1",
 	}, nil
 }
 
@@ -63,16 +60,10 @@ func (s *Server) HysteriaInboundValidator() *account.Validator {
 }
 
 func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
-	if s.nativeBackend {
-		return errors.New("native prototype user changes require restarting the inbound")
-	}
 	return s.validator.Add(user)
 }
 
 func (s *Server) RemoveUser(ctx context.Context, email string) error {
-	if s.nativeBackend {
-		return errors.New("native prototype user changes require restarting the inbound")
-	}
 	return s.validator.DelByEmail(email)
 }
 

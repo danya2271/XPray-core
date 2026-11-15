@@ -1,4 +1,4 @@
-//go:build xray_fakedns
+//go:build xray_fakedns || xray_server
 
 package conf
 
@@ -94,10 +94,10 @@ func (FakeDNSPostProcessingStage) Process(config *Config) error {
 	if fakeDNSInUse {
 		// Add a Fake DNS Config if there is none
 		if config.FakeDNS == nil {
-			config.FakeDNS = &FakeDNSConfig{}
+			var pools []*FakeDNSPoolElementConfig
 			switch {
 			case isIPv4Enable && isIPv6Enable:
-				config.FakeDNS.pools = []*FakeDNSPoolElementConfig{
+				pools = []*FakeDNSPoolElementConfig{
 					{
 						IPPool:  dns.FakeIPv4Pool,
 						LRUSize: 32768,
@@ -108,16 +108,22 @@ func (FakeDNSPostProcessingStage) Process(config *Config) error {
 					},
 				}
 			case !isIPv4Enable && isIPv6Enable:
-				config.FakeDNS.pool = &FakeDNSPoolElementConfig{
+				pools = []*FakeDNSPoolElementConfig{{
 					IPPool:  dns.FakeIPv6Pool,
 					LRUSize: 65535,
-				}
+				}}
 			case isIPv4Enable && !isIPv6Enable:
-				config.FakeDNS.pool = &FakeDNSPoolElementConfig{
+				pools = []*FakeDNSPoolElementConfig{{
 					IPPool:  dns.FakeIPv4Pool,
 					LRUSize: 65535,
-				}
+				}}
 			}
+			raw, err := json.Marshal(pools)
+			if err != nil {
+				return err
+			}
+			section := json.RawMessage(raw)
+			config.FakeDNS = &section
 		}
 
 		// Check if there is a Inbound with necessary sniffer on

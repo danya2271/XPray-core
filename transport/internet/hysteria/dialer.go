@@ -437,7 +437,7 @@ var (
 )
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
-	if nativeRequested() {
+	if nativeRequested(streamSettings) {
 		return nativeDial(ctx, dest, streamSettings)
 	}
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)

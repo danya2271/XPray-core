@@ -196,6 +196,11 @@ func TestGoOutboundAgainstEmbeddedServer(t *testing.T) {
 
 func embeddedClient(t testing.TB, server string, ca []byte, masked bool, hops ...*udphop.Config) *core.Instance {
 	t.Helper()
+	return embeddedClientWithAuth(t, server, ca, masked, auth, hops...)
+}
+
+func embeddedClientWithAuth(t testing.TB, server string, ca []byte, masked bool, password string, hops ...*udphop.Config) *core.Instance {
+	t.Helper()
 	address, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +208,7 @@ func embeddedClient(t testing.TB, server string, ca []byte, masked bool, hops ..
 	stream := &internet.StreamConfig{
 		ProtocolName: "hysteria",
 		TransportSettings: []*internet.TransportConfig{{
-			ProtocolName: "hysteria", Settings: serial.ToTypedMessage(&hytransport.Config{Auth: auth}),
+			ProtocolName: "hysteria", Settings: serial.ToTypedMessage(&hytransport.Config{Auth: password}),
 		}},
 		SecurityType: serial.GetMessageType(&xtls.Config{}),
 		SecuritySettings: []*serial.TypedMessage{serial.ToTypedMessage(&xtls.Config{

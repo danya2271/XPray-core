@@ -1,4 +1,4 @@
-//go:build xray_fakedns
+//go:build xray_fakedns || xray_server
 
 package conf
 

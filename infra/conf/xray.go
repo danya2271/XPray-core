@@ -620,10 +620,6 @@ func (c *Config) Build() (*core.Config, error) {
 	if err := PostProcessConfigureFile(c); err != nil {
 		return nil, errors.New("failed to post-process configuration file").Base(err)
 	}
-	if err := c.rejectDisabledConfigs(); err != nil {
-		return nil, err
-	}
-
 	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
@@ -665,6 +661,9 @@ func (c *Config) Build() (*core.Config, error) {
 		config.App = append(config.App, serial.ToTypedMessage(pc))
 	}
 
+	if err := c.buildDistroApps(config); err != nil {
+		return nil, err
+	}
 	config.App = append(config.App, serial.ToTypedMessage(&proxyman.InboundConfig{}))
 
 	var inbounds []InboundDetourConfig

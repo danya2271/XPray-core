@@ -61,7 +61,16 @@ func ContextWithNativeTarget(ctx context.Context, target net.Destination) contex
 	return context.WithValue(ctx, targetKey{}, target)
 }
 
-func nativeRequested() bool { return os.Getenv("XRAY_HYSTERIA_NATIVE") == "1" }
+func nativeRequested(settings *internet.MemoryStreamConfig) bool {
+	switch os.Getenv("XRAY_HYSTERIA_NATIVE") {
+	case "0":
+		return false
+	case "1":
+		return true
+	}
+	config, _ := settings.ProtocolSettings.(*Config)
+	return config.GetNative()
+}
 
 func ContextWithDatagram(ctx context.Context, v bool) context.Context {
 	return context.WithValue(ctx, datagramKey{}, v)

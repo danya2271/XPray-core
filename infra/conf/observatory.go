@@ -1,4 +1,4 @@
-//go:build xray_observatory
+//go:build xray_observatory || xray_server
 
 package conf
 

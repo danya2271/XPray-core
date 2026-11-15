@@ -1,4 +1,4 @@
-//go:build xray_wireguard
+//go:build xray_wireguard || xray_server
 
 package conf
 

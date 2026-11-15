@@ -1,4 +1,4 @@
-//go:build xray_metrics
+//go:build xray_metrics || xray_server
 
 package conf
 

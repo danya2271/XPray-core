@@ -31,6 +31,7 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
 )
 
 const (
@@ -47,30 +48,40 @@ const (
 	readyFrame    = 11
 	creditFrame   = 13
 	writableFrame = 14
+	authRequest   = 15
+	authResponse  = 16
+	authClosed    = 17
+	updateTLS     = 18
+	controlResult = 19
 	maxFrame      = 65536 + 4096
 )
 
 // Config is copied by Rust during setup. No Go pointers survive the CGO call.
 type Config struct {
-	Server           bool               `json:"server"`
-	Peer             string             `json:"peer"`
-	ServerName       string             `json:"server_name"`
-	Auth             string             `json:"auth"`
-	Users            []string           `json:"users"`
-	CAPEM            string             `json:"ca_pem"`
-	CertificatePEM   string             `json:"certificate_pem"`
-	KeyPEM           string             `json:"key_pem"`
-	Salamander       string             `json:"salamander"`
-	SystemRoots      bool               `json:"system_roots"`
-	TxBPS            uint64             `json:"tx_bps"`
-	RxBPS            uint64             `json:"rx_bps"`
-	LossCompensation bool               `json:"loss_compensation"`
-	Congestion       string             `json:"congestion"`
-	DisablePMTUD     bool               `json:"disable_pmtud"`
-	MaxIdleTimeout   uint64             `json:"max_idle_timeout"`
-	KeepAlivePeriod  uint64             `json:"keep_alive_period"`
-	PortHopping      *PortHoppingConfig `json:"port_hopping,omitempty"`
-	Diagnostic       bool               `json:"diagnostic"`
+	Server           bool                                      `json:"server"`
+	Peer             string                                    `json:"peer"`
+	ServerName       string                                    `json:"server_name"`
+	Auth             string                                    `json:"auth"`
+	Users            []string                                  `json:"users"`
+	CAPEM            string                                    `json:"ca_pem"`
+	CertificatePEM   string                                    `json:"certificate_pem"`
+	KeyPEM           string                                    `json:"key_pem"`
+	Salamander       string                                    `json:"salamander"`
+	SystemRoots      bool                                      `json:"system_roots"`
+	TxBPS            uint64                                    `json:"tx_bps"`
+	RxBPS            uint64                                    `json:"rx_bps"`
+	LossCompensation bool                                      `json:"loss_compensation"`
+	Congestion       string                                    `json:"congestion"`
+	DisablePMTUD     bool                                      `json:"disable_pmtud"`
+	MaxIdleTimeout   uint64                                    `json:"max_idle_timeout"`
+	KeepAlivePeriod  uint64                                    `json:"keep_alive_period"`
+	PortHopping      *PortHoppingConfig                        `json:"port_hopping,omitempty"`
+	Diagnostic       bool                                      `json:"diagnostic"`
+	ExternalAuth     bool                                      `json:"external_auth"`
+	UDPIdleTimeout   uint64                                    `json:"udp_idle_timeout"`
+	MaxFlows         uint32                                    `json:"max_flows"`
+	MaxConnections   uint32                                    `json:"max_connections"`
+	Authenticate     func(string) (*protocol.MemoryUser, bool) `json:"-"`
 }
 
 type PortHoppingConfig struct {
@@ -144,12 +155,27 @@ type Engine struct {
 	submitMu      sync.Mutex
 	submitWG      sync.WaitGroup
 	stopping      bool
+	authenticate  func(string) (*protocol.MemoryUser, bool)
+	authUsers     map[uint64]nativeIdentity
+	controls      map[uint64]chan frame
+	maxFlows      int
+}
+
+type nativeIdentity struct {
+	auth string
+	user *protocol.MemoryUser
 }
 
 // Start duplicates the UDP descriptor in Rust; the caller still owns udp.
 func Start(ctx context.Context, config Config, udp *os.File, local, remote net.Addr, accept func(*Conn)) (*Engine, error) {
-	if uint32(C.xhys_abi_version()) != 2 {
+	if config.MaxFlows > 65536 || config.MaxConnections > 4096 || (config.ExternalAuth && config.Authenticate == nil) {
+		return nil, errors.New("invalid native engine limits or authenticator")
+	}
+	if uint32(C.xhys_abi_version()) != 3 {
 		return nil, errors.New("native ABI version mismatch")
+	}
+	if config.Users == nil {
+		config.Users = []string{}
 	}
 	payload, err := json.Marshal(config)
 	if err != nil {
@@ -206,7 +232,15 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 		}
 		return nil, fmt.Errorf("native startup: %s", ready.data)
 	}
-	e := &Engine{handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept}
+	maxFlows := int(config.MaxFlows)
+	if maxFlows == 0 {
+		maxFlows = 128
+		if config.Server {
+			maxFlows = 1024
+		}
+	}
+	e := &Engine{handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept,
+		authenticate: config.Authenticate, authUsers: make(map[uint64]nativeIdentity), controls: make(map[uint64]chan frame), maxFlows: maxFlows}
 	liveEngines.Add(1)
 	startedEngines.Add(1)
 	liveArenaBytes.Add(arenaBytes)
@@ -272,6 +306,7 @@ func (e *Engine) stop() {
 			c.fail(net.ErrClosed)
 		}
 		e.flows = make(map[uint64]*Conn)
+		clear(e.authUsers)
 		e.mu.Unlock()
 	})
 }
@@ -306,6 +341,53 @@ func Stats() RuntimeStats {
 	return RuntimeStats{liveEngines.Load(), startedEngines.Load(), liveArenaBytes.Load()}
 }
 func (e *Engine) Done() <-chan struct{} { return e.done }
+
+// UpdateTLS replaces certificates for new handshakes; existing flows stay open.
+func (e *Engine) UpdateTLS(ctx context.Context, certificate, key string) error {
+	payload, err := json.Marshal(struct {
+		Certificate string `json:"certificate_pem"`
+		Key         string `json:"key_pem"`
+	}{certificate, key})
+	if err != nil {
+		return err
+	}
+	if len(payload) > maxFrame {
+		return errors.New("native certificate update exceeds bridge frame size")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	id := e.next.Add(1)
+	result := make(chan frame, 1)
+	e.mu.Lock()
+	e.controls[id] = result
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		delete(e.controls, id)
+		e.mu.Unlock()
+		select {
+		case f := <-result:
+			f.release()
+		default:
+		}
+	}()
+	deadline, _ := ctx.Deadline()
+	if err := e.send(frame{kind: updateTLS, id: id, data: payload}, deadline); err != nil {
+		return err
+	}
+	select {
+	case f := <-result:
+		defer f.release()
+		if len(f.data) != 0 {
+			return fmt.Errorf("native certificate update: %s", f.data)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.done:
+		return net.ErrClosed
+	}
+}
 
 func (e *Engine) writeLoop() {
 	defer e.wg.Done()
@@ -350,22 +432,75 @@ func (e *Engine) readLoop() {
 			f.release()
 			return
 		}
+		if f.kind == authRequest {
+			if len(f.data) < 8 {
+				f.release()
+				return
+			}
+			owner, auth := binary.BigEndian.Uint64(f.data), string(f.data[8:])
+			var user *protocol.MemoryUser
+			accepted := false
+			if e.authenticate != nil {
+				user, accepted = e.authenticate(auth)
+			}
+			e.mu.Lock()
+			if existing, ok := e.authUsers[owner]; ok && existing.auth != auth {
+				accepted = false
+			}
+			if accepted {
+				e.authUsers[owner] = nativeIdentity{auth: auth, user: user}
+			}
+			e.mu.Unlock()
+			response := []byte{0}
+			if accepted {
+				response[0] = 1
+			}
+			id := f.id
+			f.release()
+			if e.send(frame{kind: authResponse, id: id, data: response}, time.Now().Add(10*time.Second)) != nil {
+				return
+			}
+			continue
+		}
 		e.mu.Lock()
+		if f.kind == authClosed {
+			delete(e.authUsers, f.id)
+			e.mu.Unlock()
+			f.release()
+			continue
+		}
+		if f.kind == controlResult {
+			waiter := e.controls[f.id]
+			if waiter != nil {
+				waiter <- f
+			} else {
+				f.release()
+			}
+			e.mu.Unlock()
+			continue
+		}
 		c := e.flows[f.id]
 		if f.kind == incomingTCP || f.kind == incomingUDP {
-			if e.accept == nil || c != nil || len(e.flows) >= 128 {
+			if e.accept == nil || c != nil || len(e.flows) >= e.maxFlows {
 				f.release()
 				e.mu.Unlock()
 				e.send(frame{kind: closeFrame, id: f.id}, time.Now().Add(time.Second))
 				continue
 			}
-			if len(f.data) < 6 {
+			if len(f.data) < 14 {
 				f.release()
 				e.mu.Unlock()
 				return
 			}
 			user := binary.BigEndian.Uint32(f.data)
-			peer, target, err := decodeAddress(f.data[4:])
+			owner := binary.BigEndian.Uint64(f.data[4:])
+			identity, known := e.authUsers[owner]
+			if e.authenticate != nil && !known {
+				f.release()
+				e.mu.Unlock()
+				return
+			}
+			peer, target, err := decodeAddress(f.data[12:])
 			if err != nil {
 				f.release()
 				e.mu.Unlock()
@@ -389,6 +524,7 @@ func (e *Engine) readLoop() {
 			}
 			c = newConn(e, f.id, dest, remote)
 			c.UserIndex = user
+			c.User = identity.user
 			e.flows[f.id] = c
 			e.mu.Unlock()
 			go e.accept(c)
@@ -448,7 +584,7 @@ func (e *Engine) Open(ctx context.Context, target xnet.Destination) (*Conn, erro
 	id := e.next.Add(1)
 	c := newConn(e, id, target, e.remote)
 	e.mu.Lock()
-	if len(e.flows) >= 128 {
+	if len(e.flows) >= e.maxFlows {
 		e.mu.Unlock()
 		return nil, errors.New("native flow capacity reached")
 	}
@@ -507,6 +643,7 @@ type Conn struct {
 	target                      xnet.Destination
 	remote                      net.Addr
 	UserIndex                   uint32
+	User                        *protocol.MemoryUser
 	in                          chan frame
 	closed                      chan struct{}
 	once                        sync.Once

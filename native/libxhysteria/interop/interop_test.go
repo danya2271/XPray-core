@@ -276,6 +276,12 @@ func TestXrayClientAgainstNative(t *testing.T) {
 
 func xrayServer(t testing.TB, masked bool) (string, string) {
 	t.Helper()
+	address, ca, _ := xrayServerWithConfig(t, masked, nil)
+	return address, ca
+}
+
+func xrayServerWithConfig(t testing.TB, masked bool, modify func(*core.Config)) (string, string, *core.Instance) {
+	t.Helper()
 	certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
 	caPath := filepath.Join(t.TempDir(), "ca.pem")
 	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate}), 0600); err != nil {
@@ -306,13 +312,14 @@ func xrayServer(t testing.TB, masked bool) (string, string) {
 	if masked {
 		stream.Udpmasks = []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: psk})}
 	}
-	instance, err := core.New(&core.Config{
+	config := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
 			serial.ToTypedMessage(&proxyman.InboundConfig{}),
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 		},
 		Inbound: []*core.InboundHandlerConfig{{
+			Tag: "hysteria-test",
 			ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
 				PortList: &xnet.PortList{Range: []*xnet.PortRange{xnet.SinglePortRange(xnet.Port(port))}},
 				Listen:   xnet.NewIPOrDomain(xnet.LocalHostIP), StreamSettings: stream,
@@ -324,7 +331,11 @@ func xrayServer(t testing.TB, masked bool) (string, string) {
 		Outbound: []*core.OutboundHandlerConfig{{ProxySettings: serial.ToTypedMessage(&freedom.Config{
 			FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
 		})}},
-	})
+	}
+	if modify != nil {
+		modify(config)
+	}
+	instance, err := core.New(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +347,7 @@ func xrayServer(t testing.TB, masked bool) (string, string) {
 	if err := instance.Start(); err != nil {
 		t.Fatal(err)
 	}
-	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), caPath
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), caPath, instance
 }
 
 func prototypeQuicParams() *internet.QuicParams {

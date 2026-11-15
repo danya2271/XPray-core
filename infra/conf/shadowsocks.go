@@ -1,4 +1,4 @@
-//go:build xray_shadowsocks
+//go:build xray_shadowsocks || xray_server
 
 package conf
 

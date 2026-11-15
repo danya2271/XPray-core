@@ -20,7 +20,7 @@ mod shared;
 #[cfg(feature = "probe")]
 pub mod socket;
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Version of the setup/teardown and shared-memory storage ABI.
 #[unsafe(no_mangle)]

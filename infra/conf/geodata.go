@@ -1,4 +1,4 @@
-//go:build xray_geodata
+//go:build xray_geodata || xray_server
 
 package conf
 

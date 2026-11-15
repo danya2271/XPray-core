@@ -1,4 +1,4 @@
-//go:build xray_vless_inbound
+//go:build xray_vless_inbound || xray_server
 
 package conf
 

@@ -1,5 +1,4 @@
-//! First embedded engine: native QUIC workers and bounded framed socket IPC.
-//! The socket bridge is a copying correctness baseline for a future arena path.
+//! Embedded QUIC workers with bounded shared-memory or socket traffic bridges.
 
 use crate::{
     congestion,
@@ -31,7 +30,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 
@@ -48,10 +47,15 @@ const ERROR: u8 = 10;
 const READY: u8 = 11;
 const CREDIT: u8 = 13;
 const WRITABLE: u8 = 14;
+const AUTH_REQUEST: u8 = 15;
+const AUTH_RESPONSE: u8 = 16;
+const AUTH_CLOSED: u8 = 17;
+const UPDATE_TLS: u8 = 18;
+const CONTROL_RESULT: u8 = 19;
 const MAX_FRAME: usize = 65536 + 4096;
 const MAX_FLOWS: usize = 128;
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: bool,
@@ -76,6 +80,52 @@ pub struct Config {
     #[serde(default)]
     pub port_hopping: Option<hopping::Config>,
     pub diagnostic: bool,
+    #[serde(default)]
+    pub external_auth: bool,
+    #[serde(default)]
+    pub udp_idle_timeout: u64,
+    #[serde(default)]
+    pub max_flows: u32,
+    #[serde(default)]
+    pub max_connections: u32,
+}
+
+impl Config {
+    fn flow_limit(&self) -> usize {
+        if self.max_flows != 0 {
+            self.max_flows as usize
+        } else if self.server {
+            1024
+        } else {
+            MAX_FLOWS
+        }
+    }
+
+    fn connection_limit(&self) -> usize {
+        if self.max_connections == 0 {
+            256
+        } else {
+            self.max_connections as usize
+        }
+    }
+}
+
+fn runtime(config: &Config) -> io::Result<tokio::runtime::Runtime> {
+    let workers = if config.server {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+    } else {
+        1
+    };
+    let mut builder = if workers > 1 {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .worker_threads(workers)
+            .thread_name("xhysteria-quic");
+        builder
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    builder.enable_all().build()
 }
 
 #[derive(Debug)]
@@ -150,6 +200,19 @@ struct Bus {
     events: mpsc::Sender<Frame>,
     flows: Mutex<HashMap<u64, Flow>>,
     next: AtomicU64,
+    max_flows: usize,
+    pending_auth: std::sync::Mutex<HashMap<u64, oneshot::Sender<bool>>>,
+}
+
+struct AuthWaiter<'a> {
+    bus: &'a Bus,
+    id: u64,
+}
+
+impl Drop for AuthWaiter<'_> {
+    fn drop(&mut self) {
+        self.bus.pending_auth.lock().unwrap().remove(&self.id);
+    }
 }
 
 struct Flow {
@@ -167,7 +230,7 @@ impl Drop for Flow {
 impl Bus {
     async fn register(&self, id: u64, owner: u64) -> Result<mpsc::Receiver<Frame>> {
         let mut flows = self.flows.lock().await;
-        if flows.len() >= MAX_FLOWS || flows.contains_key(&id) {
+        if flows.len() >= self.max_flows || flows.contains_key(&id) {
             return Err("native flow capacity reached".into());
         }
         let (tx, rx) = mpsc::channel(16);
@@ -180,6 +243,19 @@ impl Bus {
             },
         );
         Ok(rx)
+    }
+    async fn authenticate(&self, owner: u64, auth: &[u8]) -> Result<bool> {
+        if auth.len() > MAX_FRAME - 8 {
+            return Ok(false);
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.pending_auth.lock().unwrap().insert(id, sender);
+        let _waiter = AuthWaiter { bus: self, id };
+        let mut request = owner.to_be_bytes().to_vec();
+        request.extend_from_slice(auth);
+        self.send(Frame::new(AUTH_REQUEST, id, request)).await?;
+        Ok(receiver.await.unwrap_or(false))
     }
     async fn send(&self, frame: Frame) -> Result<()> {
         self.events
@@ -320,6 +396,25 @@ fn transport(config: &Config) -> Result<quinn::TransportConfig> {
     Ok(t)
 }
 
+fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
+    let certs = rustls_pemfile::certs(&mut BufReader::new(config.certificate_pem.as_bytes()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(config.key_pem.as_bytes()))?
+        .ok_or("missing native server key")?;
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
+    ));
+    server.transport_config(Arc::new(transport(config)?));
+    Ok(server)
+}
+
 fn endpoint(config: &Config, socket: UdpSocket) -> Result<quinn::Endpoint> {
     if config.port_hopping.is_some() {
         if config.server {
@@ -346,22 +441,7 @@ fn endpoint(config: &Config, socket: UdpSocket) -> Result<quinn::Endpoint> {
         udp
     };
     let server = if config.server {
-        let certs = rustls_pemfile::certs(&mut BufReader::new(config.certificate_pem.as_bytes()))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let key = rustls_pemfile::private_key(&mut BufReader::new(config.key_pem.as_bytes()))?
-            .ok_or("missing native server key")?;
-        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-        tls.alpn_protocols = vec![b"h3".to_vec()];
-        let mut s = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
-        ));
-        s.transport_config(Arc::new(transport(config)?));
-        Some(s)
+        Some(server_config(config)?)
     } else {
         None
     };
@@ -536,6 +616,7 @@ async fn relay_server_tcp(
     let mut commands = bus.register(id, owner).await?;
     let result: Result<()> = async {
         let mut metadata = user.to_be_bytes().to_vec();
+        metadata.extend_from_slice(&owner.to_be_bytes());
         metadata.extend_from_slice(&address_data(peer.as_bytes(), &target)?);
         bus.send(Frame::new(INCOMING_TCP, id, metadata)).await?;
         h3_transport::write_raw(
@@ -643,6 +724,7 @@ async fn server_udp(
     bus: Arc<Bus>,
     peer: String,
     owner: u64,
+    idle: Duration,
 ) -> Result<()> {
     let start = Instant::now();
     let mut defrag = Defragger::new(128)?;
@@ -666,6 +748,7 @@ async fn server_udp(
                     let id = bus.next.fetch_add(1, Ordering::Relaxed);
                     let Ok(mut commands) = bus.register(id, owner).await else { continue };
                     let mut metadata = who.to_be_bytes().to_vec();
+                    metadata.extend_from_slice(&owner.to_be_bytes());
                     metadata.extend_from_slice(&address_data(peer.as_bytes(), &datagram.address)?);
                     bus.send(Frame::new(INCOMING_UDP, id, metadata)).await?;
                     let connection = connection.clone();
@@ -687,7 +770,7 @@ async fn server_udp(
                                     packet = packet.wrapping_add(1);
                                 }
                                 _ = expiry.tick() => {
-                                    if (start.elapsed().as_nanos() as u64).saturating_sub(activity.load(Ordering::Relaxed)) >= 60_000_000_000 { break; }
+                                    if (start.elapsed().as_nanos() as u64).saturating_sub(activity.load(Ordering::Relaxed)) >= idle.as_nanos() as u64 { break; }
                                 }
                             }
                         }
@@ -718,6 +801,11 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
         bus.clone(),
         peer.clone(),
         owner,
+        Duration::from_secs(if config.udp_idle_timeout == 0 {
+            60
+        } else {
+            config.udp_idle_timeout
+        }),
     ));
     let mut classifiers = JoinSet::new();
     let mut h3 =
@@ -725,7 +813,7 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
             .await?;
     loop {
         tokio::select! {
-            accepted = poll_fn(|cx| h3.poll_accept_request_stream(cx)), if classifiers.len() < 32 && tasks.len() < 64 => {
+            accepted = poll_fn(|cx| h3.poll_accept_request_stream(cx)), if classifiers.len() < 32 && tasks.len() < MAX_FLOWS + 1 => {
                 match accepted {
                     Ok(Some(stream)) => { classifiers.spawn(async { tokio::time::timeout(Duration::from_secs(10), h3_transport::classify(stream)).await? }); }
                     _ => break,
@@ -744,6 +832,7 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
                     let user = user.clone();
                     let config = config.clone();
                     let connection = connection.clone();
+                    let bus = bus.clone();
                     tasks.spawn(async move {
                         tokio::time::timeout(Duration::from_secs(10), async {
                             let (request, mut stream) = resolver.resolve_request().await?;
@@ -751,8 +840,12 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
                             if request.method() == "POST" && request.uri().host() == Some("hysteria") && request.uri().path() == "/auth"
                                 && request.headers().get("Hysteria-CC-RX").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).is_some()
                                 && let Some(auth) = request.headers().get("Hysteria-Auth") {
-                                for (index, password) in config.users.iter().enumerate() {
-                                    if bool::from(auth.as_bytes().ct_eq(password.as_bytes())) { matched = Some(index as u32); }
+                                if config.external_auth {
+                                    if bus.authenticate(owner, auth.as_bytes()).await? { matched = Some(0); }
+                                } else {
+                                    for (index, password) in config.users.iter().enumerate() {
+                                        if bool::from(auth.as_bytes().ct_eq(password.as_bytes())) { matched = Some(index as u32); }
+                                    }
                                 }
                             }
                             let response = if let Some(index) = matched {
@@ -779,6 +872,10 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
     tasks.abort_all();
     classifiers.abort_all();
     bus.close_owner(owner).await;
+    if config.external_auth {
+        bus.send(Frame::new(AUTH_CLOSED, owner, Bytes::new()))
+            .await?;
+    }
     Ok(())
 }
 
@@ -892,8 +989,11 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
         events,
         flows: Mutex::new(HashMap::new()),
         next: AtomicU64::new(1),
+        max_flows: config.flow_limit(),
+        pending_auth: std::sync::Mutex::new(HashMap::new()),
     });
     let config = Arc::new(config);
+    let connection_slots = Arc::new(Semaphore::new(config.connection_limit()));
     let mut tasks = JoinSet::<Result<()>>::new();
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     bridge_tasks(bridge, outgoing, incoming_tx, &mut tasks);
@@ -930,6 +1030,29 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
         tokio::select! {
             frame = incoming_rx.recv() => {
                 let Some(frame) = frame else { break };
+                if frame.kind == AUTH_RESPONSE {
+                    if let Some(sender) = bus.pending_auth.lock().unwrap().remove(&frame.id) {
+                        let _ = sender.send(frame.data.as_ref() == [1]);
+                    }
+                    continue;
+                }
+                if frame.kind == UPDATE_TLS {
+                    #[derive(Deserialize)]
+                    #[serde(deny_unknown_fields)]
+                    struct Certificate { certificate_pem: String, key_pem: String }
+                    let result = (|| -> Result<()> {
+                        if !config.server { return Err("not a native server".into()); }
+                        let certificate: Certificate = serde_json::from_slice(&frame.data)?;
+                        let mut updated = (*config).clone();
+                        updated.certificate_pem = certificate.certificate_pem;
+                        updated.key_pem = certificate.key_pem;
+                        ep.set_server_config(Some(server_config(&updated)?));
+                        Ok(())
+                    })();
+                    let data = result.err().map(|e| e.to_string()).unwrap_or_default();
+                    bus.send(Frame::new(CONTROL_RESULT, frame.id, data)).await?;
+                    continue;
+                }
                 if let Some(connection) = &client {
                     if frame.kind == OPEN_TCP {
                         let id = frame.id;
@@ -975,10 +1098,12 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
                 }
                 bus.route(frame).await;
             }
-            incoming = ep.accept(), if config.server && tasks.len() < 33 => {
+            incoming = ep.accept(), if config.server && connection_slots.available_permits() != 0 => {
                 if let Some(incoming) = incoming {
                     let config = config.clone(); let bus = bus.clone();
+                    let permit = connection_slots.clone().acquire_owned().await?;
                     tasks.spawn(async move {
+                        let _permit = permit;
                         if let Ok(connection) = incoming.await { let _ = serve(connection, config, bus).await; }
                         Ok(())
                     });
@@ -1026,7 +1151,12 @@ pub unsafe extern "C" fn xhys_engine_start(
     let result = std::panic::catch_unwind(|| -> Result<Engine> {
         let config: Config =
             serde_json::from_slice(unsafe { std::slice::from_raw_parts(config, len) })?;
-        if config.users.len() > 1024 || (config.server && config.users.is_empty()) {
+        if config.users.len() > 1024
+            || config.max_flows > 65536
+            || config.max_connections > 4096
+            || config.udp_idle_timeout > 600
+            || (config.server && config.users.is_empty() && !config.external_auth)
+        {
             return Err("invalid native user table".into());
         }
         if config.tx_bps > i64::MAX as u64 / 2
@@ -1047,10 +1177,7 @@ pub unsafe extern "C" fn xhys_engine_start(
             .name("xhysteria".into())
             .spawn(move || {
                 let _ = std::panic::catch_unwind(|| {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("native runtime");
+                    let runtime = runtime(&config).expect("native runtime");
                     runtime.block_on(async {
                         let bridge =
                             tokio::net::UnixStream::from_std(native).expect("native bridge");
@@ -1113,7 +1240,10 @@ pub unsafe extern "C" fn xhys_engine_start_shared(
         let config: Config =
             serde_json::from_slice(unsafe { std::slice::from_raw_parts(config, len) })?;
         if config.users.len() > 1024
-            || (config.server && config.users.is_empty())
+            || config.max_flows > 65536
+            || config.max_connections > 4096
+            || config.udp_idle_timeout > 600
+            || (config.server && config.users.is_empty() && !config.external_auth)
             || config.tx_bps > i64::MAX as u64 / 2
             || !["", "brutal", "force-brutal", "bbr", "reno"].contains(&config.congestion.as_str())
             || (config.congestion == "force-brutal" && config.tx_bps == 0)
@@ -1134,9 +1264,7 @@ pub unsafe extern "C" fn xhys_engine_start_shared(
                 let diagnostic = config.diagnostic;
                 let result =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
+                        let runtime = runtime(&config)?;
                         runtime.block_on(run(config, udp, Bridge::Shared(bridge.clone())))
                     }));
                 if diagnostic && !matches!(result, Ok(Ok(()))) {

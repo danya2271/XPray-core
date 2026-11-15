@@ -11,5 +11,5 @@ mkdir -p -- "$(dirname -- "$output")"
 # Go's cache does not track modifications inside external static archives.
 native_hash=$(sha256sum "$native_dir/target/release/libxhysteria.a")
 native_hash=${native_hash%% *}
-CGO_ENABLED=1 go build -tags xhysteria_native -trimpath -buildvcs=false -ldflags="-s -w -buildid=xhysteria-$native_hash" -o "$output" ./main
+CGO_ENABLED=1 go build -tags 'xhysteria_native xray_server' -trimpath -buildvcs=false -ldflags="-s -w -buildid=xhysteria-$native_hash" -o "$output" ./main
 printf 'Native Xray binary: %s\n' "$output"

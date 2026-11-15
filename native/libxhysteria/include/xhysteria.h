@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define XHYS_ABI_VERSION UINT32_C(2)
+#define XHYS_ABI_VERSION UINT32_C(3)
 
 typedef struct {
     uint8_t event_type;

@@ -83,10 +83,12 @@ also log the selected remote address when hopping. Client-side cascades and
 
 ## Enable the prototype
 
-Enable the prototype with `XRAY_HYSTERIA_NATIVE=1`. Existing Hysteria JSON stays
+Enable individual inbounds/outbounds with `"native": true` in
+`streamSettings.hysteriaSettings`, or set `XRAY_HYSTERIA_NATIVE=1` for the process.
+`XRAY_HYSTERIA_NATIVE=0` forces Go even when JSON selects native, preserving the
+Android preference and providing an operational rollback. Existing Hysteria JSON stays
 valid, but `streamSettings.finalmask.quicParams.disableChromeParrot` must be true.
-The switch applies to both Hysteria inbounds and outbounds in that process.
-Without the environment variable, the executable uses the existing Go backend.
+Without either selection, the executable uses the existing Go backend.
 
 For a local client/server test, create a one-day localhost certificate in the
 current directory:
@@ -106,8 +108,24 @@ XRAY_LOCATION_CERT="$PWD" XRAY_HYSTERIA_NATIVE=1 build_assets/xray-native run -c
 
 The client exposes SOCKS5 at `127.0.0.1:1080`, with TCP and UDP enabled. The
 examples listen on loopback and contain test passwords. The commands set Xray's
-certificate directory to the current directory. Certificate files require
-`oneTimeLoading: true`; inline PEM certificates are also supported.
+certificate directory to the current directory. Server certificate files with
+`oneTimeLoading: false` are checked every 30 seconds. A complete matching
+certificate/key pair replaces certificates for new handshakes without interrupting
+existing sessions. Invalid or incomplete updates retain the working certificate.
+Inline PEM certificates and `oneTimeLoading: true` are also supported.
+
+Linux builds include `-tags 'xhysteria_native xray_server'`. The server tag
+restores the config builders, API CLI/services, statistics, metrics, observatory,
+and server proxy registrations omitted by the Android distribution. It works
+with a Go-only build as well; Android builds do not enable it.
+
+Native server `/auth` validation uses Xray's current user validator over the
+bridge. The established connection retains its authenticated `MemoryUser`, so
+UUID routing aliases, policy, and per-user statistics stay in Go. `api adu/rmu`
+updates subsequent authentication without restarting the inbound; existing
+authenticated sessions keep their identity, matching the Go backend. Starting
+with an empty user list is supported. Direct C ABI consumers can still select
+the bounded static-user mode.
 
 ## Verify
 
@@ -129,13 +147,25 @@ Pool tests mix TCP and fragmented UDP on shared sessions, check that closing one
 flow preserves the others, and verify cleanup when the Xray instance stops.
 Ring tests exercise full queues, counter wraparound, notification wakeups, and
 buffer ownership after immediate slot reuse.
+Server tests also cover live user updates, UUID aliases, more than 1024 configured
+users, 160 concurrent flows, and TLS certificate replacement with active streams.
+To test a separately built NodeX server using DanVlessBot's actual config generator:
+
+```sh
+XHYS_SERVER_BINARY=/path/to/xray \
+XHYS_NODEX_CONFIG_DUMP=/path/to/DanVlessBot/build/native_hysteria_config_test \
+CGO_ENABLED=1 go test -tags 'xhysteria_native xhysteria_interop' \
+  ./native/libxhysteria/interop -run '^TestNodeXNativeServerBinary$' -count=1 -v
+```
 
 ## Session pooling and shared memory
 
 Linux/Android amd64 and arm64 use the shared-memory bridge by default. Each
 engine owns two bounded SPSC rings with 32 slots each and two nonblocking
 `eventfd` notification descriptors. The arena is 4,460,864 bytes (about 4.25 MiB),
-aligned to 64 bytes; ABI version 2 validates its layout during setup. A dedicated
+aligned to 64 bytes; storage layout version 2 is checked during setup. Engine
+ABI version 3 adds authentication/certificate control frames and connection
+ownership metadata. A dedicated
 Go notification reader wakes both RX and blocked TX through Go netpoll. No CGO
 call is made to transfer traffic. The socket bridge remains available for
 comparison and rollback, and is the default on other supported architectures.
@@ -160,7 +190,7 @@ also covers an advertised RX limit when the local controller is BBR or Reno.
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `XRAY_HYSTERIA_NATIVE` | unset | `1` selects the native backend |
+| `XRAY_HYSTERIA_NATIVE` | unset | `1` forces native, `0` forces Go; unset uses JSON selection |
 | `XRAY_HYSTERIA_BRIDGE` | shared on amd64/arm64 | `socket` restores socket IPC |
 | `XRAY_HYSTERIA_POOL_SIZE` | `2` | `1..8` sessions per outbound; `0` restores per-flow engines |
 | `XRAY_NET_DIAG` | unset | `1` logs the active bridge and arena size |
@@ -189,10 +219,14 @@ buffer reuse in both Go and native traffic paths.
 
 ## Prototype boundaries
 
-The server uses one native worker per inbound listener. Per-flow credits bound
+The server uses one native engine per inbound listener, with up to four Rust
+runtime worker threads (limited by available parallelism); clients retain one.
+Defaults allow 256 concurrent server connections and 1024 active TCP/UDP flows
+per listener, with bounded queues and backpressure. The Go client engine limit
+remains 128; the outbound pool
+reserves at most 64 per session. Per-flow credits bound
 queued TCP data and apply backpressure; unread UDP datagrams are dropped when
-receive credits run out. Engine flow limits are currently 128; the outbound pool
-reserves at most 64 per session. The older standalone ring experiment in
+receive credits run out. The older standalone ring experiment in
 `src/ffi.rs` is separate from the active traffic ABI in `src/shared.rs`.
 
 The prototype supports Linux and an Android arm64 cross-build. Android native
@@ -205,9 +239,10 @@ controllers during setup, including Android protection where the embedding app
 provides it; network handover and replacement sockets still need validation.
 
 Salamander and client-only remote port hopping are supported as UDP masks, and
-only 404 HTTP masquerading is implemented. Unsupported masks, advanced TLS options, certificate reload,
-custom QUIC windows/stream limits, and user mutation are rejected explicitly.
-Restart the inbound to change its users. The native engine uses rustls/ring certificate
+only 404 HTTP masquerading is implemented. Unsupported masks, advanced TLS
+options, verification-CA reload, and custom QUIC windows/stream limits are
+rejected explicitly. Server UDP idle timeout accepts the configured value
+(default 60 seconds). The native engine uses rustls/ring certificate
 verification with bundled public roots and configured verification certificates;
 it does not implement Xray's ECH or QUIC/TLS fingerprint behavior.
 

@@ -4,6 +4,7 @@ package hysteria
 
 import (
 	"context"
+	"crypto/subtle"
 	cryptotls "crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -12,12 +13,12 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
@@ -54,7 +55,7 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	if q.MaxIdleTimeout < 0 || q.MaxIdleTimeout > maxTimerSeconds || q.KeepAlivePeriod < 0 || q.KeepAlivePeriod > maxTimerSeconds {
 		return c, fmt.Errorf("native QUIC timers must be non-negative duration-safe seconds")
 	}
-	if len(t.EchServerKeys) != 0 || t.EchConfigList != "" || t.Fingerprint != "" || len(t.PinnedPeerCertSha256) != 0 || len(t.VerifyPeerCertByName) != 0 || t.UseSystemCa || t.RejectUnknownSni || t.MasterKeyLog != "" || len(t.CurvePreferences) != 0 || t.CipherSuites != "" || t.EnableSessionResumption || (t.MinVersion != "" && t.MinVersion != "1.3") || (t.MaxVersion != "" && t.MaxVersion != "1.3") {
+	if len(t.EchServerKeys) != 0 || t.EchConfigList != "" || t.Fingerprint != "" || len(t.PinnedPeerCertSha256) != 0 || len(t.VerifyPeerCertByName) != 0 || t.UseSystemCa || t.RejectUnknownSni || t.MasterKeyLog != "" || len(t.CurvePreferences) != 0 || t.CipherSuites != "" || t.EnableSessionResumption || (t.MinVersion != "" && t.MinVersion != "1.2" && t.MinVersion != "1.3") || (t.MaxVersion != "" && t.MaxVersion != "1.3") {
 		return c, fmt.Errorf("native prototype does not support the selected advanced TLS settings")
 	}
 	for _, alpn := range t.NextProtocol {
@@ -76,8 +77,8 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	c.Diagnostic = os.Getenv("XRAY_NET_DIAG") == "1"
 	for _, entry := range t.Certificate {
 		certificate, key := entry.Certificate, entry.Key
-		if (entry.CertificatePath != "" || entry.KeyPath != "") && !entry.OneTimeLoading {
-			return c, fmt.Errorf("native prototype requires oneTimeLoading for certificate files; reload is not implemented")
+		if (entry.CertificatePath != "" || entry.KeyPath != "") && !entry.OneTimeLoading && entry.Usage != tls.Certificate_ENCIPHERMENT {
+			return c, fmt.Errorf("native verification certificate reload is not supported")
 		}
 		if entry.OcspStapling != 0 || entry.BuildChain {
 			return c, fmt.Errorf("native prototype does not support OCSP or generated certificate chains")
@@ -235,9 +236,14 @@ func nativeDial(ctx context.Context, dest net.Destination, settings *internet.Me
 type nativeListener struct {
 	engine *native.Engine
 	addr   stdnet.Addr
+	wg     sync.WaitGroup
 }
 
-func (l *nativeListener) Close() error      { return l.engine.Close() }
+func (l *nativeListener) Close() error {
+	err := l.engine.Close()
+	l.wg.Wait()
+	return err
+}
 func (l *nativeListener) Addr() stdnet.Addr { return l.addr }
 
 type nativeInbound struct {
@@ -259,25 +265,26 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	if hy.MasqType != "" && hy.MasqType != "404" {
 		return nil, fmt.Errorf("native prototype supports 404 masquerading only")
 	}
-	if hy.UdpIdleTimeout != 0 && hy.UdpIdleTimeout != 60 {
-		return nil, fmt.Errorf("native prototype UDP idle timeout is fixed at 60 seconds")
+	if hy.UdpIdleTimeout < 0 || hy.UdpIdleTimeout > 600 {
+		return nil, fmt.Errorf("native UDP idle timeout must be 0..600 seconds")
 	}
 	if address.Family().IsDomain() {
 		return nil, fmt.Errorf("native listener requires an IP address")
 	}
 	config.Server = true
-	var users []*protocol.MemoryUser
-	if validator := ValidatorFromContext(ctx); validator != nil {
-		users = validator.GetAll()
-	}
-	for _, user := range users {
-		config.Users = append(config.Users, user.Account.(*account.MemoryAccount).Auth)
-	}
-	if len(config.Users) == 0 && hy.Auth != "" {
-		config.Users = []string{hy.Auth}
-	}
-	if len(config.Users) == 0 {
+	config.UDPIdleTimeout = uint64(hy.UdpIdleTimeout)
+	validator := ValidatorFromContext(ctx)
+	if validator == nil && hy.Auth == "" {
 		return nil, fmt.Errorf("native listener requires authentication")
+	}
+	config.ExternalAuth = true
+	config.Users = nil
+	config.Authenticate = func(auth string) (*protocol.MemoryUser, bool) {
+		if validator != nil && validator.NotEmpty() {
+			user := validator.Get(auth)
+			return user, user != nil
+		}
+		return nil, hy.Auth != "" && subtle.ConstantTimeCompare([]byte(auth), []byte(hy.Auth)) == 1
 	}
 	raw, err := internet.ListenSystemPacket(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, settings.SocketSettings)
 	if err != nil {
@@ -291,14 +298,21 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	defer file.Close()
 	local := raw.LocalAddr()
 	engine, err := native.Start(ctx, config, file, local, nil, func(conn *native.Conn) {
-		var user *protocol.MemoryUser
-		if int(conn.UserIndex) < len(users) {
-			user = users[conn.UserIndex]
-		}
-		handler(&nativeInbound{Conn: conn, user: user})
+		handler(&nativeInbound{Conn: conn, user: conn.User})
 	})
 	if err != nil {
 		return nil, err
 	}
-	return &nativeListener{engine: engine, addr: local}, nil
+	listener := &nativeListener{engine: engine, addr: local}
+	for _, certificate := range tls.ConfigFromStreamSettings(settings).Certificate {
+		if certificate.Usage == tls.Certificate_ENCIPHERMENT && !certificate.OneTimeLoading &&
+			(certificate.CertificatePath != "" || certificate.KeyPath != "") {
+			listener.wg.Add(1)
+			go func() {
+				defer listener.wg.Done()
+				watchNativeCertificate(engine, certificate, 30*time.Second)
+			}()
+		}
+	}
+	return listener, nil
 }

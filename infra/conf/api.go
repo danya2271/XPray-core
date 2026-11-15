@@ -1,4 +1,4 @@
-//go:build xray_api
+//go:build xray_api || xray_server
 
 package conf
 

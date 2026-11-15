@@ -1,4 +1,4 @@
-//go:build xray_vmess
+//go:build xray_vmess || xray_server
 
 package conf
 

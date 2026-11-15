@@ -8,8 +8,20 @@ import (
 	. "github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
+	hytransport "github.com/xtls/xray-core/transport/internet/hysteria"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestHysteriaNativeTransportConfig(t *testing.T) {
+	message, err := (&HysteriaConfig{Version: 2, Native: true, UdpIdleTimeout: 30}).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := message.(*hytransport.Config)
+	if !config.Native || config.UdpIdleTimeout != 30 {
+		t.Fatal("native transport settings were not preserved")
+	}
+}
 
 func TestHysteria2Aliases(t *testing.T) {
 	input := `{
