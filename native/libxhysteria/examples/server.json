@@ -1,0 +1,23 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": 8443,
+    "protocol": "hysteria",
+    "settings": { "users": [{ "auth": "change-this-test-password", "email": "native-test" }] },
+    "streamSettings": {
+      "network": "hysteria",
+      "security": "tls",
+      "hysteriaSettings": { "version": 2 },
+      "tlsSettings": {
+        "alpn": ["h3"],
+        "certificates": [{ "certificateFile": "cert.pem", "keyFile": "key.pem", "oneTimeLoading": true }]
+      },
+      "finalmask": {
+        "quicParams": { "disableChromeParrot": true, "congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps" },
+        "udp": [{ "type": "salamander", "settings": { "password": "change-this-salamander-password" } }]
+      }
+    }
+  }],
+  "outbounds": [{ "protocol": "freedom", "settings": { "finalRules": [{ "action": "allow" }] } }]
+}

@@ -89,7 +89,7 @@ impl Ring {
 pub struct XhysBridge {
     commands: Ring,
     events: Ring,
-    arena: Box<[u8]>,
+    arena: Box<[UnsafeCell<u8>]>,
     closed: AtomicBool,
     event_fd: i32,
 }
@@ -148,17 +148,15 @@ pub extern "C" fn xhys_bridge_create(arena_bytes: u64, ring_capacity: u32) -> *m
     let Some(events) = Ring::new(capacity) else {
         return ptr::null_mut();
     };
-    let Some(arena) = Vec::<u8>::new()
-        .try_reserve_exact(arena_bytes)
-        .ok()
-        .map(|_| vec![0u8; arena_bytes].into_boxed_slice())
-    else {
+    let mut arena = Vec::new();
+    if arena.try_reserve_exact(arena_bytes).is_err() {
         return ptr::null_mut();
-    };
+    }
+    arena.resize_with(arena_bytes, || UnsafeCell::new(0u8));
     let bridge = XhysBridge {
         commands,
         events,
-        arena,
+        arena: arena.into_boxed_slice(),
         closed: AtomicBool::new(false),
         event_fd: create_event_fd(),
     };
@@ -183,10 +181,10 @@ pub unsafe extern "C" fn xhys_bridge_arena(
     if bridge.is_null() || view.is_null() {
         return -1;
     }
-    let bridge = unsafe { &mut *bridge };
+    let bridge = unsafe { &*bridge };
     unsafe {
         *view = XhysArenaView {
-            data: bridge.arena.as_mut_ptr(),
+            data: bridge.arena.as_ptr().cast::<u8>().cast_mut(),
             len: bridge.arena.len() as u64,
         };
     }

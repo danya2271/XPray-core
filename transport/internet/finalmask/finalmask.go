@@ -41,6 +41,13 @@ type FinalMask struct {
 	listenPacket func(context.Context, net.Addr) (net.PacketConn, error)
 }
 
+// UDPMasks returns the configured masks for native transport capability checks.
+func (fm *FinalMask) UDPMasks() []UDPMask {
+	return slices.Clone(fm.udpMasks)
+}
+
+func (fm *FinalMask) HasTCPMasks() bool { return len(fm.tcpMasks) != 0 }
+
 func NewFinalMask(tcpMasks []TCPMask, udpMasks []UDPMask, dialTCP func(context.Context, net.Destination) (net.Conn, error), listen func(context.Context, net.Addr) (net.Listener, error), dialUDP func(context.Context, net.Destination) (net.PacketConn, net.Addr, error), listenPacket func(context.Context, net.Addr) (net.PacketConn, error)) *FinalMask {
 	slices.Reverse(tcpMasks)
 	slices.Reverse(udpMasks)

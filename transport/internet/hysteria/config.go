@@ -3,9 +3,11 @@ package hysteria
 import (
 	"context"
 	"math/rand"
+	"os"
 	"time"
 
 	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -53,6 +55,13 @@ var (
 )
 
 type datagramKey struct{}
+type targetKey struct{}
+
+func ContextWithNativeTarget(ctx context.Context, target net.Destination) context.Context {
+	return context.WithValue(ctx, targetKey{}, target)
+}
+
+func nativeRequested() bool { return os.Getenv("XRAY_HYSTERIA_NATIVE") == "1" }
 
 func ContextWithDatagram(ctx context.Context, v bool) context.Context {
 	return context.WithValue(ctx, datagramKey{}, v)

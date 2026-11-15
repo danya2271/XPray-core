@@ -613,7 +613,7 @@ impl Connection {
                     debug_assert!(untracked_bytes <= segment_size as u64);
 
                     let bytes_to_send = segment_size as u64 + untracked_bytes;
-                    if self.path.in_flight.bytes + bytes_to_send >= self.path.congestion.window() {
+                    if !self.path.congestion.can_send(self.path.in_flight.bytes, bytes_to_send) {
                         space_idx += 1;
                         congestion_blocked = true;
                         // We continue instead of breaking here in order to avoid
@@ -624,13 +624,17 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay(
-                        smoothed_rtt,
-                        bytes_to_send,
-                        self.path.current_mtu(),
-                        self.path.congestion.window(),
-                        now,
-                    ) {
+                    let pacing_delay = match self.path.congestion.pacing_deadline(now, smoothed_rtt) {
+                        Some(delay) => delay,
+                        None => self.path.pacing.delay(
+                            smoothed_rtt,
+                            bytes_to_send,
+                            self.path.current_mtu(),
+                            self.path.congestion.window(),
+                            now,
+                        ),
+                    };
+                    if let Some(delay) = pacing_delay {
                         self.timers.set(Timer::Pacing, delay);
                         congestion_blocked = true;
                         // Loss probes should be subject to pacing, even though
@@ -1767,6 +1771,7 @@ impl Connection {
             let old_bytes_in_flight = self.path.in_flight.bytes;
             let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
             self.stats.path.lost_packets += lost_packets.len() as u64;
+            self.path.congestion.on_packets_lost(now, lost_packets.len() as u64);
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
                 "packets lost: {:?}, bytes lost: {}",

@@ -74,11 +74,19 @@ impl Brutal {
     }
 
     pub fn congestion_window(&self, rtt_ns: u64) -> u64 {
+        self.window_for_rate(self.rate, rtt_ns)
+    }
+
+    pub fn set_rate(&mut self, rate: u64) {
+        assert!(rate > 0 && rate <= i64::MAX as u64 / 2);
+        self.rate = rate;
+    }
+
+    pub fn window_for_rate(&self, rate: u64, rtt_ns: u64) -> u64 {
         if rtt_ns == 0 {
             return 10240;
         }
-        ((self.rate as f64 * (rtt_ns as f64 / SECOND as f64) * 2.0 / self.ack_rate) as u64)
-            .max(self.mtu)
+        ((rate as f64 * (rtt_ns as f64 / SECOND as f64) * 2.0 / self.ack_rate) as u64).max(self.mtu)
     }
 
     pub fn set_max_datagram_size(&mut self, size: u16) -> bool {

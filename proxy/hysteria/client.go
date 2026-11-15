@@ -60,7 +60,8 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	ob.CanSpliceCopy = 3
 	target := ob.Target
 
-	conn, err := dialer.Dial(hysteria.ContextWithDatagram(ctx, target.Network == net.Network_UDP), c.server.Destination)
+	dialContext := hysteria.ContextWithNativeTarget(ctx, target)
+	conn, err := dialer.Dial(hysteria.ContextWithDatagram(dialContext, target.Network == net.Network_UDP), c.server.Destination)
 	if err != nil {
 		return errors.New("failed to find an available destination").Base(err)
 	}
@@ -84,6 +85,25 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	if newCtx != nil {
 		ctx = newCtx
+	}
+
+	if native, reader, writer, ok := nativeLink(conn); ok {
+		defer cancel()
+		requestDone := func() error {
+			defer timer.SetTimeout(sessionPolicy.Timeouts.DownlinkOnly)
+			if err := buf.Copy(link.Reader, writer, buf.UpdateActivity(timer)); err != nil {
+				return err
+			}
+			if target.Network == net.Network_TCP {
+				return native.CloseWrite()
+			}
+			return nil
+		}
+		responseDone := func() error {
+			defer timer.SetTimeout(sessionPolicy.Timeouts.UplinkOnly)
+			return buf.Copy(reader, link.Writer, buf.UpdateActivity(timer))
+		}
+		return task.Run(ctx, requestDone, task.OnSuccess(responseDone, task.Close(link.Writer)))
 	}
 
 	if target.Network == net.Network_TCP {

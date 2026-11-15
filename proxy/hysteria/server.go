@@ -2,6 +2,7 @@ package hysteria
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -25,6 +26,7 @@ type Server struct {
 	config        *ServerConfig
 	validator     *account.Validator
 	policyManager policy.Manager
+	nativeBackend bool
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -52,6 +54,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		config:        config,
 		validator:     validator,
 		policyManager: p,
+		nativeBackend: os.Getenv("XRAY_HYSTERIA_NATIVE") == "1",
 	}, nil
 }
 
@@ -60,10 +63,16 @@ func (s *Server) HysteriaInboundValidator() *account.Validator {
 }
 
 func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
+	if s.nativeBackend {
+		return errors.New("native prototype user changes require restarting the inbound")
+	}
 	return s.validator.Add(user)
 }
 
 func (s *Server) RemoveUser(ctx context.Context, email string) error {
+	if s.nativeBackend {
+		return errors.New("native prototype user changes require restarting the inbound")
+	}
 	return s.validator.DelByEmail(email)
 }
 
@@ -97,6 +106,14 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 			inbound.User = user
 			inbound.VlessRoute = user.Account.(*account.MemoryAccount).VR
 		}
+	}
+
+	if native, reader, writer, ok := nativeLink(conn); ok {
+		target := native.NativeHysteriaTarget()
+		ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+			From: conn.RemoteAddr(), To: target, Status: log.AccessAccepted, Email: inbound.User.Email,
+		})
+		return dispatcher.DispatchLink(ctx, target, &transport.Link{Reader: reader, Writer: writer})
 	}
 
 	if _, ok := iConn.(*hysteria.InterConn); ok {

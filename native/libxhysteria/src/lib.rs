@@ -7,6 +7,12 @@ pub mod protocol;
 pub mod salamander;
 pub mod udp;
 
+#[cfg(feature = "engine")]
+mod congestion;
+#[cfg(all(feature = "engine", unix))]
+pub mod engine;
+#[cfg(feature = "engine")]
+mod h3_transport;
 #[cfg(feature = "probe")]
 pub mod socket;
 

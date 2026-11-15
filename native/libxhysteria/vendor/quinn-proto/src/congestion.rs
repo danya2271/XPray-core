@@ -15,6 +15,22 @@ pub use new_reno::{NewReno, NewRenoConfig};
 
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
+    /// Override the stock window-derived pacer. `None` keeps the default;
+    /// `Some(None)` permits an immediate send; `Some(Some(t))` waits until `t`.
+    fn pacing_deadline(&mut self, _now: Instant, _rtt: crate::Duration) -> Option<Option<Instant>> {
+        None
+    }
+
+    /// Exact packet accounting for controllers that compensate packet loss.
+    /// MTU-probe losses are excluded, as in regular congestion accounting.
+    fn on_packets_lost(&mut self, _now: Instant, _packets: u64) {}
+
+    /// Whether another packet may be sent. The default preserves Quinn's
+    /// conservative full-packet window check.
+    fn can_send(&self, in_flight: u64, bytes_to_send: u64) -> bool {
+        in_flight.saturating_add(bytes_to_send) < self.window()
+    }
+
     /// One or more packets were just sent
     #[allow(unused_variables)]
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}

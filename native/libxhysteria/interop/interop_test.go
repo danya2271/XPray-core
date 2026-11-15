@@ -289,6 +289,8 @@ func xrayServer(t *testing.T, masked bool) (string, string) {
 	if err := reservation.Close(); err != nil {
 		t.Fatal(err)
 	}
+	serverCertificate := xtls.ParseCertificate(certificate)
+	serverCertificate.OneTimeLoading = true
 	stream := &internet.StreamConfig{
 		ProtocolName: "hysteria",
 		TransportSettings: []*internet.TransportConfig{{
@@ -297,8 +299,9 @@ func xrayServer(t *testing.T, masked bool) (string, string) {
 		}},
 		SecurityType: serial.GetMessageType(&xtls.Config{}),
 		SecuritySettings: []*serial.TypedMessage{serial.ToTypedMessage(&xtls.Config{
-			Certificate: []*xtls.Certificate{xtls.ParseCertificate(certificate)}, NextProtocol: []string{"h3"},
+			Certificate: []*xtls.Certificate{serverCertificate}, NextProtocol: []string{"h3"},
 		})},
+		QuicParams: prototypeQuicParams(),
 	}
 	if masked {
 		stream.Udpmasks = []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: psk})}
@@ -334,6 +337,16 @@ func xrayServer(t *testing.T, masked bool) (string, string) {
 		t.Fatal(err)
 	}
 	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), caPath
+}
+
+func prototypeQuicParams() *internet.QuicParams {
+	q := &internet.QuicParams{DisableChromeParrot: true}
+	if os.Getenv("XHYS_TEST_BRUTAL") == "1" {
+		q.Congestion = "brutal"
+		q.BrutalUp = 1_000_000
+		q.BrutalDown = 2_000_000
+	}
+	return q
 }
 
 func echoTargets(t *testing.T) (string, string) {

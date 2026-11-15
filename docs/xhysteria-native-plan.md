@@ -1,8 +1,11 @@
 # Native Hysteria 2 migration plan
 
-Status: corrected architecture proposal, checked against this checkout and
-upstream sources on 2026-11-15. This document does not implement or enable a
-native backend. Performance targets below require measurement.
+Status: architecture proposal checked against this checkout and upstream sources
+on 2026-11-15. An opt-in embedded Linux prototype is now implemented; see
+[build, run, validation, and prototype boundaries](../native/libxhysteria/README.md).
+Its active bridge uses bounded socket IPC as a copying baseline; the shared
+arena described below remains the target architecture. Performance targets
+require measurement.
 
 ## 1. Stack decision
 

@@ -37,6 +37,12 @@ int32_t xhys_bridge_event_fd(void *bridge);
 int32_t xhys_bridge_dup_event_fd(void *bridge);
 void xhys_bridge_close(void *bridge);
 
+/* Prototype socket bridge. Returned fd belongs to Go; udp_fd is duplicated.
+ * Close the Go fd before joining. Config is copied before start returns. */
+void *xhys_engine_start(const uint8_t *config_json, uintptr_t config_len,
+                       int32_t udp_fd, int32_t *bridge_fd);
+void xhys_engine_join(void *engine);
+
 #ifdef __cplusplus
 }
 #endif
