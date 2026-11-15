@@ -13,6 +13,8 @@ mod congestion;
 pub mod engine;
 #[cfg(feature = "engine")]
 mod h3_transport;
+#[cfg(feature = "engine")]
+pub mod hopping;
 #[cfg(feature = "probe")]
 pub mod socket;
 

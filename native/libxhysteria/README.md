@@ -48,10 +48,38 @@ shared with the VPN process and isolated connectivity tests. Builds made with
 
 The app sets `disableChromeParrot=true` and `XRAY_HYSTERIA_NATIVE=1` together,
 deriving the process environment from its saved configuration even on a fast
-restart. Profile QUIC idle/keepalive timers are passed to Rust. UDP hopping,
-unsupported UDP masks, and proxy chains select Go for the entire Xray process;
-their settings are preserved, not silently dropped. The VPN log identifies the
-selected backend and compatibility fallback reason.
+restart. Profile QUIC idle/keepalive timers are passed to Rust. Remote port hopping
+(`udphop` with `mode: "intervalRemote"`) runs in Rust, with or without Salamander.
+Local port/IP hopping, unsupported masks, and proxy chains still select Go for
+the entire Xray process; their settings are preserved, not silently dropped.
+The VPN log identifies the selected backend and compatibility fallback reason.
+
+### Remote port hopping
+
+Keep the existing `finalmask.udp` configuration, for example:
+
+```json
+[
+  {"type": "salamander", "settings": {"password": "example-secret"}},
+  {"type": "udphop", "settings": {
+    "mode": "intervalRemote", "interval": 120, "remotePorts": "12000-18000"
+  }}
+]
+```
+
+The server must already forward the configured UDP port range to its Hysteria
+listener, as it does for the Go backend. This is not a multi-port native server.
+The native client uses the same Go-created/protected UDP socket for every hop;
+it does not create unprotected replacement sockets. QUIC keeps one logical peer
+while the socket adapter changes the wire destination and accepts delayed
+replies from earlier configured ports. The initial port is also selected from
+the range, and successive choices differ when at least two distinct ports exist.
+Intervals may be a fixed value or Xray's min/max range, with a minimum of five
+seconds. Idle sockets choose their next port when they next send traffic.
+
+The app logs `Hysteria backend: native (Rust), UDP port hopping`. Debug builds
+also log the selected remote address when hopping. Client-side cascades and
+`intervalLocal`, `perConnRemote`, or `remoteIPs` configurations still use Go.
 
 ## Enable the prototype
 
@@ -93,6 +121,10 @@ Salamander, TCP, fragmented 4096-byte UDP, authentication/TLS rejection, concurr
 TCP, and negotiated Brutal. Standalone `xhys-probe` and `xhys-echo` fixtures remain
 available with `cargo build --locked --features probe --bins` in this directory.
 The echo fixture is an echo endpoint, not a routing proxy.
+Port-hopping tests route through a multi-port UDP forwarder against both Go and
+native servers, with and without Salamander. The same TCP and fragmented UDP
+flows must survive at least two destination-port changes with stable local
+sockets; the base peer port is deliberately unreachable.
 
 ## Prototype boundaries
 
@@ -107,16 +139,17 @@ Per-flow credits bound queued TCP data and apply backpressure; unread UDP
 datagrams are dropped when receive credits run out. Flow limits are currently
 128 per engine. QUIC's own buffers also consume memory.
 
-The prototype supports Linux and an Android arm64 cross-build. Android runtime
-and device interoperability still need validation. Windows notification/socket
+The prototype supports Linux and an Android arm64 cross-build. Android native
+TCP throughput has been smoke-tested manually; hopping, UDP, sleep recovery,
+and network handover still need device validation. Windows notification/socket
 integration is pending.
 Go creates and configures tunnel UDP sockets with Xray's system dialer/listener,
 then Rust duplicates the descriptor and owns packet I/O. This preserves socket
 controllers during setup, including Android protection where the embedding app
 provides it; network handover and replacement sockets still need validation.
 
-Only Salamander is supported as a UDP mask, and only 404 HTTP masquerading is
-implemented. Unsupported masks, advanced TLS options, certificate reload,
+Salamander and client-only remote port hopping are supported as UDP masks, and
+only 404 HTTP masquerading is implemented. Unsupported masks, advanced TLS options, certificate reload,
 custom QUIC windows/stream limits, and user mutation are rejected explicitly.
 Restart the inbound to change its users. The native engine uses rustls/ring certificate
 verification with bundled public roots and configured verification certificates;

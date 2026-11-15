@@ -22,6 +22,7 @@ import (
 	hyproxy "github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
+	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
 	hytransport "github.com/xtls/xray-core/transport/internet/hysteria"
 	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -193,7 +194,7 @@ func TestGoOutboundAgainstEmbeddedServer(t *testing.T) {
 	}
 }
 
-func embeddedClient(t *testing.T, server string, ca []byte, masked bool) *core.Instance {
+func embeddedClient(t *testing.T, server string, ca []byte, masked bool, hops ...*udphop.Config) *core.Instance {
 	t.Helper()
 	address, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
@@ -215,6 +216,9 @@ func embeddedClient(t *testing.T, server string, ca []byte, masked bool) *core.I
 	stream.QuicParams.KeepAlivePeriod = 9
 	if masked {
 		stream.Udpmasks = []*serial.TypedMessage{serial.ToTypedMessage(&salamander.Config{Password: psk})}
+	}
+	for _, hop := range hops {
+		stream.Udpmasks = append(stream.Udpmasks, serial.ToTypedMessage(hop))
 	}
 	client, err := core.New(&core.Config{
 		App: []*serial.TypedMessage{

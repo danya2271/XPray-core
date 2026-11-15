@@ -19,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
+	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	native "github.com/xtls/xray-core/transport/internet/xhysteria"
@@ -106,19 +107,51 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 			return c, fmt.Errorf("native Hysteria does not support TCP finalmasks")
 		}
 		masks := settings.FinalMask.UDPMasks()
-		if len(masks) > 1 {
-			return c, fmt.Errorf("native prototype supports one Salamander mask")
-		}
-		for _, mask := range masks {
-			s, ok := mask.(*salamander.Config)
-			if !ok {
+		for index, mask := range masks {
+			switch s := mask.(type) {
+			case *salamander.Config:
+				if c.Salamander != "" || len(s.Password) < 4 {
+					return c, fmt.Errorf("native Salamander requires one mask with a password of at least four bytes")
+				}
+				c.Salamander = s.Password
+			case *udphop.Config:
+				if index != 0 || c.PortHopping != nil {
+					return c, fmt.Errorf("native UDP hopping must be the outermost network mask")
+				}
+				var err error
+				c.PortHopping, err = nativePortHopping(s)
+				if err != nil {
+					return c, err
+				}
+			default:
 				return c, fmt.Errorf("unsupported native UDP mask %T", mask)
 			}
-			if len(s.Password) < 4 {
-				return c, fmt.Errorf("native Salamander password must have at least four bytes")
-			}
-			c.Salamander = s.Password
 		}
+	}
+	return c, nil
+}
+
+func nativePortHopping(hop *udphop.Config) (*native.PortHoppingConfig, error) {
+	const maxTimerSeconds = int64((1<<63 - 1) / time.Second)
+	if hop.Local || !hop.Remote || hop.RemoteOnce || len(hop.RemoteIPs) != 0 {
+		return nil, fmt.Errorf("native UDP hopping supports intervalRemote ports only, without local/IP hopping")
+	}
+	if hop.IntervalMin < 5 || hop.IntervalMax < hop.IntervalMin || hop.IntervalMax > maxTimerSeconds {
+		return nil, fmt.Errorf("native UDP hopping requires ordered intervals of at least five seconds")
+	}
+	if len(hop.RemotePorts) == 0 || len(hop.RemotePorts) > 65535 {
+		return nil, fmt.Errorf("native UDP hopping requires 1..65535 remote ports")
+	}
+	c := &native.PortHoppingConfig{
+		IntervalMin: uint64(hop.IntervalMin),
+		IntervalMax: uint64(hop.IntervalMax),
+		Ports:       make([]uint16, len(hop.RemotePorts)),
+	}
+	for i, port := range hop.RemotePorts {
+		if port == 0 || port > 65535 {
+			return nil, fmt.Errorf("invalid native UDP hopping port %d", port)
+		}
+		c.Ports[i] = uint16(port)
 	}
 	return c, nil
 }
@@ -200,6 +233,9 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	config, err := nativeConfig(settings)
 	if err != nil {
 		return nil, err
+	}
+	if config.PortHopping != nil {
+		return nil, fmt.Errorf("native UDP hopping is client-only")
 	}
 	hy := settings.ProtocolSettings.(*Config)
 	if hy.MasqType != "" && hy.MasqType != "404" {

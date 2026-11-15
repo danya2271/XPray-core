@@ -4,6 +4,7 @@
 use crate::{
     congestion,
     h3_transport::{self, Dispatch, Replay, Result},
+    hopping::{self, HoppingSocket},
     protocol,
     socket::MaskedSocket,
     udp::{Defragger, Message},
@@ -72,6 +73,8 @@ pub struct Config {
     pub max_idle_timeout: u64,
     #[serde(default)]
     pub keep_alive_period: u64,
+    #[serde(default)]
+    pub port_hopping: Option<hopping::Config>,
     pub diagnostic: bool,
 }
 
@@ -318,11 +321,29 @@ fn transport(config: &Config) -> Result<quinn::TransportConfig> {
 }
 
 fn endpoint(config: &Config, socket: UdpSocket) -> Result<quinn::Endpoint> {
+    if config.port_hopping.is_some() {
+        if config.server {
+            return Err("native UDP hopping is client-only".into());
+        }
+        if socket.peer_addr().is_ok() {
+            return Err("native UDP hopping requires an unconnected UDP socket".into());
+        }
+    }
     let runtime = Arc::new(quinn::TokioRuntime);
     let udp: Arc<dyn AsyncUdpSocket> = if config.salamander.is_empty() {
         runtime.wrap_udp_socket(socket)?
     } else {
         Arc::new(MaskedSocket::new(socket, config.salamander.as_bytes())?)
+    };
+    let udp: Arc<dyn AsyncUdpSocket> = if let Some(hop) = &config.port_hopping {
+        Arc::new(HoppingSocket::new(
+            udp,
+            config.peer.parse()?,
+            hop.clone(),
+            config.diagnostic,
+        )?)
+    } else {
+        udp
     };
     let server = if config.server {
         let certs = rustls_pemfile::certs(&mut BufReader::new(config.certificate_pem.as_bytes()))

@@ -51,24 +51,31 @@ const (
 
 // Config is copied by Rust during setup. No Go pointers survive the CGO call.
 type Config struct {
-	Server           bool     `json:"server"`
-	Peer             string   `json:"peer"`
-	ServerName       string   `json:"server_name"`
-	Auth             string   `json:"auth"`
-	Users            []string `json:"users"`
-	CAPEM            string   `json:"ca_pem"`
-	CertificatePEM   string   `json:"certificate_pem"`
-	KeyPEM           string   `json:"key_pem"`
-	Salamander       string   `json:"salamander"`
-	SystemRoots      bool     `json:"system_roots"`
-	TxBPS            uint64   `json:"tx_bps"`
-	RxBPS            uint64   `json:"rx_bps"`
-	LossCompensation bool     `json:"loss_compensation"`
-	Congestion       string   `json:"congestion"`
-	DisablePMTUD     bool     `json:"disable_pmtud"`
-	MaxIdleTimeout   uint64   `json:"max_idle_timeout"`
-	KeepAlivePeriod  uint64   `json:"keep_alive_period"`
-	Diagnostic       bool     `json:"diagnostic"`
+	Server           bool               `json:"server"`
+	Peer             string             `json:"peer"`
+	ServerName       string             `json:"server_name"`
+	Auth             string             `json:"auth"`
+	Users            []string           `json:"users"`
+	CAPEM            string             `json:"ca_pem"`
+	CertificatePEM   string             `json:"certificate_pem"`
+	KeyPEM           string             `json:"key_pem"`
+	Salamander       string             `json:"salamander"`
+	SystemRoots      bool               `json:"system_roots"`
+	TxBPS            uint64             `json:"tx_bps"`
+	RxBPS            uint64             `json:"rx_bps"`
+	LossCompensation bool               `json:"loss_compensation"`
+	Congestion       string             `json:"congestion"`
+	DisablePMTUD     bool               `json:"disable_pmtud"`
+	MaxIdleTimeout   uint64             `json:"max_idle_timeout"`
+	KeepAlivePeriod  uint64             `json:"keep_alive_period"`
+	PortHopping      *PortHoppingConfig `json:"port_hopping,omitempty"`
+	Diagnostic       bool               `json:"diagnostic"`
+}
+
+type PortHoppingConfig struct {
+	Ports       []uint16 `json:"ports"`
+	IntervalMin uint64   `json:"interval_min"`
+	IntervalMax uint64   `json:"interval_max"`
 }
 
 type frame struct {
