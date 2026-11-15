@@ -18,6 +18,36 @@ The output is `build_assets/xray-native`, with the Rust archive linked into the
 executable. No separate Hysteria process or `libxhysteria.so` is used. System
 libraries such as libc are still dynamically linked.
 
+## Build on Android arm64
+
+Install the Android NDK and the Rust standard library for Android:
+
+```sh
+rustup target add aarch64-linux-android
+bash native/libxhysteria/build-android-arm64.sh "$ANDROID_NDK_ROOT"
+```
+
+The script accepts NDK directory, API level (default 26), and output path.
+It builds the Rust archive for `aarch64-linux-android`, then links a PIE Android
+executable with CGO and `-tags xhysteria_native`. It does not use the Linux
+archive. `CARGO` and `GO` can select tool executables. Without `CARGO`, the script
+prefers `~/.cargo/bin/cargo` when available.
+
+In the sibling `bypclient` checkout, `./gradlew :app:buildXrayAndroid` uses this
+script by default. The task accepts `-PandroidNdk=/path/to/ndk`, or uses the NDK
+environment variables, or finds the newest installed NDK in the Android SDK.
+Use `-PxrayCargo=/path/to/cargo` or `-PxrayGo=/path/to/go` to override tools,
+and `-PxrayNative=false` for the old Go-only build. With `rebuildXray=true`,
+the same build runs before assembling the APK.
+
+Building in the module does **not** activate it. `bypclient` still launches
+Xray without `XRAY_HYSTERIA_NATIVE=1`. Its generated Hysteria configuration
+also needs changes before native activation: the prototype requires
+`disableChromeParrot=true` and rejects custom QUIC timers and UDP hopping.
+Do not enable the environment switch for those configurations unchanged.
+
+## Enable the prototype
+
 Enable the prototype with `XRAY_HYSTERIA_NATIVE=1`. Existing Hysteria JSON stays
 valid, but `streamSettings.finalmask.quicParams.disableChromeParrot` must be true.
 The switch applies to both Hysteria inbounds and outbounds in that process.
@@ -70,8 +100,9 @@ Per-flow credits bound queued TCP data and apply backpressure; unread UDP
 datagrams are dropped when receive credits run out. Flow limits are currently
 128 per engine. QUIC's own buffers also consume memory.
 
-The prototype supports Linux; Android has a CGO/Unix code path but has not yet
-been cross-built or tested. Windows notification/socket integration is pending.
+The prototype supports Linux and an Android arm64 cross-build. Android runtime
+and device interoperability still need validation. Windows notification/socket
+integration is pending.
 Go creates and configures tunnel UDP sockets with Xray's system dialer/listener,
 then Rust duplicates the descriptor and owns packet I/O. This preserves socket
 controllers during setup, including Android protection where the embedding app

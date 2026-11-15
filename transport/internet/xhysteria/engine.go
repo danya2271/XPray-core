@@ -4,7 +4,12 @@ package xhysteria
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../native/libxhysteria/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../native/libxhysteria/target/release -lxhysteria -ldl -lpthread -lm
+#cgo linux,!android LDFLAGS: -L${SRCDIR}/../../../native/libxhysteria/target/release -lxhysteria -ldl -lpthread -lm
+#cgo android,arm64 LDFLAGS: -L${SRCDIR}/../../../native/libxhysteria/target/aarch64-linux-android/release
+#cgo android,arm LDFLAGS: -L${SRCDIR}/../../../native/libxhysteria/target/armv7-linux-androideabi/release
+#cgo android,amd64 LDFLAGS: -L${SRCDIR}/../../../native/libxhysteria/target/x86_64-linux-android/release
+#cgo android,386 LDFLAGS: -L${SRCDIR}/../../../native/libxhysteria/target/i686-linux-android/release
+#cgo android LDFLAGS: -lxhysteria -ldl -lm -llog
 #include "xhysteria.h"
 */
 import "C"
