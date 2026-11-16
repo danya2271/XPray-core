@@ -142,3 +142,56 @@ parallel throughput; the existing limit of four workers remains unchanged.
 Cascade tests exercise two native servers under concurrent TCP and fragmented
 UDP traffic through two port changes on both legs, using each bridge. That is
 a bounded interoperability check, not a long-running VPS stability test.
+
+## Optimized bridge, November 16, 2026
+
+Implementation: `f1bc3bdf`. Run the isolated server harness:
+
+```sh
+XHYS_BENCH_MASKS=1 XHYS_BENCH_TIME=2s XHYS_BENCH_COUNT=3 \
+  bash native/libxhysteria/bench-server.sh build_assets/native-server-f1bc3bdf
+```
+
+The following arithmetic means cover three fresh processes per combination,
+alternating server order. All use Salamander, standard BBR, the shared bridge
+where native is selected, and `GOMAXPROCS=4`. Continuous upload/download count
+one direction and include the receiver's final acknowledgement. Transfer and
+Parallel count both directions as before. Go allocation bytes and total process
+CPU include both endpoints; they cannot isolate the server's own CPU or RSS.
+
+| Client | Server | Transfer MB/s | Parallel MB/s | Upload MB/s | Download MB/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Go | Go | 159.83 | 213.07 | 173.58 | 166.29 |
+| Go | Native | 143.77 | 217.84 | 178.34 | 282.63 |
+| Native, pool 2 | Go | 169.14 | 284.36 | 330.91 | 170.81 |
+| Native, pool 2 | Native | 205.98 | 471.43 | 385.64 | 325.56 |
+
+With the native client held constant, changing only the server improved
+Parallel by 66%, download by 91%, upload by 17%, and Transfer by 22%. Process
+CPU per operation decreased from 1.958 to 1.374 ms in Parallel and from 1.195
+to 0.603 ms in download; Go allocation bytes decreased from 28,225 to 5,277 and
+from 13,073 to 2,399 respectively. End-to-end native/native exceeded Go/Go by
+2.21x in Parallel and 2.22x in upload. Those are different-client comparisons,
+not proof that the server alone is twice as fast. With a Go client, native
+Transfer remains slower and total CPU work is higher in several workloads.
+
+| Client | Server | TCP idle p50/p99 us | TCP loaded p50/p99 us | UDP p50/p99 us |
+| --- | --- | ---: | ---: | ---: |
+| Go | Go | 128.8 / 218.4 | 455.3 / 1195.0 | 113.5 / 204.7 |
+| Go | Native | 141.2 / 258.4 | 496.6 / 1101.3 | 130.8 / 240.7 |
+| Native, pool 2 | Go | 144.3 / 248.4 | 389.2 / 1017.2 | 129.9 / 233.2 |
+| Native, pool 2 | Native | 138.7 / 246.6 | 489.6 / 1105.3 | 136.1 / 245.0 |
+
+The latency requirement is not met universally. Native/native improves idle
+TCP latency against the same client and Go server, but UDP and loaded TCP still
+regress. Loaded latency uses four unthrottled background transfers, so the
+faster backend also processes more background traffic; this is a saturation
+test, not a comparison at equal offered load. Long-running WAN/device tests,
+equal-load latency and packet-loss scenarios remain necessary. Raw output,
+archive hash, revision and source diff are in the ignored result directory.
+
+Changes measured here include GSO with independent Salamander salts,
+runtime-dispatched BLAKE2b, fewer shared-memory task hops and wakeups, grouped
+credits, raw Quinn TCP handoff after header parsing, and fewer buffer copies.
+Brutal stays restricted to one datagram per transmission. Payload batching uses
+only already available data, with no batching timer.
