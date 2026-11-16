@@ -5,12 +5,14 @@ package hysteria
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	native "github.com/xtls/xray-core/transport/internet/xhysteria"
 )
 
 func TestNativeServerResourceLimits(t *testing.T) {
@@ -35,6 +37,13 @@ func TestNativeServerResourceLimits(t *testing.T) {
 				t.Fatalf("limit=%d error=%v, want=%d error=%t", got, err, test.want, test.wantError)
 			}
 		})
+	}
+}
+
+func TestNativeFallbackAllowsQUICAndAuthStartupToFinish(t *testing.T) {
+	if nativeDialAttemptTimeout <= 10*time.Second || nativeDialAttemptTimeout >= native.StartupTimeout {
+		t.Fatalf("native dial timeout=%s must exceed the Rust 10s handshake and stay below startup timeout %s",
+			nativeDialAttemptTimeout, native.StartupTimeout)
 	}
 }
 
