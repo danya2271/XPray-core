@@ -195,3 +195,25 @@ runtime-dispatched BLAKE2b, fewer shared-memory task hops and wakeups, grouped
 credits, raw Quinn TCP handoff after header parsing, and fewer buffer copies.
 Brutal stays restricted to one datagram per transmission. Payload batching uses
 only already available data, with no batching timer.
+
+## Equal-load latency follow-up
+
+Combining the native wake-descriptor reader with command dispatch removes one
+task handoff. It continues servicing notification readiness while a control
+queue is full; a regression test explicitly blocks both that queue and the
+event ring. `BenchmarkNativePacedLatency` offers 64 MiB/s of background traffic
+on four connections, and reports actual background throughput. Three two-second
+repetitions with Salamander achieved 63.94-64.00 MiB/s on average:
+
+| Client | Server | TCP idle p50/p99 us | TCP at 64 MiB/s p50/p99 us | UDP p50/p99 us |
+| --- | --- | ---: | ---: | ---: |
+| Go | Go | 128.3 / 215.5 | 141.6 / 466.1 | 112.6 / 211.7 |
+| Go | Native | 136.0 / 235.6 | 158.2 / 513.8 | 130.0 / 236.4 |
+| Native, pool 2 | Go | 141.3 / 247.9 | 150.9 / 484.9 | 132.8 / 269.0 |
+| Native, pool 2 | Native | 137.2 / 251.0 | 148.7 / 412.6 | 135.2 / 245.2 |
+
+Raw results and archive hash: `build_assets/native-server-reactor-latency`.
+With the same native client, equal-load TCP p99 improved about 15%; idle TCP
+p99 remained similar. UDP median remained slightly higher, while UDP p99
+improved in this run. Go-client results still regress, and these measurements
+do not demonstrate universally lower latency or a universal 2x server speedup.

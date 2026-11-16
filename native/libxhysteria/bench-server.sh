@@ -7,7 +7,7 @@ output=${1:-"$repo_dir/build_assets/native-server-perf"}
 duration=${XHYS_BENCH_TIME:-2s}
 count=${XHYS_BENCH_COUNT:-3}
 cpus=${XHYS_BENCH_CPUS:-4}
-scenarios=${XHYS_BENCH_SCENARIOS:-"Transfer Parallel Upload Download Latency LoadedLatency UDPLatency"}
+scenarios=${XHYS_BENCH_SCENARIOS:-"Transfer Parallel Upload Download Latency LoadedLatency PacedLatency UDPLatency"}
 clients=${XHYS_BENCH_CLIENTS:-"go shared_pool2"}
 masks=${XHYS_BENCH_MASKS:-"0 1"}
 

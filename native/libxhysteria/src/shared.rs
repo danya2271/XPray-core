@@ -213,14 +213,17 @@ impl Bridge {
         }
     }
 
-    pub async fn notifications(self: Arc<Self>) -> Result<()> {
+    pub fn notification_fd(&self) -> Result<AsyncFd<OwnedFd>> {
         let fd = unsafe { libc::fcntl(self.native.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error().into());
         }
         // OwnedFd stays alive and its raw descriptor is never replaced while
         // registered with this reactor.
-        let fd = unsafe { AsyncFd::register(OwnedFd::from_raw_fd(fd)) }?;
+        Ok(unsafe { AsyncFd::register(OwnedFd::from_raw_fd(fd)) }?)
+    }
+
+    pub async fn notification(&self, fd: &AsyncFd<OwnedFd>) -> Result<()> {
         loop {
             let mut ready = fd.readable().await?;
             let read = ready.try_io(|fd| {
@@ -237,9 +240,7 @@ impl Bridge {
                 // then arm the next one before notifying ring waiters.
                 self.header().native_pending.swap(0, Ordering::AcqRel);
                 self.changed.notify_waiters();
-                if self.closed() {
-                    return Ok(());
-                }
+                return Ok(());
             } else if let Ok(Err(error)) = read {
                 return Err(error.into());
             }

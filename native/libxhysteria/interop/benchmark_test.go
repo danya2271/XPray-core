@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -252,6 +253,12 @@ func BenchmarkNativeLoadedLatency(b *testing.B) {
 	})
 }
 
+func BenchmarkNativePacedLatency(b *testing.B) {
+	benchmarkModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
+		benchmarkLatencyWithLoad(b, client, target, true, true)
+	})
+}
+
 func BenchmarkNativeUDPLatency(b *testing.B) {
 	benchmarkModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
 		_, udp := echoTargets(b)
@@ -262,6 +269,12 @@ func BenchmarkNativeUDPLatency(b *testing.B) {
 
 func benchmarkLatency(b *testing.B, client *core.Instance, target xnet.Destination, loaded bool) {
 	b.Helper()
+	benchmarkLatencyWithLoad(b, client, target, loaded, false)
+}
+
+func benchmarkLatencyWithLoad(b *testing.B, client *core.Instance, target xnet.Destination, loaded, paced bool) {
+	b.Helper()
+	var backgroundBytes atomic.Int64
 	if loaded {
 		var workers sync.WaitGroup
 		var load []net.Conn
@@ -279,6 +292,14 @@ func benchmarkLatency(b *testing.B, client *core.Instance, target xnet.Destinati
 			data, got := make([]byte, 65536), make([]byte, 65536)
 			benchmarkExchange(b, conn, data, got)
 			workers.Go(func() {
+				var ticks <-chan time.Time
+				if paced {
+					// Four workers, 128 exchanges/s, 64 KiB each way:
+					// 64 MiB/s offered load for either server backend.
+					ticker := time.NewTicker(time.Second / 128)
+					defer ticker.Stop()
+					ticks = ticker.C
+				}
 				report := func(err error) {
 					select {
 					case <-stop:
@@ -292,6 +313,13 @@ func benchmarkLatency(b *testing.B, client *core.Instance, target xnet.Destinati
 						return
 					default:
 					}
+					if paced {
+						select {
+						case <-stop:
+							return
+						case <-ticks:
+						}
+					}
 					if _, err := conn.Write(data); err != nil {
 						report(err)
 						return
@@ -300,6 +328,7 @@ func benchmarkLatency(b *testing.B, client *core.Instance, target xnet.Destinati
 						report(err)
 						return
 					}
+					backgroundBytes.Add(int64(2 * len(data)))
 				}
 			})
 		}
@@ -311,12 +340,17 @@ func benchmarkLatency(b *testing.B, client *core.Instance, target xnet.Destinati
 	samples := make([]int64, 0, 16384)
 	b.ReportAllocs()
 	b.ResetTimer()
+	started := time.Now()
+	before := backgroundBytes.Load()
 	for b.Loop() {
 		start := time.Now()
 		benchmarkExchange(b, conn, data, got)
 		samples = append(samples, time.Since(start).Nanoseconds())
 	}
 	b.StopTimer()
+	if loaded {
+		b.ReportMetric(float64(backgroundBytes.Load()-before)/time.Since(started).Seconds()/1024/1024, "background-MiB/s")
+	}
 	slices.Sort(samples)
 	for _, percentile := range []int{50, 95, 99} {
 		index := min(len(samples)-1, len(samples)*percentile/100)

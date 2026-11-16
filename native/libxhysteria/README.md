@@ -177,6 +177,9 @@ blocked TX directly through Go netpoll; a third wakes Rust. Coalesced pending
 flags reduce redundant notification syscalls without delaying data. No CGO
 call is made to transfer traffic. The socket bridge remains available for
 comparison and rollback, and is the default on other supported architectures.
+Rust handles wake descriptors and command dispatch in the same task. When a
+control queue is full, it continues handling notification readiness so that
+event-space backpressure cannot deadlock the engine.
 
 Payloads are copied across the ownership boundary: Rust copies commands out of
 the ring, and Go copies events into pooled Xray buffers before releasing slots.
@@ -250,7 +253,9 @@ bash native/libxhysteria/bench-server.sh build_assets/native-server-perf
 
 The harness alternates server order and covers Salamander on/off, single and
 parallel request/response traffic, continuous upload/download, TCP latency in
-idle and under four background transfers, and UDP latency. Latency output
+idle and under four background transfers, and UDP latency. `PacedLatency`
+offers the same 64 MiB/s background traffic to each backend and reports the
+achieved rate; `LoadedLatency` saturates each backend. Latency output
 includes p50/p95/p99. Environment overrides `XHYS_BENCH_TIME`,
 `XHYS_BENCH_COUNT`, `XHYS_BENCH_SCENARIOS`, `XHYS_BENCH_CLIENTS` and
 `XHYS_BENCH_MASKS` select a smaller matrix. Native archive hashes and the tracked

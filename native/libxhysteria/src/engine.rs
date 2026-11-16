@@ -1107,12 +1107,9 @@ fn bridge_tasks(
         }
         Bridge::Shared(bridge) => {
             drop(outgoing);
-            tasks.spawn(bridge.clone().notifications());
             tasks.spawn(async move {
+                let notification_fd = bridge.notification_fd()?;
                 loop {
-                    let changed = bridge.changed.notified();
-                    tokio::pin!(changed);
-                    changed.as_mut().enable();
                     if bridge.closed() {
                         break;
                     }
@@ -1127,22 +1124,36 @@ fn bridge_tasks(
                         if incoming.capacity() == 0 {
                             bridge.notify_space();
                         }
-                        if bus
-                            .command(&incoming, Frame::new(kind, id, data))
-                            .await
-                            .is_err()
-                        {
-                            return Ok(());
+                        let command = bus.command(&incoming, Frame::new(kind, id, data));
+                        tokio::pin!(command);
+                        loop {
+                            tokio::select! {
+                                result = &mut command => {
+                                    if result.is_err() { return Ok(()); }
+                                    break;
+                                }
+                                result = bridge.notification(&notification_fd) => {
+                                    result?;
+                                    if bridge.closed() { return Ok(()); }
+                                }
+                            }
                         }
                     }
                     if drained != 0 {
                         bridge.notify_space();
                     }
                     if drained == 32 || bytes >= 256 * 1024 {
+                        // Even a continuously full command ring must service
+                        // event-space notifications before the next batch.
+                        tokio::select! {
+                            biased;
+                            result = bridge.notification(&notification_fd) => result?,
+                            _ = std::future::ready(()) => (),
+                        }
                         tokio::task::yield_now().await;
                         continue;
                     }
-                    changed.await;
+                    bridge.notification(&notification_fd).await?;
                 }
                 Ok(())
             });
@@ -1516,6 +1527,76 @@ pub unsafe extern "C" fn xhys_engine_join(engine: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_control_queue_still_delivers_event_space_notifications() {
+        use std::future::Future;
+        use std::os::fd::OwnedFd;
+        let bridge = shared::Bridge::new().unwrap();
+        let view = bridge.view().unwrap();
+        let (_notify, wake, _space) = unsafe {
+            (
+                OwnedFd::from_raw_fd(view.notify_fd),
+                OwnedFd::from_raw_fd(view.wake_fd),
+                OwnedFd::from_raw_fd(view.space_fd),
+            )
+        };
+        for id in 0..shared::CAPACITY {
+            assert!(bridge.push(false, DATA, id as u64, b"full").unwrap());
+        }
+        let (events, outgoing) = mpsc::channel(1);
+        let bus = Arc::new(Bus {
+            events,
+            shared: Some(bridge.clone()),
+            flows: std::sync::Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+            max_flows: 128,
+            pending_auth: std::sync::Mutex::new(HashMap::new()),
+        });
+        let (incoming, _receiver) = mpsc::channel(1);
+        // The first control fills the queue, the second waits for space.
+        incoming
+            .send(Frame::new(OPEN_UDP, 1, Bytes::new()))
+            .await
+            .unwrap();
+        assert!(bridge.push(true, OPEN_UDP, 2, b"target:53").unwrap());
+        let mut tasks = JoinSet::new();
+        bridge_tasks(
+            Bridge::Shared(bridge.clone()),
+            outgoing,
+            incoming,
+            bus.clone(),
+            &mut tasks,
+        );
+        let (started, registered) = oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            let publish = bus.send(Frame::new(READY, 0, Bytes::new()));
+            tokio::pin!(publish);
+            poll_fn(|cx| {
+                assert!(publish.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            started.send(()).unwrap();
+            publish.await
+        });
+        registered.await.unwrap();
+        assert!(!waiting.is_finished());
+        bridge.pop(false).unwrap().unwrap();
+        let value = 1u64.to_ne_bytes();
+        assert_eq!(
+            unsafe { libc::write(wake.as_raw_fd(), value.as_ptr().cast(), value.len()) },
+            8
+        );
+        tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        bridge.close();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
 
     #[test]
     fn quic_timers_preserve_defaults_and_profile_values() {
