@@ -67,3 +67,12 @@ func TestStartupReportsNativeErrorsAndCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidWorkerOverrideFailsBeforeNativeInitialization(t *testing.T) {
+	for _, value := range []string{"-1", "17", "invalid"} {
+		t.Setenv("XRAY_HYSTERIA_SERVER_WORKERS", value)
+		if _, err := Start(context.Background(), Config{Server: true}, nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "SERVER_WORKERS") {
+			t.Fatalf("invalid worker override %q: %v", value, err)
+		}
+	}
+}

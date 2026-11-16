@@ -71,6 +71,7 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	}
 	c.Congestion = q.Congestion
 	c.DisablePMTUD = q.DisablePathMtuDiscovery || runtime.GOOS == "android"
+	c.DisableGSO = q.DisableGSO
 	c.MaxIdleTimeout = uint64(q.MaxIdleTimeout)
 	c.KeepAlivePeriod = uint64(q.KeepAlivePeriod)
 	c.LossCompensation = !q.BrutalDisableLossCompensation

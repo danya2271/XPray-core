@@ -44,6 +44,18 @@ func TestNativeQuicTimers(t *testing.T) {
 	}
 }
 
+func TestNativeDisableGSOIsForwarded(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		config, err := nativeConfig(&internet.MemoryStreamConfig{
+			SecuritySettings: &tls.Config{},
+			QuicParams:       &internet.QuicParams{DisableChromeParrot: true, DisableGSO: disabled},
+		})
+		if err != nil || config.DisableGSO != disabled {
+			t.Fatalf("disableGSO=%t config=%+v err=%v", disabled, config, err)
+		}
+	}
+}
+
 func TestNativeRemotePortHopping(t *testing.T) {
 	for _, test := range []struct {
 		name      string

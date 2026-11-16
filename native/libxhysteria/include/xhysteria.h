@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define XHYS_ABI_VERSION UINT32_C(3)
+#define XHYS_ABI_VERSION UINT32_C(4)
 
 typedef struct {
     uint8_t event_type;
@@ -41,13 +41,14 @@ void xhys_bridge_close(void *bridge);
  * Close the Go fd before joining. Config is copied before start returns. */
 void *xhys_engine_start(const uint8_t *config_json, uintptr_t config_len,
                        int32_t udp_fd, int32_t *bridge_fd);
-/* Aligned little-endian arena; both returned fds belong to Go. Go must stop
+/* Aligned little-endian arena; all three returned fds belong to Go. Go must stop
  * all arena accesses before join, which releases the native allocation. */
 typedef struct {
     uint8_t *data;
     uint64_t len;
     int32_t notify_fd;
     int32_t wake_fd;
+    int32_t space_fd;
 } XhysSharedView;
 void *xhys_engine_start_shared(const uint8_t *config_json, uintptr_t config_len,
                               int32_t udp_fd, XhysSharedView *view);

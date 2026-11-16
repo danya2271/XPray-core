@@ -25,7 +25,7 @@ import (
 
 const (
 	sharedMagic    = 0x5848595353484d32
-	sharedVersion  = 2
+	sharedVersion  = 3
 	sharedHeader   = 320
 	sharedCapacity = 32
 	sharedStride   = (16 + maxFrame + 63) &^ 63
@@ -63,28 +63,25 @@ func (b *socketBridge) writeBatch(batch []frame) error {
 type sharedBridge struct {
 	data         []byte
 	notify, wake *os.File
-	space        chan struct{}
-	events       chan struct{}
-	closed       chan struct{}
+	space        *os.File
 	once         sync.Once
 	released     uint32
 	wakeRaw      syscall.RawConn
-	pollWG       sync.WaitGroup
-	errMu        sync.Mutex
-	pollErr      error
 }
 
 func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
 	notify := os.NewFile(uintptr(view.notify_fd), "xhysteria-eventfd")
 	wake := os.NewFile(uintptr(view.wake_fd), "xhysteria-wakefd")
+	space := os.NewFile(uintptr(view.space_fd), "xhysteria-spacefd")
 	if view.data == nil || uint64(view.len) != sharedBytes || uintptr(unsafe.Pointer(view.data))%64 != 0 {
 		notify.Close()
 		wake.Close()
+		space.Close()
 		return nil, errors.New("invalid native shared arena view")
 	}
 	b := &sharedBridge{
 		data:   unsafe.Slice((*byte)(unsafe.Pointer(view.data)), sharedBytes),
-		notify: notify, wake: wake, space: make(chan struct{}, 1), closed: make(chan struct{}),
+		notify: notify, wake: wake, space: space,
 	}
 	var err error
 	b.wakeRaw, err = wake.SyscallConn()
@@ -107,42 +104,18 @@ func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
 		b.close()
 		return nil, err
 	}
-	b.startNotifications()
 	return b, nil
 }
 
-func (b *sharedBridge) startNotifications() {
-	b.events = make(chan struct{}, 1)
-	b.pollWG.Add(1)
-	go func() {
-		defer b.pollWG.Done()
-		for {
-			var value [8]byte
-			_, err := io.ReadFull(b.notify, value[:])
-			if err != nil {
-				b.errMu.Lock()
-				b.pollErr = err
-				b.errMu.Unlock()
-			}
-			select {
-			case b.space <- struct{}{}:
-			default:
-			}
-			select {
-			case b.events <- struct{}{}:
-			default:
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-}
-
-func (b *sharedBridge) notificationError() error {
-	b.errMu.Lock()
-	defer b.errMu.Unlock()
-	return b.pollErr
+func (b *sharedBridge) wait(file *os.File, pending int) error {
+	var value [8]byte
+	if _, err := io.ReadFull(file, value[:]); err != nil {
+		return err
+	}
+	// Rearm before observing published ring state; a later producer must
+	// signal again. RX and TX-space wait independently in Go netpoll.
+	atomic.SwapUint32(b.word(pending), 0)
+	return nil
 }
 
 func (b *sharedBridge) word(offset int) *uint32 {
@@ -150,8 +123,14 @@ func (b *sharedBridge) word(offset int) *uint32 {
 }
 
 func (b *sharedBridge) notifyRust() error {
+	if atomic.SwapUint32(b.word(40), 1) != 0 {
+		return nil
+	}
 	if b.wakeRaw == nil {
 		_, err := b.wake.Write(eventfdSignal[:])
+		if err != nil {
+			atomic.SwapUint32(b.word(40), 0)
+		}
 		return err
 	}
 	var writeErr error
@@ -168,7 +147,11 @@ func (b *sharedBridge) notifyRust() error {
 		}
 	})
 	if err != nil {
+		atomic.SwapUint32(b.word(40), 0)
 		return err
+	}
+	if writeErr != nil {
+		atomic.SwapUint32(b.word(40), 0)
 	}
 	return writeErr
 }
@@ -176,11 +159,10 @@ func (b *sharedBridge) notifyRust() error {
 func (b *sharedBridge) close() error {
 	b.once.Do(func() {
 		atomic.StoreUint32(b.word(32), 1)
-		close(b.closed)
 		b.notifyRust()
 		b.notify.Close()
 		b.wake.Close()
-		b.pollWG.Wait()
+		b.space.Close()
 	})
 	return nil
 }
@@ -222,57 +204,54 @@ func (b *sharedBridge) read() (frame, error) {
 		if atomic.LoadUint32(b.word(32)) != 0 {
 			return frame{}, net.ErrClosed
 		}
-		if err := b.notificationError(); err != nil {
+		if err := b.wait(b.notify, 36); err != nil {
 			return frame{}, err
-		}
-		select {
-		case <-b.events:
-		case <-b.closed:
-			return frame{}, net.ErrClosed
 		}
 	}
 }
 
 func (b *sharedBridge) writeBatch(batch []frame) error {
 	for len(batch) != 0 {
-		if err := b.notificationError(); err != nil {
+		n, err := b.tryWriteBatch(batch)
+		if err != nil {
 			return err
 		}
-		if atomic.LoadUint32(b.word(32)) != 0 {
-			return net.ErrClosed
-		}
-		head := atomic.LoadUint32(b.word(64))
-		count := head - atomic.LoadUint32(b.word(128))
-		if count > sharedCapacity {
-			return errors.New("corrupt native command ring")
-		}
-		n := min(len(batch), sharedCapacity-int(count))
-		for i := range n {
-			f := batch[i]
-			if len(f.data) > maxFrame {
-				return errors.New("oversized native command")
-			}
-			offset := sharedHeader + int((head+uint32(i))&(sharedCapacity-1))*sharedStride
-			d := b.data[offset:]
-			binary.LittleEndian.PutUint32(d, uint32(f.kind))
-			binary.LittleEndian.PutUint32(d[4:], uint32(len(f.data)))
-			binary.LittleEndian.PutUint64(d[8:], f.id)
-			copy(d[16:], f.data)
-		}
-		if n != 0 {
-			atomic.StoreUint32(b.word(64), head+uint32(n))
-			batch = batch[n:]
-		}
-		if err := b.notifyRust(); err != nil {
-			return err
-		}
+		batch = batch[n:]
 		if n == 0 {
-			select {
-			case <-b.closed:
-				return net.ErrClosed
-			case <-b.space:
+			if err := b.wait(b.space, 44); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
+}
+
+// The engine serializes publication. A full ring falls back to the bounded
+// writer queue instead of blocking the caller holding the publication lock.
+func (b *sharedBridge) tryWriteBatch(batch []frame) (int, error) {
+	if atomic.LoadUint32(b.word(32)) != 0 {
+		return 0, net.ErrClosed
+	}
+	head := atomic.LoadUint32(b.word(64))
+	count := head - atomic.LoadUint32(b.word(128))
+	if count > sharedCapacity {
+		return 0, errors.New("corrupt native command ring")
+	}
+	n := min(len(batch), sharedCapacity-int(count))
+	for i := range n {
+		f := batch[i]
+		if len(f.data) > maxFrame {
+			return 0, errors.New("oversized native command")
+		}
+		offset := sharedHeader + int((head+uint32(i))&(sharedCapacity-1))*sharedStride
+		d := b.data[offset:]
+		binary.LittleEndian.PutUint32(d, uint32(f.kind))
+		binary.LittleEndian.PutUint32(d[4:], uint32(len(f.data)))
+		binary.LittleEndian.PutUint64(d[8:], f.id)
+		copy(d[16:], f.data)
+	}
+	if n != 0 {
+		atomic.StoreUint32(b.word(64), head+uint32(n))
+	}
+	return n, b.notifyRust()
 }

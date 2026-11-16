@@ -15,6 +15,7 @@ package xhysteria
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,6 +77,7 @@ type Config struct {
 	LossCompensation bool                                      `json:"loss_compensation"`
 	Congestion       string                                    `json:"congestion"`
 	DisablePMTUD     bool                                      `json:"disable_pmtud"`
+	DisableGSO       bool                                      `json:"disable_gso"`
 	MaxIdleTimeout   uint64                                    `json:"max_idle_timeout"`
 	KeepAlivePeriod  uint64                                    `json:"keep_alive_period"`
 	PortHopping      *PortHoppingConfig                        `json:"port_hopping,omitempty"`
@@ -83,6 +86,7 @@ type Config struct {
 	UDPIdleTimeout   uint64                                    `json:"udp_idle_timeout"`
 	MaxFlows         uint32                                    `json:"max_flows"`
 	MaxConnections   uint32                                    `json:"max_connections"`
+	ServerWorkers    uint8                                     `json:"server_workers"`
 	Authenticate     func(string) (*protocol.MemoryUser, bool) `json:"-"`
 }
 
@@ -156,6 +160,8 @@ type Engine struct {
 	accept        func(*Conn)
 	submitMu      sync.Mutex
 	submitWG      sync.WaitGroup
+	publishMu     sync.Mutex
+	queued        atomic.Int64
 	stopping      bool
 	authenticate  func(string) (*protocol.MemoryUser, bool)
 	authUsers     map[uint64]nativeIdentity
@@ -175,10 +181,19 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("native startup: %w", err)
 	}
-	if config.MaxFlows > 65536 || config.MaxConnections > 4096 || (config.ExternalAuth && config.Authenticate == nil) {
+	if config.Server {
+		if value := os.Getenv("XRAY_HYSTERIA_SERVER_WORKERS"); value != "" {
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 || n > 16 {
+				return nil, errors.New("XRAY_HYSTERIA_SERVER_WORKERS must be 0..16")
+			}
+			config.ServerWorkers = uint8(n)
+		}
+	}
+	if config.MaxFlows > 65536 || config.MaxConnections > 4096 || config.ServerWorkers > 16 || (config.ExternalAuth && config.Authenticate == nil) {
 		return nil, errors.New("invalid native engine limits or authenticator")
 	}
-	if uint32(C.xhys_abi_version()) != 3 {
+	if uint32(C.xhys_abi_version()) != C.XHYS_ABI_VERSION {
 		return nil, errors.New("native ABI version mismatch")
 	}
 	if config.Users == nil {
@@ -291,6 +306,18 @@ func (e *Engine) send(f frame, until time.Time) error {
 		return net.ErrClosed
 	}
 	defer e.submitWG.Done()
+	if !until.IsZero() && !time.Now().Before(until) {
+		return os.ErrDeadlineExceeded
+	}
+	if direct, err := e.prepareFrame(f); direct || err != nil {
+		return err
+	}
+	queued := true
+	defer func() {
+		if queued {
+			e.queued.Add(-1)
+		}
+	}()
 	var timeout <-chan time.Time
 	var timer *time.Timer
 	if !until.IsZero() {
@@ -307,8 +334,36 @@ func (e *Engine) send(f frame, until time.Time) error {
 	case <-timeout:
 		return os.ErrDeadlineExceeded
 	case e.out <- f:
+		queued = false
 		return nil
 	}
+}
+
+func (e *Engine) prepareFrame(f frame) (bool, error) {
+	e.publishMu.Lock()
+	select {
+	case <-e.done:
+		e.publishMu.Unlock()
+		return false, net.ErrClosed
+	default:
+	}
+	if bridge, ok := e.bridge.(*sharedBridge); ok && e.queued.Load() == 0 {
+		n, err := bridge.tryWriteBatch([]frame{f})
+		if err != nil || n != 0 {
+			e.publishMu.Unlock()
+			if err == nil {
+				f.release()
+			} else {
+				e.stop()
+			}
+			return true, err
+		}
+	}
+	// Count both queued and dequeued-but-unpublished frames. A direct write
+	// must never overtake a batch already owned by the background writer.
+	e.queued.Add(1)
+	e.publishMu.Unlock()
+	return false, nil
 }
 
 func (e *Engine) beginSubmit() bool {
@@ -355,6 +410,7 @@ func (e *Engine) Close() error {
 	for {
 		select {
 		case f := <-e.out:
+			e.queued.Add(-1)
 			f.release()
 		default:
 			return nil
@@ -439,6 +495,7 @@ func (e *Engine) writeLoop() {
 				}
 			}
 			err := e.bridge.writeBatch(batch[:n])
+			e.queued.Add(-int64(n))
 			for i := range n {
 				batch[i].release()
 			}
@@ -569,10 +626,19 @@ func (e *Engine) readLoop() {
 			continue
 		}
 		if f.kind == writableFrame {
+			count := 1
+			if len(f.data) == 1 {
+				count = int(f.data[0])
+			}
 			f.release()
-			select {
-			case c.writeCredit <- struct{}{}:
-			default:
+			if count < 1 || count > cap(c.writeCredit) {
+				return
+			}
+			for range count {
+				select {
+				case c.writeCredit <- struct{}{}:
+				default:
+				}
 			}
 			continue
 		}
@@ -673,6 +739,7 @@ type Conn struct {
 	engine                      *Engine
 	id                          uint64
 	target                      xnet.Destination
+	targetAddress               string
 	remote                      net.Addr
 	UserIndex                   uint32
 	User                        *protocol.MemoryUser
@@ -689,6 +756,7 @@ type Conn struct {
 	pending                     []byte
 	pendingStorage              *buf.Buffer
 	writeCredit                 chan struct{}
+	readCredits                 uint8
 	eof                         bool
 	writeClosed                 bool
 	userClosed                  bool
@@ -697,6 +765,9 @@ type Conn struct {
 
 func newConn(e *Engine, id uint64, target xnet.Destination, remote net.Addr) *Conn {
 	c := &Conn{engine: e, id: id, target: target, remote: remote, in: make(chan frame, 18), closed: make(chan struct{}), changed: make(chan struct{}), writeCredit: make(chan struct{}, 16)}
+	if target.IsValid() && target.Address != nil {
+		c.targetAddress = target.NetAddr()
+	}
 	for range 16 {
 		c.writeCredit <- struct{}{}
 	}
@@ -805,15 +876,30 @@ func (c *Conn) nextFrame() (frame, error) {
 
 func (c *Conn) received(f frame) (frame, error) {
 	if f.kind == dataFrame || f.kind == datagramFrame {
-		if err := c.engine.send(frame{kind: creditFrame, id: c.id}, time.Now().Add(10*time.Second)); err != nil {
-			f.release()
-			return frame{}, err
+		c.readCredits++
+		if c.readCredits >= 8 {
+			c.readCredits = 0
+			if err := c.engine.send(frame{kind: creditFrame, id: c.id, data: []byte{8}}, time.Now().Add(10*time.Second)); err != nil {
+				select {
+				case <-c.engine.done:
+					// Published payload remains readable after engine shutdown.
+				default:
+					f.release()
+					return frame{}, err
+				}
+			}
 		}
 	}
 	return f, nil
 }
 
 func (c *Conn) waitWrite(f *frame) error {
+	reserved := false
+	defer func() {
+		if reserved {
+			c.engine.queued.Add(-1)
+		}
+	}()
 	if f != nil {
 		if !c.engine.beginSubmit() {
 			return net.ErrClosed
@@ -840,6 +926,16 @@ func (c *Conn) waitWrite(f *frame) error {
 		var value frame
 		var credit <-chan struct{}
 		if f != nil {
+			if !reserved {
+				direct, err := c.engine.prepareFrame(*f)
+				if direct || err != nil {
+					if timer != nil {
+						timer.Stop()
+					}
+					return err
+				}
+				reserved = true
+			}
 			send = c.engine.out
 			value = *f
 		} else {
@@ -869,6 +965,7 @@ func (c *Conn) waitWrite(f *frame) error {
 			}
 			return nil
 		case send <- value:
+			reserved = false
 			if timer != nil {
 				timer.Stop()
 			}
@@ -1004,10 +1101,13 @@ func (c *Conn) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		f.release()
 		return nil, errors.New("invalid native UDP datagram")
 	}
-	dest, err := xnet.ParseDestination("udp:" + string(address))
-	if err != nil {
-		f.release()
-		return nil, err
+	dest := c.target
+	if !bytes.Equal(address, []byte(c.targetAddress)) {
+		dest, err = xnet.ParseDestination("udp:" + string(address))
+		if err != nil {
+			f.release()
+			return nil, err
+		}
 	}
 	b := f.storage
 	if b == nil {
@@ -1046,6 +1146,15 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			if err := c.awaitWriteCredit(); err != nil {
 				return err
 			}
+			if len(mb) == 1 && mb[0].Len() <= 65536 {
+				storage := mb[0]
+				if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: storage.Bytes(), storage: storage}); err != nil {
+					return err
+				}
+				// The bridge or writer queue owns this buffer now.
+				mb[0] = nil
+				return nil
+			}
 			storage := buf.NewWithSize(65536)
 			for len(mb) != 0 && storage.Len() < 65536 {
 				b := mb[0]
@@ -1073,7 +1182,7 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if b.Len() == 0 || b.Len() > 4096 {
 			return errors.New("native UDP size outside 1..4096")
 		}
-		address := c.target.NetAddr()
+		address := c.targetAddress
 		if b.UDP != nil {
 			address = b.UDP.NetAddr()
 		}

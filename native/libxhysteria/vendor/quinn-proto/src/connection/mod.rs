@@ -466,7 +466,7 @@ impl Connection {
         assert!(max_datagrams != 0);
         let max_datagrams = match self.config.enable_segmentation_offload {
             false => 1,
-            true => max_datagrams,
+            true => max_datagrams.min(self.path.congestion.max_datagrams()),
         };
 
         let mut num_datagrams = 0;

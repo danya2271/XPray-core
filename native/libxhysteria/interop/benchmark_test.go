@@ -4,10 +4,13 @@ package interop_test
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,11 +37,12 @@ func benchmarkModes(b *testing.B, run func(*testing.B, *core.Instance, xnet.Dest
 		{"shared_pool2", "1", "shared", "2"},
 	} {
 		b.Run(mode.name, func(b *testing.B) {
+			masked := os.Getenv("XHYS_BENCH_SALAMANDER") != "0"
 			b.Setenv("XRAY_HYSTERIA_NATIVE", "0")
 			if os.Getenv("XHYS_BENCH_NATIVE_SERVER") == "1" {
 				b.Setenv("XRAY_HYSTERIA_NATIVE", "1")
 			}
-			server, caPath := xrayServer(b, true)
+			server, caPath := xrayServer(b, masked)
 			ca, err := os.ReadFile(caPath)
 			if err != nil {
 				b.Fatal(err)
@@ -46,7 +50,7 @@ func benchmarkModes(b *testing.B, run func(*testing.B, *core.Instance, xnet.Dest
 			b.Setenv("XRAY_HYSTERIA_NATIVE", mode.native)
 			b.Setenv("XRAY_HYSTERIA_BRIDGE", mode.bridge)
 			b.Setenv("XRAY_HYSTERIA_POOL_SIZE", mode.pool)
-			client := embeddedClient(b, server, ca, true)
+			client := embeddedClient(b, server, ca, masked)
 			b.Cleanup(func() {
 				var usage unix.Rusage
 				if unix.Getrusage(unix.RUSAGE_SELF, &usage) == nil {
@@ -149,4 +153,173 @@ func BenchmarkNativeParallel(b *testing.B) {
 		b.StopTimer()
 		b.ReportMetric(float64(processCPU()-cpu)/float64(b.N), "process-cpu-ns/op")
 	})
+}
+
+func BenchmarkNativeUpload(b *testing.B) {
+	benchmarkModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
+		benchmarkStreaming(b, client, true)
+	})
+}
+
+func BenchmarkNativeDownload(b *testing.B) {
+	benchmarkModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
+		benchmarkStreaming(b, client, false)
+	})
+}
+
+func benchmarkStreaming(b *testing.B, client *core.Instance, upload bool) {
+	b.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer listener.Close()
+	completed := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			completed <- err
+			return
+		}
+		defer conn.Close()
+		var header [8]byte
+		_, err = io.ReadFull(conn, header[:])
+		if err == nil {
+			total := int64(binary.BigEndian.Uint64(header[:]))
+			if upload {
+				_, err = io.CopyN(io.Discard, conn, total)
+			} else {
+				_, err = io.CopyN(conn, zeroReader{}, total)
+			}
+		}
+		if err == nil {
+			_, err = conn.Write([]byte{1})
+		}
+		completed <- err
+	}()
+	target, _ := xnet.ParseDestination("tcp:" + listener.Addr().String())
+	conn := benchmarkDial(b, client, target)
+	defer conn.Close()
+	// Conventional b.N includes the receiver's final acknowledgement in the
+	// measured interval, not just data queued into local socket/bridge buffers.
+	const size = 65536
+	var header [8]byte
+	binary.BigEndian.PutUint64(header[:], uint64(b.N)*size)
+	b.SetBytes(size)
+	b.ReportAllocs()
+	b.ResetTimer()
+	cpu := processCPU()
+	if _, err := conn.Write(header[:]); err != nil {
+		b.Fatal(err)
+	}
+	data := make([]byte, size)
+	for range b.N {
+		if upload {
+			_, err = conn.Write(data)
+		} else {
+			_, err = io.ReadFull(conn, data)
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	if _, err := io.ReadFull(conn, header[:1]); err != nil {
+		b.Fatal(err)
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(processCPU()-cpu)/float64(b.N), "process-cpu-ns/op")
+	if err := <-completed; err != nil {
+		b.Fatal(err)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+func BenchmarkNativeLatency(b *testing.B) {
+	benchmarkModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
+		benchmarkLatency(b, client, target, false)
+	})
+}
+
+func BenchmarkNativeLoadedLatency(b *testing.B) {
+	benchmarkModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
+		benchmarkLatency(b, client, target, true)
+	})
+}
+
+func BenchmarkNativeUDPLatency(b *testing.B) {
+	benchmarkModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
+		_, udp := echoTargets(b)
+		target, _ := xnet.ParseDestination("udp:" + udp)
+		benchmarkLatency(b, client, target, false)
+	})
+}
+
+func benchmarkLatency(b *testing.B, client *core.Instance, target xnet.Destination, loaded bool) {
+	b.Helper()
+	if loaded {
+		var workers sync.WaitGroup
+		var load []net.Conn
+		stop := make(chan struct{})
+		b.Cleanup(func() {
+			close(stop)
+			for _, conn := range load {
+				conn.Close()
+			}
+			workers.Wait()
+		})
+		for range 4 {
+			conn := benchmarkDial(b, client, target)
+			load = append(load, conn)
+			data, got := make([]byte, 65536), make([]byte, 65536)
+			benchmarkExchange(b, conn, data, got)
+			workers.Go(func() {
+				report := func(err error) {
+					select {
+					case <-stop:
+					default:
+						b.Errorf("background transfer stopped: %v", err)
+					}
+				}
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if _, err := conn.Write(data); err != nil {
+						report(err)
+						return
+					}
+					if _, err := io.ReadFull(conn, got); err != nil {
+						report(err)
+						return
+					}
+				}
+			})
+		}
+	}
+	conn := benchmarkDial(b, client, target)
+	defer conn.Close()
+	data, got := make([]byte, 64), make([]byte, 64)
+	benchmarkExchange(b, conn, data, got)
+	samples := make([]int64, 0, 16384)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		start := time.Now()
+		benchmarkExchange(b, conn, data, got)
+		samples = append(samples, time.Since(start).Nanoseconds())
+	}
+	b.StopTimer()
+	slices.Sort(samples)
+	for _, percentile := range []int{50, 95, 99} {
+		index := min(len(samples)-1, len(samples)*percentile/100)
+		b.ReportMetric(float64(samples[index])/1000, fmt.Sprintf("p%d-us", percentile))
+	}
 }

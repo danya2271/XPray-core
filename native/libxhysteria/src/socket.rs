@@ -14,7 +14,13 @@ use std::{
 pub struct MaskedSocket {
     socket: Arc<dyn AsyncUdpSocket>,
     mask: Salamander,
-    send_buffer: Mutex<Vec<u8>>,
+    send_buffer: Mutex<SendBuffer>,
+}
+
+struct SendBuffer {
+    wire: Vec<u8>,
+    salts: [u8; 4096],
+    remaining: usize,
 }
 
 impl MaskedSocket {
@@ -22,7 +28,11 @@ impl MaskedSocket {
         Ok(Self {
             socket: quinn::TokioRuntime.wrap_udp_socket(socket)?,
             mask: Salamander::new(psk).map_err(io::Error::other)?,
-            send_buffer: Mutex::new(Vec::with_capacity(65536)),
+            send_buffer: Mutex::new(SendBuffer {
+                wire: Vec::with_capacity(65536),
+                salts: [0; 4096],
+                remaining: 0,
+            }),
         })
     }
 }
@@ -41,21 +51,41 @@ impl AsyncUdpSocket for MaskedSocket {
     }
 
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
-        if transmit.segment_size.is_some() {
+        let stride = transmit.segment_size.unwrap_or(transmit.contents.len());
+        if stride == 0
+            || stride > u16::MAX as usize - SALT_LEN
+            || transmit.contents.len().div_ceil(stride) > 32
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Salamander requires individual UDP transmissions",
+                "invalid Salamander segmentation",
             ));
         }
         let mut buffer = self
             .send_buffer
             .lock()
             .map_err(|_| io::Error::other("send lock poisoned"))?;
-        self.mask
-            .seal(transmit.contents, &mut buffer)
-            .map_err(io::Error::other)?;
+        let SendBuffer {
+            wire,
+            salts,
+            remaining,
+        } = &mut *buffer;
+        let salt_bytes = transmit.contents.len().div_ceil(stride) * SALT_LEN;
+        if *remaining < salt_bytes {
+            getrandom::fill(salts).map_err(io::Error::other)?;
+            *remaining = salts.len();
+        }
+        let start = salts.len() - *remaining;
+        *remaining -= salt_bytes;
+        self.mask.seal_segments(
+            transmit.contents,
+            stride,
+            &salts[start..start + salt_bytes],
+            wire,
+        );
         let masked = udp::Transmit {
-            contents: &buffer,
+            contents: wire,
+            segment_size: transmit.segment_size.map(|n| n + SALT_LEN),
             ..*transmit
         };
         self.socket.try_send(&masked)
@@ -100,7 +130,7 @@ impl AsyncUdpSocket for MaskedSocket {
         self.socket.local_addr()
     }
     fn max_transmit_segments(&self) -> usize {
-        1
+        self.socket.max_transmit_segments().min(32)
     }
     fn max_receive_segments(&self) -> usize {
         self.socket.max_receive_segments()
@@ -183,6 +213,44 @@ mod tests {
         assert_eq!(meta.stride, 12);
         assert_eq!(meta.ecn, Some(udp::EcnCodepoint::Ect0));
         assert_eq!(meta.dst_ip, Some("127.0.0.2".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn segmented_send_is_wire_compatible_with_individual_salamander_packets() {
+        let sender = Arc::new(socket());
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut poller = sender.clone().create_io_poller();
+        let payload: Vec<_> = (0..(1200 * 3 + 17)).map(|i| (i % 251) as u8).collect();
+        let transmit = udp::Transmit {
+            destination: receiver.local_addr().unwrap(),
+            contents: &payload,
+            segment_size: Some(1200),
+            ecn: None,
+            src_ip: None,
+        };
+        loop {
+            poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                .await
+                .unwrap();
+            match sender.try_send(&transmit) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            let mut packet = [0; 2048];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                receiver.recv(&mut packet),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            got.extend_from_slice(sender.mask.open_in_place(&mut packet[..n]).unwrap());
+        }
+        assert_eq!(got, payload);
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -74,6 +74,8 @@ pub struct Config {
     pub congestion: String,
     pub disable_pmtud: bool,
     #[serde(default)]
+    pub disable_gso: bool,
+    #[serde(default)]
     pub max_idle_timeout: u64,
     #[serde(default)]
     pub keep_alive_period: u64,
@@ -88,6 +90,8 @@ pub struct Config {
     pub max_flows: u32,
     #[serde(default)]
     pub max_connections: u32,
+    #[serde(default)]
+    pub server_workers: u8,
 }
 
 impl Config {
@@ -111,8 +115,18 @@ impl Config {
 }
 
 fn runtime(config: &Config) -> io::Result<tokio::runtime::Runtime> {
+    if config.server_workers > 16 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server_workers must be 0..16",
+        ));
+    }
     let workers = if config.server {
-        std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+        if config.server_workers != 0 {
+            config.server_workers as usize
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+        }
     } else {
         1
     };
@@ -198,7 +212,8 @@ fn parse_address(data: &[u8]) -> Result<(&[u8], &[u8])> {
 
 struct Bus {
     events: mpsc::Sender<Frame>,
-    flows: Mutex<HashMap<u64, Flow>>,
+    shared: Option<Arc<shared::Bridge>>,
+    flows: std::sync::Mutex<HashMap<u64, Flow>>,
     next: AtomicU64,
     max_flows: usize,
     pending_auth: std::sync::Mutex<HashMap<u64, oneshot::Sender<bool>>>,
@@ -229,7 +244,7 @@ impl Drop for Flow {
 
 impl Bus {
     async fn register(&self, id: u64, owner: u64) -> Result<mpsc::Receiver<Frame>> {
-        let mut flows = self.flows.lock().await;
+        let mut flows = self.flows.lock().unwrap();
         if flows.len() >= self.max_flows || flows.contains_key(&id) {
             return Err("native flow capacity reached".into());
         }
@@ -258,17 +273,23 @@ impl Bus {
         Ok(receiver.await.unwrap_or(false))
     }
     async fn send(&self, frame: Frame) -> Result<()> {
+        if let Some(shared) = &self.shared {
+            return shared.send(frame.kind, frame.id, &frame.data).await;
+        }
         self.events
             .send(frame)
             .await
             .map_err(|_| "Go bridge closed".into())
     }
     async fn payload(&self, frame: Frame) -> Result<()> {
+        self.payload_bytes(frame.id, &frame.data).await
+    }
+    async fn payload_bytes(&self, id: u64, data: &[u8]) -> Result<()> {
         let credit = self
             .flows
             .lock()
-            .await
-            .get(&frame.id)
+            .unwrap()
+            .get(&id)
             .map(|flow| flow.receive_credit.clone())
             .ok_or("closed native flow")?;
         credit
@@ -276,13 +297,18 @@ impl Bus {
             .await
             .map_err(|_| "closed native flow")?
             .forget();
-        self.send(frame).await
+        if let Some(shared) = &self.shared {
+            shared.send(DATA, id, data).await
+        } else {
+            self.send(Frame::new(DATA, id, Bytes::copy_from_slice(data)))
+                .await
+        }
     }
     async fn udp_payload(&self, frame: Frame) -> Result<()> {
         let credit = self
             .flows
             .lock()
-            .await
+            .unwrap()
             .get(&frame.id)
             .map(|flow| flow.receive_credit.clone());
         let Some(credit) = credit else { return Ok(()) };
@@ -293,8 +319,18 @@ impl Bus {
         permit.forget();
         self.send(frame).await
     }
+    async fn writable(&self, id: u64, pending: &mut u8) -> Result<()> {
+        *pending += 1;
+        if *pending >= 8 {
+            let count = *pending;
+            *pending = 0;
+            self.send(Frame::new(WRITABLE, id, Bytes::copy_from_slice(&[count])))
+                .await?;
+        }
+        Ok(())
+    }
     async fn done(&self, id: u64, result: Result<()>) {
-        self.flows.lock().await.remove(&id);
+        self.flows.lock().unwrap().remove(&id);
         let frame = match result {
             Ok(()) => Frame::new(CLOSE, id, Bytes::new()),
             Err(_) => Frame::new(ERROR, id, "native flow failed"),
@@ -305,7 +341,7 @@ impl Bus {
         let ids: Vec<u64> = self
             .flows
             .lock()
-            .await
+            .unwrap()
             .iter()
             .filter(|(_, flow)| flow.owner == owner)
             .map(|(id, _)| *id)
@@ -316,11 +352,13 @@ impl Bus {
     }
     async fn route(&self, frame: Frame) {
         let id = frame.id;
-        let mut flows = self.flows.lock().await;
+        let mut flows = self.flows.lock().unwrap();
         if let Some(flow) = flows.get(&id) {
             if frame.kind == CREDIT {
-                if flow.receive_credit.available_permits() < 16 {
-                    flow.receive_credit.add_permits(1);
+                let count = frame.data.first().copied().unwrap_or(1) as usize;
+                let available = flow.receive_credit.available_permits();
+                if count != 0 && count <= 16 && available < 16 {
+                    flow.receive_credit.add_permits(count.min(16 - available));
                 }
                 return;
             }
@@ -332,6 +370,19 @@ impl Bus {
                 // Terminate a slow flow explicitly, never discard TCP silently.
                 // Dropping the sender wakes its task; its completion closes Go.
                 flows.remove(&id);
+            }
+        }
+    }
+
+    async fn command(&self, incoming: &mpsc::Sender<Frame>, frame: Frame) -> Result<()> {
+        match frame.kind {
+            OPEN_TCP | OPEN_UDP | CLOSE | AUTH_RESPONSE | UPDATE_TLS => incoming
+                .send(frame)
+                .await
+                .map_err(|_| "Go bridge closed".into()),
+            _ => {
+                self.route(frame).await;
+                Ok(())
             }
         }
     }
@@ -392,10 +443,15 @@ fn transport(config: &Config) -> Result<quinn::TransportConfig> {
         compensate: config.loss_compensation,
         fallback,
     }));
-    // The custom pacer accounts one UDP transmission per callback.
-    t.enable_segmentation_offload(false);
-    if config.disable_pmtud || !config.salamander.is_empty() {
+    // Hybrid restricts Brutal to individual sends after rate negotiation.
+    t.enable_segmentation_offload(!config.disable_gso);
+    if config.disable_pmtud {
         t.initial_mtu(1200).min_mtu(1200).mtu_discovery_config(None);
+    } else if !config.salamander.is_empty() {
+        let mut discovery = quinn::MtuDiscoveryConfig::default();
+        // Reserve Salamander's salt even on an IPv6 1500-byte path.
+        discovery.upper_bound(1500 - 40 - 8 - crate::salamander::SALT_LEN as u16);
+        t.mtu_discovery_config(Some(discovery));
     }
     Ok(t)
 }
@@ -619,11 +675,18 @@ async fn relay_client_tcp(
         }
     }
     let up = async {
+        let mut credit = 0;
+        let mut budget = 0;
         while let Some(command) = commands.recv().await {
             match command.kind {
                 DATA => {
-                    bus.send(Frame::new(WRITABLE, id, Bytes::new())).await?;
-                    tx.write_all(&command.data).await?
+                    bus.writable(id, &mut credit).await?;
+                    budget += command.data.len();
+                    tx.write_chunk(command.data).await?;
+                    if budget >= 256 * 1024 {
+                        budget = 0;
+                        tokio::task::yield_now().await;
+                    }
                 }
                 FIN => {
                     tx.finish()?;
@@ -641,9 +704,14 @@ async fn relay_client_tcp(
         // Quinn fills only the currently readable bytes, without waiting for a
         // full 64 KiB. Coalescing ready QUIC fragments reduces bridge events.
         let mut buffer = vec![0; 65536];
+        let mut budget = 0;
         while let Some(n) = rx.read(&mut buffer).await? {
-            bus.payload(Frame::new(DATA, id, Bytes::copy_from_slice(&buffer[..n])))
-                .await?;
+            bus.payload_bytes(id, &buffer[..n]).await?;
+            budget += n;
+            if budget >= 256 * 1024 {
+                budget = 0;
+                tokio::task::yield_now().await;
+            }
         }
         bus.send(Frame::new(FIN, id, Bytes::new())).await?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -699,20 +767,27 @@ async fn relay_server_tcp(
             ))
             .await?;
         }
-        let (mut tx, mut rx) = stream.split();
+        let (mut tx, mut rx) = stream.split()?;
         let up = async {
+            let mut credit = 0;
+            let mut budget = 0;
             while let Some(command) = commands.recv().await {
                 match command.kind {
                     DATA => {
-                        bus.send(Frame::new(WRITABLE, id, Bytes::new())).await?;
-                        h3_transport::write_raw(&mut tx, command.data).await?
+                        bus.writable(id, &mut credit).await?;
+                        budget += command.data.len();
+                        tx.write_chunk(command.data).await?;
+                        if budget >= 256 * 1024 {
+                            budget = 0;
+                            tokio::task::yield_now().await;
+                        }
                     }
                     FIN => {
-                        poll_fn(|cx| tx.poll_finish(cx)).await?;
+                        tx.finish()?;
                         return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
                     }
                     _ => {
-                        tx.reset(0);
+                        let _ = tx.reset(0u32.into());
                         return Ok(());
                     }
                 }
@@ -723,13 +798,18 @@ async fn relay_server_tcp(
             // Aggregate ready fragments on the server as on the client. Do not
             // spend a bridge credit and wake Go for each individual QUIC chunk.
             let mut buffer = vec![0; 65536];
+            let mut budget = 0;
             loop {
                 let n = rx.read(&mut buffer).await?;
                 if n == 0 {
                     break;
                 }
-                bus.payload(Frame::new(DATA, id, Bytes::copy_from_slice(&buffer[..n])))
-                    .await?;
+                bus.payload_bytes(id, &buffer[..n]).await?;
+                budget += n;
+                if budget >= 256 * 1024 {
+                    budget = 0;
+                    tokio::task::yield_now().await;
+                }
             }
             bus.send(Frame::new(FIN, id, Bytes::new())).await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -758,6 +838,12 @@ async fn send_udp(
         payload,
     };
     let limit = connection.max_datagram_size().ok_or("peer disabled UDP")?;
+    if message.header_len()? + payload.len() <= limit {
+        let mut wire = Vec::with_capacity(message.header_len()? + payload.len());
+        message.encode(&mut wire)?;
+        connection.send_datagram_wait(Bytes::from(wire)).await?;
+        return Ok(());
+    }
     for part in message.fragment(limit)? {
         let mut wire = Vec::new();
         part.encode(&mut wire)?;
@@ -778,17 +864,25 @@ async fn client_udp(
         let Ok(message) = Message::decode(&data) else {
             continue;
         };
-        let Ok(Some(datagram)) = defrag.feed(start.elapsed().as_nanos() as u64, &message) else {
-            continue;
+        let assembled;
+        let (session, address, payload) = if message.count == 1 {
+            (message.session, message.address, message.payload)
+        } else {
+            let Ok(Some(datagram)) = defrag.feed(start.elapsed().as_nanos() as u64, &message)
+            else {
+                continue;
+            };
+            assembled = datagram;
+            (
+                assembled.session,
+                assembled.address.as_slice(),
+                assembled.payload.as_slice(),
+            )
         };
-        let id = sessions.lock().await.get(&datagram.session).copied();
+        let id = sessions.lock().await.get(&session).copied();
         if let Some(id) = id {
-            bus.udp_payload(Frame::new(
-                DATAGRAM,
-                id,
-                address_data(&datagram.address, &datagram.payload)?,
-            ))
-            .await?;
+            bus.udp_payload(Frame::new(DATAGRAM, id, address_data(address, payload)?))
+                .await?;
         }
     }
 }
@@ -813,9 +907,16 @@ async fn server_udp(
                 let who = user.load(Ordering::Acquire);
                 if who == u32::MAX { continue; }
                 let Ok(message) = Message::decode(&data) else { continue };
-                let Ok(Some(datagram)) = defrag.feed(start.elapsed().as_nanos() as u64, &message) else { continue };
+                let assembled;
+                let (session_id, address, payload) = if message.count == 1 {
+                    (message.session, message.address, message.payload)
+                } else {
+                    let Ok(Some(datagram)) = defrag.feed(start.elapsed().as_nanos() as u64, &message) else { continue };
+                    assembled = datagram;
+                    (assembled.session, assembled.address.as_slice(), assembled.payload.as_slice())
+                };
                 let now_ns = start.elapsed().as_nanos() as u64;
-                let id = if let Some((id, activity)) = sessions.get(&datagram.session) {
+                let id = if let Some((id, activity)) = sessions.get(&session_id) {
                     activity.store(now_ns, Ordering::Relaxed);
                     *id
                 } else {
@@ -824,15 +925,16 @@ async fn server_udp(
                     let Ok(mut commands) = bus.register(id, owner).await else { continue };
                     let mut metadata = who.to_be_bytes().to_vec();
                     metadata.extend_from_slice(&owner.to_be_bytes());
-                    metadata.extend_from_slice(&address_data(peer.as_bytes(), &datagram.address)?);
+                    metadata.extend_from_slice(&address_data(peer.as_bytes(), address)?);
                     bus.send(Frame::new(INCOMING_UDP, id, metadata)).await?;
                     let connection = connection.clone();
                     let bus = bus.clone();
-                    let session = datagram.session;
+                    let session = session_id;
                     let activity = Arc::new(AtomicU64::new(now_ns));
                     let session_activity = activity.clone();
                     tasks.spawn(async move {
                         let mut packet = 1u16;
+                        let mut credit = 0;
                         let mut expiry = tokio::time::interval(Duration::from_secs(1));
                         loop {
                             tokio::select! {
@@ -840,7 +942,7 @@ async fn server_udp(
                                     let Some(frame) = command else { break };
                                     if frame.kind != DATAGRAM { break; }
                                     activity.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                                    let _ = bus.send(Frame::new(WRITABLE, id, Bytes::new())).await;
+                                    let _ = bus.writable(id, &mut credit).await;
                                     if send_udp(&connection, session, packet, &frame.data).await.is_err() { break; }
                                     packet = packet.wrapping_add(1);
                                 }
@@ -852,10 +954,10 @@ async fn server_udp(
                         bus.done(id, Ok(())).await;
                         session
                     });
-                    sessions.insert(datagram.session, (id, session_activity));
+                    sessions.insert(session_id, (id, session_activity));
                     id
                 };
-                bus.udp_payload(Frame::new(DATAGRAM, id, address_data(&datagram.address, &datagram.payload)?)).await?;
+                bus.udp_payload(Frame::new(DATAGRAM, id, address_data(address, payload)?)).await?;
             }
             _ = cleanup.tick() => { defrag.expire(start.elapsed().as_nanos() as u64); }
             Some(done) = tasks.join_next(), if !tasks.is_empty() => {
@@ -980,6 +1082,7 @@ fn bridge_tasks(
     bridge: Bridge,
     mut outgoing: mpsc::Receiver<Frame>,
     incoming: mpsc::Sender<Frame>,
+    bus: Arc<Bus>,
     tasks: &mut JoinSet<Result<()>>,
 ) {
     match bridge {
@@ -995,7 +1098,7 @@ fn bridge_tasks(
             });
             tasks.spawn(async move {
                 while let Ok(frame) = read_frame(&mut reader).await {
-                    if incoming.send(frame).await.is_err() {
+                    if bus.command(&incoming, frame).await.is_err() {
                         break;
                     }
                 }
@@ -1003,50 +1106,8 @@ fn bridge_tasks(
             });
         }
         Bridge::Shared(bridge) => {
+            drop(outgoing);
             tasks.spawn(bridge.clone().notifications());
-            let writer = bridge.clone();
-            tasks.spawn(async move {
-                while let Some(frame) = outgoing.recv().await {
-                    let mut pending = Some(frame);
-                    for _ in 0..32 {
-                        let Some(frame) = pending.take() else { break };
-                        loop {
-                            let changed = writer.changed.notified();
-                            tokio::pin!(changed);
-                            changed.as_mut().enable();
-                            if writer.closed() {
-                                return Ok(());
-                            }
-                            if writer.push(false, frame.kind, frame.id, &frame.data)? {
-                                break;
-                            }
-                            // Do not hold unpublished wakes while waiting for
-                            // the consumer to release a full event ring.
-                            writer.notify_go();
-                            changed.await;
-                        }
-                        pending = outgoing.try_recv().ok();
-                    }
-                    writer.notify_go();
-                    if let Some(frame) = pending {
-                        // The bounded batch ended with one prefetched frame.
-                        loop {
-                            let changed = writer.changed.notified();
-                            tokio::pin!(changed);
-                            changed.as_mut().enable();
-                            if writer.closed() {
-                                return Ok(());
-                            }
-                            if writer.push(false, frame.kind, frame.id, &frame.data)? {
-                                break;
-                            }
-                            changed.await;
-                        }
-                        writer.notify_go();
-                    }
-                }
-                Ok(())
-            });
             tasks.spawn(async move {
                 loop {
                     let changed = bridge.changed.notified();
@@ -1055,18 +1116,31 @@ fn bridge_tasks(
                     if bridge.closed() {
                         break;
                     }
-                    let mut drained = false;
-                    while let Some((kind, id, data)) = bridge.pop(true)? {
-                        drained = true;
+                    let mut drained = 0;
+                    let mut bytes = 0;
+                    while drained < 32 && bytes < 256 * 1024 {
+                        let Some((kind, id, data)) = bridge.pop(true)? else {
+                            break;
+                        };
+                        drained += 1;
+                        bytes += data.len();
                         if incoming.capacity() == 0 {
-                            bridge.notify_go();
+                            bridge.notify_space();
                         }
-                        if incoming.send(Frame::new(kind, id, data)).await.is_err() {
+                        if bus
+                            .command(&incoming, Frame::new(kind, id, data))
+                            .await
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }
-                    if drained {
-                        bridge.notify_go();
+                    if drained != 0 {
+                        bridge.notify_space();
+                    }
+                    if drained == 32 || bytes >= 256 * 1024 {
+                        tokio::task::yield_now().await;
+                        continue;
                     }
                     changed.await;
                 }
@@ -1081,7 +1155,11 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
     let (events, outgoing) = mpsc::channel(128);
     let bus = Arc::new(Bus {
         events,
-        flows: Mutex::new(HashMap::new()),
+        shared: match &bridge {
+            Bridge::Shared(shared) => Some(shared.clone()),
+            Bridge::Socket(_) => None,
+        },
+        flows: std::sync::Mutex::new(HashMap::new()),
         next: AtomicU64::new(1),
         max_flows: config.flow_limit(),
         pending_auth: std::sync::Mutex::new(HashMap::new()),
@@ -1090,7 +1168,7 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
     let connection_slots = Arc::new(Semaphore::new(config.connection_limit()));
     let mut tasks = JoinSet::<Result<()>>::new();
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
-    bridge_tasks(bridge, outgoing, incoming_tx, &mut tasks);
+    bridge_tasks(bridge, outgoing, incoming_tx, bus.clone(), &mut tasks);
     let mut client = None;
     let sessions = Arc::new(Mutex::new(HashMap::new()));
     let mut udp_enabled = false;
@@ -1184,9 +1262,10 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
                         let connection = connection.clone(); let bus = bus.clone(); let sessions = sessions.clone();
                         tasks.spawn(async move {
                             let mut packet = 1u16;
+                            let mut credit = 0;
                             while let Some(command) = commands.recv().await {
                                 if command.kind != DATAGRAM { break; }
-                                bus.send(Frame::new(WRITABLE, id, Bytes::new())).await?;
+                                bus.writable(id, &mut credit).await?;
                                 if send_udp(&connection, session, packet, &command.data).await.is_err() { break; }
                                 packet = packet.wrapping_add(1);
                             }
@@ -1327,7 +1406,7 @@ pub unsafe extern "C" fn xhys_engine_start(
     }
 }
 
-/// Starts the active shared-memory bridge. Both duplicated notification fds are
+/// Starts the active shared-memory bridge. Three duplicated notification fds are
 /// transferred to Go; arena storage remains owned by the Engine until join.
 ///
 /// # Safety

@@ -65,6 +65,14 @@ impl Hybrid {
 }
 
 impl Controller for Hybrid {
+    fn max_datagrams(&self) -> usize {
+        if self.selected.load(Ordering::Acquire) == 0 {
+            self.fallback.max_datagrams()
+        } else {
+            1
+        }
+    }
+
     fn can_send(&self, in_flight: u64, bytes_to_send: u64) -> bool {
         if self.selected.load(Ordering::Acquire) == 0 {
             self.fallback.can_send(in_flight, bytes_to_send)
@@ -195,7 +203,9 @@ mod tests {
             .into_any()
             .downcast::<Hybrid>()
             .unwrap();
+        assert_eq!(controller.max_datagrams(), usize::MAX);
         controller.selected.store(1_000_000, Ordering::Release);
+        assert_eq!(controller.max_datagrams(), 1);
         assert!(controller.can_send(controller.window(), 1280));
         assert!(!controller.can_send(controller.window() + 1, 1280));
         assert_eq!(

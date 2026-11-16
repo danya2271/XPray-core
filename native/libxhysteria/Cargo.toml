@@ -10,7 +10,7 @@ license = "MPL-2.0"
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
-blake2 = "=0.10.6"
+blake2b_simd = "=1.0.5"
 libc = "=0.2.191"
 getrandom = "=0.4.3"
 bytes = { version = "=1.12.1", optional = true }
@@ -27,8 +27,12 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 webpki-roots = { version = "1", optional = true }
 
+[dev-dependencies]
+blake2 = "=0.10.6"
+
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }
+h3-quinn = { path = "vendor/h3-quinn" }
 
 [features]
 probe = ["dep:bytes", "dep:h3", "dep:h3-quinn", "dep:http", "dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:tokio"]

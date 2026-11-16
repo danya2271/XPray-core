@@ -1,4 +1,4 @@
-//! Bounded SPSC frame rings. Only setup/teardown use the C ABI.
+//! Bounded frame rings with serialized publishers. Only setup/teardown use C.
 //!
 //! The Go peer uses aligned 32-bit atomics over this little-endian storage ABI.
 //! Payload access is exclusive between head publication and tail release.
@@ -18,7 +18,7 @@ use std::{
 use tokio::{io::unix::AsyncFd, sync::Notify};
 
 pub const MAGIC: u64 = 0x5848595353484d32;
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const CAPACITY: u32 = 32;
 pub const MAX_FRAME: usize = 65536 + 4096;
 pub const STRIDE: usize = (16 + MAX_FRAME + 63) & !63;
@@ -40,7 +40,10 @@ struct Header {
     max_frame: u32,
     arena_bytes: u64,
     closed: AtomicU32,
-    pad: [u8; 28],
+    go_pending: AtomicU32,
+    native_pending: AtomicU32,
+    space_pending: AtomicU32,
+    pad: [u8; 16],
     command_head: Line,
     command_tail: Line,
     event_head: Line,
@@ -54,12 +57,15 @@ pub struct View {
     pub len: u64,
     pub notify_fd: i32,
     pub wake_fd: i32,
+    pub space_fd: i32,
 }
 
 pub struct Bridge {
     data: NonNull<u8>,
     go: OwnedFd,
     native: OwnedFd,
+    space: OwnedFd,
+    event_writer: std::sync::Mutex<()>,
     pub changed: Notify,
 }
 
@@ -91,6 +97,7 @@ impl Bridge {
     pub fn new() -> io::Result<Arc<Self>> {
         let go = eventfd()?;
         let native = eventfd()?;
+        let space = eventfd()?;
         let layout = Layout::from_size_align(ARENA_BYTES, 64).unwrap();
         let data = NonNull::new(unsafe { alloc_zeroed(layout) })
             .ok_or_else(|| io::Error::other("native shared arena allocation failed"))?;
@@ -103,7 +110,10 @@ impl Bridge {
                 max_frame: MAX_FRAME as u32,
                 arena_bytes: ARENA_BYTES as u64,
                 closed: AtomicU32::new(0),
-                pad: [0; 28],
+                go_pending: AtomicU32::new(0),
+                native_pending: AtomicU32::new(0),
+                space_pending: AtomicU32::new(0),
+                pad: [0; 16],
                 command_head: Line {
                     value: AtomicU32::new(0),
                     pad: [0; 60],
@@ -126,6 +136,8 @@ impl Bridge {
             data,
             go,
             native,
+            space,
+            event_writer: std::sync::Mutex::new(()),
             changed: Notify::new(),
         }))
     }
@@ -144,12 +156,14 @@ impl Bridge {
         };
         let notify = duplicate(self.go.as_raw_fd())?;
         let wake = duplicate(self.native.as_raw_fd())?;
+        let space = duplicate(self.space.as_raw_fd())?;
         use std::os::fd::IntoRawFd;
         Ok(View {
             data: self.data.as_ptr(),
             len: ARENA_BYTES as u64,
             notify_fd: notify.into_raw_fd(),
             wake_fd: wake.into_raw_fd(),
+            space_fd: space.into_raw_fd(),
         })
     }
 
@@ -161,11 +175,42 @@ impl Bridge {
         self.header().closed.store(1, Ordering::Release);
         signal(self.go.as_raw_fd());
         signal(self.native.as_raw_fd());
+        signal(self.space.as_raw_fd());
         self.changed.notify_waiters();
     }
 
     pub fn notify_go(&self) {
-        signal(self.go.as_raw_fd());
+        if self.header().go_pending.swap(1, Ordering::AcqRel) == 0 {
+            signal(self.go.as_raw_fd());
+        }
+    }
+
+    pub fn notify_space(&self) {
+        if self.header().space_pending.swap(1, Ordering::AcqRel) == 0 {
+            signal(self.space.as_raw_fd());
+        }
+    }
+
+    pub async fn send(&self, kind: u8, id: u64, data: &[u8]) -> Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let published = {
+                // Serialize only the ring publication, never an async wait.
+                // This keeps one producer without an extra task/queue hop.
+                let _writer = self.event_writer.lock().unwrap();
+                if self.closed() {
+                    return Err("Go bridge closed".into());
+                }
+                self.push(false, kind, id, data)?
+            };
+            self.notify_go();
+            if published {
+                return Ok(());
+            }
+            changed.await;
+        }
     }
 
     pub async fn notifications(self: Arc<Self>) -> Result<()> {
@@ -188,6 +233,9 @@ impl Bridge {
                 }
             });
             if matches!(read, Ok(Ok(()))) {
+                // Acquire all changes published before the coalesced wake,
+                // then arm the next one before notifying ring waiters.
+                self.header().native_pending.swap(0, Ordering::AcqRel);
                 self.changed.notify_waiters();
                 if self.closed() {
                     return Ok(());
@@ -287,6 +335,9 @@ mod tests {
     fn layout_wraparound_and_full_rings() {
         assert_eq!(std::mem::size_of::<Header>(), HEADER);
         assert_eq!(std::mem::offset_of!(Header, closed), 32);
+        assert_eq!(std::mem::offset_of!(Header, go_pending), 36);
+        assert_eq!(std::mem::offset_of!(Header, native_pending), 40);
+        assert_eq!(std::mem::offset_of!(Header, space_pending), 44);
         assert_eq!(std::mem::offset_of!(Header, command_head), 64);
         assert_eq!(std::mem::offset_of!(Header, command_tail), 128);
         assert_eq!(std::mem::offset_of!(Header, event_head), 192);
@@ -314,5 +365,43 @@ mod tests {
             }
             assert!(b.pop(commands).unwrap().is_none());
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publishers_preserve_ownership_order_and_wakeups() {
+        let bridge = Bridge::new().unwrap();
+        let mut producers = tokio::task::JoinSet::new();
+        for producer in 0..8u64 {
+            let bridge = bridge.clone();
+            producers.spawn(async move {
+                for sequence in 0..256u64 {
+                    let id = producer * 256 + sequence;
+                    bridge.send(3, id, &id.to_be_bytes()).await.unwrap();
+                }
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut sequences = [0u64; 8];
+            for _ in 0..2048 {
+                loop {
+                    if let Some((kind, id, data)) = bridge.pop(false).unwrap() {
+                        let producer = (id / 256) as usize;
+                        assert_eq!(kind, 3);
+                        assert_eq!(id % 256, sequences[producer]);
+                        sequences[producer] += 1;
+                        assert_eq!(data.as_ref(), &id.to_be_bytes());
+                        bridge.changed.notify_waiters();
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+            assert_eq!(sequences, [256; 8]);
+            while let Some(result) = producers.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
     }
 }

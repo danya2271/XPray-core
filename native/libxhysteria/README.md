@@ -167,12 +167,14 @@ CGO_ENABLED=1 go test -tags 'xhysteria_native xhysteria_interop' \
 ## Session pooling and shared memory
 
 Linux/Android amd64 and arm64 use the shared-memory bridge by default. Each
-engine owns two bounded SPSC rings with 32 slots each and two nonblocking
+engine owns two bounded frame rings with 32 slots each and three nonblocking
 `eventfd` notification descriptors. The arena is 4,460,864 bytes (about 4.25 MiB),
-aligned to 64 bytes; storage layout version 2 is checked during setup. Engine
-ABI version 3 adds authentication/certificate control frames and connection
-ownership metadata. A dedicated
-Go notification reader wakes both RX and blocked TX through Go netpoll. No CGO
+aligned to 64 bytes; storage layout version 3 and engine ABI version 4 are
+checked during setup. Event publication is serialized with a short native
+mutex; command publication uses a short Go mutex and an ordered queue fallback.
+No lock is held over a blocked ring wait. Separate descriptors wake RX and
+blocked TX directly through Go netpoll; a third wakes Rust. Coalesced pending
+flags reduce redundant notification syscalls without delaying data. No CGO
 call is made to transfer traffic. The socket bridge remains available for
 comparison and rollback, and is the default on other supported architectures.
 
@@ -183,6 +185,11 @@ never escape into Xray's forwarding buffers. This is not end-to-end zero-copy.
 TCP writes are coalesced up to 64 KiB; client and server reads aggregate available
 QUIC bytes without waiting to fill an entire chunk. Engine shutdown stops submissions,
 wakes blocked operations, joins dispatchers and Rust, then releases the arena.
+Single Xray buffers are transferred to the bridge without an extra coalescing
+copy. Rust writes owned chunks directly into Quinn and reads server TCP through
+the underlying Quinn stream after parsing the Hysteria header. Data arriving
+with that header is preserved. Credits are returned in groups of eight out of
+a sixteen-frame window; payload publication never waits to fill such a group.
 
 Each outbound lazily opens up to two QUIC sessions, sharing them across TCP and
 UDP flows with the same Xray instance, transport settings, and peer. Closing a
@@ -201,6 +208,7 @@ also covers an advertised RX limit when the local controller is BBR or Reno.
 | `XRAY_HYSTERIA_NATIVE` | unset | `1` forces native, `0` forces Go; unset uses JSON selection |
 | `XRAY_HYSTERIA_BRIDGE` | shared on amd64/arm64 | `socket` restores socket IPC |
 | `XRAY_HYSTERIA_POOL_SIZE` | `2` | `1..8` sessions per outbound; `0` restores per-flow engines |
+| `XRAY_HYSTERIA_SERVER_WORKERS` | `0` | `0`: automatic (up to four); `1..16`: explicit server runtime threads |
 | `XRAY_NET_DIAG` | unset | `1` logs roles, peers, authentication, QUIC counters, buffers and failure reasons |
 
 With diagnostics enabled, `engine started ... role=server` confirms listener
@@ -234,12 +242,34 @@ and fixed an exact-size mismatch in Xray's regular buffer pool that had prevente
 buffer reuse in both Go and native traffic paths.
 Set `XHYS_BENCH_NATIVE_SERVER=1` to measure the native server; the default is Go.
 
+For server comparisons with the same client, in isolated processes:
+
+```sh
+bash native/libxhysteria/bench-server.sh build_assets/native-server-perf
+```
+
+The harness alternates server order and covers Salamander on/off, single and
+parallel request/response traffic, continuous upload/download, TCP latency in
+idle and under four background transfers, and UDP latency. Latency output
+includes p50/p95/p99. Environment overrides `XHYS_BENCH_TIME`,
+`XHYS_BENCH_COUNT`, `XHYS_BENCH_SCENARIOS`, `XHYS_BENCH_CLIENTS` and
+`XHYS_BENCH_MASKS` select a smaller matrix. Native archive hashes and the tracked
+source diff are recorded beside the raw results. CPU includes both endpoints;
+Go allocations exclude Rust allocations and the shared arena.
+
 The native transport now uses the same 8 MiB stream and 20 MiB connection receive
 windows as Go Hysteria. Kernel UDP buffers request up to 8 MiB, subject to OS
 limits, preserving larger existing buffers. Salamander and port hopping retain
 batched receives and GRO segment metadata. Salamander delegates UDP send-error
 handling and source-address selection to Quinn's socket adapter; transient send
-failures no longer directly terminate a QUIC connection. GSO remains disabled.
+failures no longer directly terminate a QUIC connection. BBR/Reno can use GSO.
+Each Salamander segment receives its own system-random salt and BLAKE2b-256
+mask. Hashing uses runtime SIMD detection and a precomputed password prefix;
+the portable implementation remains available. OS-random bytes are prefetched
+in bounded blocks. MTU discovery reserves salt overhead; `disableGSO` and
+`disablePathMtuDiscovery` remain effective. Negotiated Brutal limits transmits
+to one datagram so batching cannot bypass its pacer. See
+`vendor/PATCHES.md` for the pinned dependency changes.
 
 ## Prototype boundaries
 

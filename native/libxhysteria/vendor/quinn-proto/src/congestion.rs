@@ -15,6 +15,11 @@ pub use new_reno::{NewReno, NewRenoConfig};
 
 /// Common interface for different congestion controllers
 pub trait Controller: Send + Sync {
+    /// Limit a single GSO batch when pacing accounts for one send at a time.
+    fn max_datagrams(&self) -> usize {
+        usize::MAX
+    }
+
     /// Override the stock window-derived pacer. `None` keeps the default;
     /// `Some(None)` permits an immediate send; `Some(Some(t))` waits until `t`.
     fn pacing_deadline(&mut self, _now: Instant, _rtt: crate::Duration) -> Option<Option<Instant>> {
