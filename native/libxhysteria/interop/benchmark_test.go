@@ -35,6 +35,9 @@ func benchmarkModes(b *testing.B, run func(*testing.B, *core.Instance, xnet.Dest
 	} {
 		b.Run(mode.name, func(b *testing.B) {
 			b.Setenv("XRAY_HYSTERIA_NATIVE", "0")
+			if os.Getenv("XHYS_BENCH_NATIVE_SERVER") == "1" {
+				b.Setenv("XRAY_HYSTERIA_NATIVE", "1")
+			}
 			server, caPath := xrayServer(b, true)
 			ca, err := os.ReadFile(caPath)
 			if err != nil {

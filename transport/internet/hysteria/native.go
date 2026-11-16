@@ -170,7 +170,7 @@ func nativeDial(ctx context.Context, dest net.Destination, settings *internet.Me
 	if os.Getenv("XRAY_NET_DIAG") == "1" {
 		defer func() {
 			if resultErr != nil {
-				fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] dial failed: %v\n", resultErr)
+				fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] dial failed peer=%s: %v\n", dest.NetAddr(), resultErr)
 			}
 		}()
 	}

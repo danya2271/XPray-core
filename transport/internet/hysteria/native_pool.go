@@ -128,7 +128,7 @@ func (m *nativePools) clean() {
 }
 
 func (p *nativePool) open(ctx context.Context, target net.Destination, create func(context.Context) (*native.Engine, error)) (*pooledNativeConn, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, native.StartupTimeout)
 	defer cancel()
 retry:
 	p.mu.Lock()

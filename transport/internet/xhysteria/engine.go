@@ -54,6 +54,8 @@ const (
 	updateTLS     = 18
 	controlResult = 19
 	maxFrame      = 65536 + 4096
+	// Leave time to deliver Rust's ten-second handshake/auth timeout over IPC.
+	StartupTimeout = 12 * time.Second
 )
 
 // Config is copied by Rust during setup. No Go pointers survive the CGO call.
@@ -159,6 +161,8 @@ type Engine struct {
 	authUsers     map[uint64]nativeIdentity
 	controls      map[uint64]chan frame
 	maxFlows      int
+	diagnostic    bool
+	role, peer    string
 }
 
 type nativeIdentity struct {
@@ -168,6 +172,9 @@ type nativeIdentity struct {
 
 // Start duplicates the UDP descriptor in Rust; the caller still owns udp.
 func Start(ctx context.Context, config Config, udp *os.File, local, remote net.Addr, accept func(*Conn)) (*Engine, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("native startup: %w", err)
+	}
 	if config.MaxFlows > 65536 || config.MaxConnections > 4096 || (config.ExternalAuth && config.Authenticate == nil) {
 		return nil, errors.New("invalid native engine limits or authenticator")
 	}
@@ -211,7 +218,7 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 		C.xhys_engine_join(handle)
 		return nil, err
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(StartupTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
@@ -221,6 +228,12 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 	ready, err := bridge.read()
 	if !stop() {
 		<-stopped
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	} else if d, ok := ctx.Deadline(); err != nil && ok && !time.Now().Before(d) {
+		// Netpoll may report the same deadline before the context timer runs.
+		err = context.DeadlineExceeded
 	}
 	bridge.setReadDeadline(time.Time{})
 	defer ready.release()
@@ -240,7 +253,11 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 		}
 	}
 	e := &Engine{handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept,
-		authenticate: config.Authenticate, authUsers: make(map[uint64]nativeIdentity), controls: make(map[uint64]chan frame), maxFlows: maxFlows}
+		authenticate: config.Authenticate, authUsers: make(map[uint64]nativeIdentity), controls: make(map[uint64]chan frame), maxFlows: maxFlows, diagnostic: config.Diagnostic, role: "client", peer: config.Peer}
+	if config.Server {
+		e.role = "server"
+		e.peer = fmt.Sprint(local)
+	}
 	liveEngines.Add(1)
 	startedEngines.Add(1)
 	liveArenaBytes.Add(arenaBytes)
@@ -249,12 +266,24 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 		if arenaBytes != 0 {
 			mode = "shared"
 		}
-		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] engine started bridge=%s arena_bytes=%d\n", mode, arenaBytes)
+		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] engine started bridge=%s arena_bytes=%d role=%s peer=%s\n", mode, arenaBytes, e.role, e.peer)
 	}
 	e.wg.Add(2)
 	go e.readLoop()
 	go e.writeLoop()
 	return e, nil
+}
+
+func (e *Engine) diagnose(event string, err error) {
+	if !e.diagnostic {
+		return
+	}
+	select {
+	case <-e.done:
+		return
+	default:
+	}
+	fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] %s role=%s peer=%s reason=%v\n", event, e.role, e.peer, err)
 }
 
 func (e *Engine) send(f frame, until time.Time) error {
@@ -414,6 +443,7 @@ func (e *Engine) writeLoop() {
 				batch[i].release()
 			}
 			if err != nil {
+				e.diagnose("bridge write failed", err)
 				return
 			}
 		}
@@ -426,9 +456,11 @@ func (e *Engine) readLoop() {
 	for {
 		f, err := e.bridge.read()
 		if err != nil {
+			e.diagnose("bridge read failed", err)
 			return
 		}
 		if f.kind == errorFrame && f.id == 0 {
+			e.diagnose("engine failed", errors.New(string(f.data)))
 			f.release()
 			return
 		}

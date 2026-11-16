@@ -119,3 +119,26 @@ including speed, CPU use, memory, sleep recovery, and network handover. Earlier
 native Android builds being stable does not establish those results for this
 change. UDP correctness and port hopping are covered by interoperability tests;
 this benchmark does not measure UDP throughput.
+
+## Server follow-up, November 16, 2026
+
+The harness now accepts `XHYS_BENCH_NATIVE_SERVER=1`. The same short loopback
+workload was repeated three times with the corrected batched Salamander/hopping
+receives, server read coalescing, and Go-equivalent QUIC receive windows. Results
+in `build_assets/native-server-fix/server-0.txt` and `server-1.txt`:
+
+| Client | Server | Transfer MB/s | Parallel MB/s |
+| --- | --- | ---: | ---: |
+| Go | Go | 163.29 | 220.47 |
+| Shared, pool 2 | Go | 157.68 | 280.40 |
+| Go | Native | 127.08 | 176.64 |
+| Shared, pool 2 | Native | 117.00 | 195.68 |
+
+The native server remains slower than Go in this fixture. These figures do not
+demonstrate recovery of the reported WAN speed regression or compare the native
+server before and after the fixes. No production throughput improvement is
+claimed. Trying one server runtime worker reduced CPU work but also reduced
+parallel throughput; the existing limit of four workers remains unchanged.
+Cascade tests exercise two native servers under concurrent TCP and fragmented
+UDP traffic through two port changes on both legs, using each bridge. That is
+a bounded interoperability check, not a long-running VPS stability test.

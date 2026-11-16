@@ -1,8 +1,7 @@
-//! Conservative Salamander socket adapter for the interoperability tools.
-//! No GSO/GRO, ECN, or source-IP selection; production I/O will replace this.
+//! Salamander over Quinn's batched UDP I/O and nonfatal send-error handling.
 
 use crate::salamander::{SALT_LEN, Salamander};
-use quinn::{AsyncUdpSocket, UdpPoller, udp};
+use quinn::{AsyncUdpSocket, Runtime, UdpPoller, udp};
 use std::{
     fmt,
     io::{self, IoSliceMut},
@@ -11,10 +10,9 @@ use std::{
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
-use tokio::io::ReadBuf;
 
 pub struct MaskedSocket {
-    socket: Arc<tokio::net::UdpSocket>,
+    socket: Arc<dyn AsyncUdpSocket>,
     mask: Salamander,
     send_buffer: Mutex<Vec<u8>>,
 }
@@ -22,7 +20,7 @@ pub struct MaskedSocket {
 impl MaskedSocket {
     pub fn new(socket: std::net::UdpSocket, psk: &[u8]) -> io::Result<Self> {
         Ok(Self {
-            socket: Arc::new(tokio::net::UdpSocket::from_std(socket)?),
+            socket: quinn::TokioRuntime.wrap_udp_socket(socket)?,
             mask: Salamander::new(psk).map_err(io::Error::other)?,
             send_buffer: Mutex::new(Vec::with_capacity(65536)),
         })
@@ -39,14 +37,14 @@ impl fmt::Debug for MaskedSocket {
 
 impl AsyncUdpSocket for MaskedSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        Box::pin(MaskedPoller(self.socket.clone()))
+        self.socket.clone().create_io_poller()
     }
 
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
-        if transmit.segment_size.is_some() || transmit.src_ip.is_some() {
+        if transmit.segment_size.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "probe adapter has no GSO or source-IP selection",
+                "Salamander requires individual UDP transmissions",
             ));
         }
         let mut buffer = self
@@ -56,10 +54,11 @@ impl AsyncUdpSocket for MaskedSocket {
         self.mask
             .seal(transmit.contents, &mut buffer)
             .map_err(io::Error::other)?;
-        if self.socket.try_send_to(&buffer, transmit.destination)? != buffer.len() {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "partial UDP send"));
-        }
-        Ok(())
+        let masked = udp::Transmit {
+            contents: &buffer,
+            ..*transmit
+        };
+        self.socket.try_send(&masked)
     }
 
     fn poll_recv(
@@ -68,32 +67,30 @@ impl AsyncUdpSocket for MaskedSocket {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        // Plain Tokio sockets never enable UDP GRO. Cap work per poll to stay fair.
         for _ in 0..32 {
-            let mut buffer = ReadBuf::new(&mut bufs[0]);
-            let address = match self.socket.poll_recv_from(cx, &mut buffer) {
-                Poll::Ready(Ok(address)) => address,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
+            let count = match self.socket.poll_recv(cx, bufs, meta) {
+                Poll::Ready(Ok(count)) => count,
+                result => return result,
             };
-            let len = buffer.filled().len();
-            if len <= SALT_LEN {
-                continue;
+            if count == 0 {
+                return Poll::Ready(Ok(0));
             }
-            let payload_len = self
-                .mask
-                .open_in_place(&mut bufs[0][..len])
-                .map_err(io::Error::other)?
-                .len();
-            bufs[0].copy_within(SALT_LEN..len, 0);
-            meta[0] = udp::RecvMeta {
-                addr: address,
-                len: payload_len,
-                stride: payload_len,
-                ecn: None,
-                dst_ip: None,
-            };
-            return Poll::Ready(Ok(1));
+            let mut kept = 0;
+            for i in 0..count {
+                self.decode(&mut bufs[i], &mut meta[i]);
+                if meta[i].len == 0 {
+                    continue;
+                }
+                if kept != i {
+                    let (before, after) = bufs.split_at_mut(i);
+                    before[kept][..meta[i].len].copy_from_slice(&after[0][..meta[i].len]);
+                    meta[kept] = meta[i];
+                }
+                kept += 1;
+            }
+            if kept != 0 {
+                return Poll::Ready(Ok(kept));
+            }
         }
         cx.waker().wake_by_ref();
         Poll::Pending
@@ -106,18 +103,114 @@ impl AsyncUdpSocket for MaskedSocket {
         1
     }
     fn max_receive_segments(&self) -> usize {
-        1
+        self.socket.max_receive_segments()
     }
     fn may_fragment(&self) -> bool {
-        true
+        self.socket.may_fragment()
     }
 }
 
-#[derive(Debug)]
-struct MaskedPoller(Arc<tokio::net::UdpSocket>);
+impl MaskedSocket {
+    fn decode(&self, buffer: &mut [u8], meta: &mut udp::RecvMeta) {
+        let wire_len = meta.len;
+        let stride = meta.stride;
+        meta.len = 0;
+        if stride <= SALT_LEN {
+            return;
+        }
+        // Each GRO segment has its own salt. Compact decoded payloads while
+        // retaining the segment stride, ECN, destination IP and source address.
+        meta.stride = stride - SALT_LEN;
+        for offset in (0..wire_len).step_by(stride) {
+            let end = (offset + stride).min(wire_len);
+            if self.mask.open_in_place(&mut buffer[offset..end]).is_ok() {
+                let len = end - offset - SALT_LEN;
+                buffer.copy_within(offset + SALT_LEN..end, meta.len);
+                meta.len += len;
+            }
+        }
+    }
+}
 
-impl UdpPoller for MaskedPoller {
-    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.0.poll_send_ready(cx)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+
+    fn socket() -> MaskedSocket {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        MaskedSocket::new(socket, b"test-password").unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_errors_are_packet_loss_instead_of_connection_failure() {
+        let socket = Arc::new(socket());
+        let mut poller = socket.clone().create_io_poller();
+        poll_fn(|cx| poller.as_mut().poll_writable(cx))
+            .await
+            .unwrap();
+        // Port zero produces EINVAL without transmitting a packet on Linux.
+        socket
+            .try_send(&udp::Transmit {
+                destination: "127.0.0.1:0".parse().unwrap(),
+                contents: b"test",
+                ecn: None,
+                segment_size: None,
+                src_ip: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gro_segments_have_independent_salts_and_preserve_metadata() {
+        let socket = socket();
+        let mut wire = Vec::new();
+        for payload in [b"first packet".as_slice(), b"next packet!", b"last"] {
+            let mut packet = Vec::new();
+            socket.mask.seal(payload, &mut packet).unwrap();
+            wire.extend_from_slice(&packet);
+        }
+        let mut meta = udp::RecvMeta {
+            addr: "127.0.0.1:1234".parse().unwrap(),
+            len: wire.len(),
+            stride: 12 + SALT_LEN,
+            ecn: Some(udp::EcnCodepoint::Ect0),
+            dst_ip: Some("127.0.0.2".parse().unwrap()),
+        };
+        socket.decode(&mut wire, &mut meta);
+        assert_eq!(&wire[..meta.len], b"first packetnext packet!last");
+        assert_eq!(meta.stride, 12);
+        assert_eq!(meta.ecn, Some(udp::EcnCodepoint::Ect0));
+        assert_eq!(meta.dst_ip, Some("127.0.0.2".parse().unwrap()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn receives_a_batch_and_filters_short_packets() {
+        let socket = socket();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for payload in [b"a".as_slice(), b"short", b"b", b"c"] {
+            let mut packet = Vec::new();
+            if payload == b"short" {
+                packet.extend_from_slice(payload);
+            } else {
+                socket.mask.seal(payload, &mut packet).unwrap();
+            }
+            sender
+                .send_to(&packet, socket.local_addr().unwrap())
+                .unwrap();
+        }
+        let mut storage = [[0; 2048]; 4];
+        let mut bufs: Vec<_> = storage.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+        let mut meta = [udp::RecvMeta::default(); 4];
+        let count = poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        for i in 0..count {
+            assert_eq!(&bufs[i][..meta[i].len], &[b'a' + i as u8]);
+            assert_eq!(meta[i].addr, sender.local_addr().unwrap());
+        }
     }
 }

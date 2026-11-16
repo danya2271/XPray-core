@@ -168,18 +168,29 @@ impl AsyncUdpSocket for HoppingSocket {
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
         for _ in 0..32 {
-            // Keep GRO metadata intact, but inspect one receive buffer at a time
-            // so rejected sources never require copying/reordering packet data.
-            match self.inner.poll_recv(cx, &mut bufs[..1], &mut meta[..1]) {
+            match self.inner.poll_recv(cx, bufs, meta) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Ok(0)),
-                Poll::Ready(Ok(_)) => {
-                    if !self.accepts(meta[0].addr) {
-                        continue;
+                Poll::Ready(Ok(count)) => {
+                    let mut kept = 0;
+                    for i in 0..count {
+                        if !self.accepts(meta[i].addr) {
+                            continue;
+                        }
+                        if kept != i {
+                            let (before, after) = bufs.split_at_mut(i);
+                            before[kept][..meta[i].len].copy_from_slice(&after[0][..meta[i].len]);
+                        }
+                        // A port change is not QUIC migration. Preserve GRO
+                        // metadata and compact only after rejected sources.
+                        meta[kept] = udp::RecvMeta {
+                            addr: self.peer,
+                            ..meta[i]
+                        };
+                        kept += 1;
                     }
-                    // The network port is not a QUIC migration. Late replies
-                    // from any configured port still belong to the same peer.
-                    meta[0].addr = self.peer;
-                    return Poll::Ready(Ok(1));
+                    if kept != 0 {
+                        return Poll::Ready(Ok(kept));
+                    }
                 }
                 result => return result,
             }
@@ -232,18 +243,24 @@ mod tests {
             bufs: &mut [IoSliceMut<'_>],
             meta: &mut [udp::RecvMeta],
         ) -> Poll<io::Result<usize>> {
-            let Some(address) = self.received.lock().unwrap().pop_front() else {
-                return Poll::Pending;
-            };
-            bufs[0][..4].copy_from_slice(b"test");
-            meta[0] = udp::RecvMeta {
-                addr: address,
-                len: 4,
-                stride: 4,
-                ecn: None,
-                dst_ip: None,
-            };
-            Poll::Ready(Ok(1))
+            let mut received = self.received.lock().unwrap();
+            let count = received.len().min(bufs.len());
+            for i in 0..count {
+                let address = received.pop_front().unwrap();
+                bufs[i][..4].copy_from_slice(&address.port().to_be_bytes().repeat(2));
+                meta[i] = udp::RecvMeta {
+                    addr: address,
+                    len: 4,
+                    stride: 2,
+                    ecn: Some(udp::EcnCodepoint::Ect0),
+                    dst_ip: Some("127.0.0.1".parse().unwrap()),
+                };
+            }
+            if count == 0 {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(count))
+            }
         }
 
         fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -297,13 +314,41 @@ mod tests {
                 Poll::Ready(Ok(1))
             ));
             assert_eq!(meta[0].addr, peer);
-            assert_eq!(meta[0].stride, 4);
+            assert_eq!(meta[0].stride, 2);
         }
         assert!(
             socket
                 .poll_recv(&mut cx, &mut buffers, &mut meta)
                 .is_pending()
         );
+    }
+
+    #[test]
+    fn receives_batches_without_losing_gro_metadata_or_reordering_payloads() {
+        let inner = Arc::new(Socket::default());
+        inner.received.lock().unwrap().extend([
+            "127.0.0.1:1111".parse::<SocketAddr>().unwrap(),
+            "127.0.0.2:1111".parse().unwrap(),
+            "127.0.0.1:2222".parse().unwrap(),
+            "127.0.0.1:3333".parse().unwrap(),
+        ]);
+        let peer = "127.0.0.1:3333".parse().unwrap();
+        let socket = HoppingSocket::new(inner, peer, config(vec![1111, 2222]), false).unwrap();
+        let mut bytes = [[0; 64]; 4];
+        let mut buffers: Vec<_> = bytes.iter_mut().map(|b| IoSliceMut::new(b)).collect();
+        let mut meta = [udp::RecvMeta::default(); 4];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            socket.poll_recv(&mut cx, &mut buffers, &mut meta),
+            Poll::Ready(Ok(3))
+        ));
+        for (i, port) in [1111u16, 2222, 3333].into_iter().enumerate() {
+            assert_eq!(&buffers[i][..4], &port.to_be_bytes().repeat(2));
+            assert_eq!(meta[i].addr, peer);
+            assert_eq!(meta[i].stride, 2);
+            assert_eq!(meta[i].ecn, Some(udp::EcnCodepoint::Ect0));
+            assert_eq!(meta[i].dst_ip, Some("127.0.0.1".parse().unwrap()));
+        }
     }
 
     #[test]

@@ -147,6 +147,12 @@ Pool tests mix TCP and fragmented UDP on shared sessions, check that closing one
 flow preserves the others, and verify cleanup when the Xray instance stops.
 Ring tests exercise full queues, counter wraparound, notification wakeups, and
 buffer ownership after immediate slot reuse.
+Cascade tests run four TCP transfers and two fragmented UDP flows through two
+native servers, with Salamander and at least two port changes on both legs.
+Both shared and socket bridges are exercised. UDP loss under load is permitted;
+closed flows, corrupted payloads and stalled TCP transfers fail the test.
+Startup tests distinguish native setup failures, handshake timeouts and caller
+cancellation on both bridges.
 Server tests also cover live user updates, UUID aliases, more than 1024 configured
 users, 160 concurrent flows, and TLS certificate replacement with active streams.
 To test a separately built NodeX server using DanVlessBot's actual config generator:
@@ -174,8 +180,8 @@ Payloads are copied across the ownership boundary: Rust copies commands out of
 the ring, and Go copies events into pooled Xray buffers before releasing slots.
 Those buffers then pass directly to `ReadMultiBuffer`; native arena pointers
 never escape into Xray's forwarding buffers. This is not end-to-end zero-copy.
-TCP writes are coalesced up to 64 KiB; client reads aggregate available QUIC
-bytes without waiting to fill an entire chunk. Engine shutdown stops submissions,
+TCP writes are coalesced up to 64 KiB; client and server reads aggregate available
+QUIC bytes without waiting to fill an entire chunk. Engine shutdown stops submissions,
 wakes blocked operations, joins dispatchers and Rust, then releases the arena.
 
 Each outbound lazily opens up to two QUIC sessions, sharing them across TCP and
@@ -183,8 +189,10 @@ UDP flows with the same Xray instance, transport settings, and peer. Closing a
 flow preserves the session. There are 64 reserved flows per pooled session,
 a global limit of 16 pooled outbound sessions including handshakes in progress,
 and a 30-second idle timeout. A full pool waits for capacity with cancellation
-and a 10-second timeout. Closing its Xray instance or losing the native engine
-also retires sessions. A fixed negotiated Brutal rate restricts the pool to one
+and a 12-second timeout. The native handshake/auth timeout is ten seconds; the
+additional bridge allowance lets Go receive its actual error. An earlier caller
+deadline still takes precedence. Closing its Xray instance or losing the native
+engine also retires sessions. A fixed negotiated Brutal rate restricts the pool to one
 session so pooling does not multiply the configured bandwidth allowance. This
 also covers an advertised RX limit when the local controller is BBR or Reno.
 
@@ -193,7 +201,15 @@ also covers an advertised RX limit when the local controller is BBR or Reno.
 | `XRAY_HYSTERIA_NATIVE` | unset | `1` forces native, `0` forces Go; unset uses JSON selection |
 | `XRAY_HYSTERIA_BRIDGE` | shared on amd64/arm64 | `socket` restores socket IPC |
 | `XRAY_HYSTERIA_POOL_SIZE` | `2` | `1..8` sessions per outbound; `0` restores per-flow engines |
-| `XRAY_NET_DIAG` | unset | `1` logs the active bridge and arena size |
+| `XRAY_NET_DIAG` | unset | `1` logs roles, peers, authentication, QUIC counters, buffers and failure reasons |
+
+With diagnostics enabled, `engine started ... role=server` confirms listener
+startup; `authenticated role=server` confirms successful client authentication.
+`connection role=client/server` reports RTT, TX/RX bytes, lost packets and the
+congestion window every ten seconds. Increasing counters confirm traffic on
+that peer. Startup errors identify the peer and phase (QUIC or HTTP/3 auth);
+caller cancellation is reported separately from a native timeout. Error frames
+survive shared-bridge shutdown instead of becoming a generic closed connection.
 
 The existing Android native-backend preference still switches the entire backend
 to Go. Pool and bridge overrides are process environment settings; no additional
@@ -216,6 +232,14 @@ Go CPU/allocation profiles, and optional native stacks. See `PERFORMANCE.md`
 for methodology, measured results, and limitations. Profiling also identified
 and fixed an exact-size mismatch in Xray's regular buffer pool that had prevented
 buffer reuse in both Go and native traffic paths.
+Set `XHYS_BENCH_NATIVE_SERVER=1` to measure the native server; the default is Go.
+
+The native transport now uses the same 8 MiB stream and 20 MiB connection receive
+windows as Go Hysteria. Kernel UDP buffers request up to 8 MiB, subject to OS
+limits, preserving larger existing buffers. Salamander and port hopping retain
+batched receives and GRO segment metadata. Salamander delegates UDP send-error
+handling and source-address selection to Quinn's socket adapter; transient send
+failures no longer directly terminate a QUIC connection. GSO remains disabled.
 
 ## Prototype boundaries
 

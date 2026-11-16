@@ -14,9 +14,10 @@ pub struct Replay {
     prefix: VecDeque<Bytes>,
 }
 
-pub struct ReplayRecv {
-    raw: h3_quinn::RecvStream,
+pub struct ReplayRecv<S = h3_quinn::RecvStream> {
+    raw: S,
     prefix: VecDeque<Bytes>,
+    error: Option<quic::StreamErrorIncoming>,
 }
 
 impl Replay {
@@ -27,12 +28,13 @@ impl Replay {
             ReplayRecv {
                 raw: recv,
                 prefix: self.prefix,
+                error: None,
             },
         )
     }
 }
 
-impl quic::RecvStream for ReplayRecv {
+impl<S: quic::RecvStream<Buf = Bytes>> quic::RecvStream for ReplayRecv<S> {
     type Buf = Bytes;
     fn poll_data(
         &mut self,
@@ -41,6 +43,9 @@ impl quic::RecvStream for ReplayRecv {
         if let Some(data) = self.prefix.pop_front() {
             return Poll::Ready(Ok(Some(data)));
         }
+        if let Some(error) = self.error.take() {
+            return Poll::Ready(Err(error));
+        }
         self.raw.poll_data(cx)
     }
     fn stop_sending(&mut self, code: u64) {
@@ -48,6 +53,42 @@ impl quic::RecvStream for ReplayRecv {
     }
     fn recv_id(&self) -> quic::StreamId {
         self.raw.recv_id()
+    }
+}
+
+impl<S: quic::RecvStream<Buf = Bytes> + Unpin> tokio::io::AsyncRead for ReplayRecv<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let start = buffer.filled().len();
+        while buffer.remaining() != 0 {
+            match self.poll_data(cx) {
+                Poll::Ready(Ok(Some(mut data))) => {
+                    let n = buffer.remaining().min(data.len());
+                    buffer.put_slice(&data.split_to(n));
+                    if !data.is_empty() {
+                        self.prefix.push_front(data);
+                    }
+                }
+                Poll::Ready(Ok(None)) => break,
+                Poll::Ready(Err(error)) => {
+                    if buffer.filled().len() == start {
+                        return Poll::Ready(Err(std::io::Error::other(error)));
+                    }
+                    self.error = Some(error);
+                    break;
+                }
+                Poll::Pending => {
+                    if buffer.filled().len() == start {
+                        return Poll::Pending;
+                    }
+                    break;
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -196,4 +237,69 @@ pub async fn write_raw<S: quic::SendStreamUnframed<Bytes>>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    struct Chunks(VecDeque<Poll<std::result::Result<Option<Bytes>, quic::StreamErrorIncoming>>>);
+
+    impl quic::RecvStream for Chunks {
+        type Buf = Bytes;
+        fn poll_data(
+            &mut self,
+            _: &mut Context<'_>,
+        ) -> Poll<std::result::Result<Option<Bytes>, quic::StreamErrorIncoming>> {
+            self.0.pop_front().unwrap_or(Poll::Ready(Ok(None)))
+        }
+        fn stop_sending(&mut self, _: u64) {
+            unreachable!()
+        }
+        fn recv_id(&self) -> quic::StreamId {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn coalesces_ready_chunks_without_waiting_and_retains_partial_chunks() {
+        let mut reader = ReplayRecv {
+            raw: Chunks(VecDeque::from([
+                Poll::Ready(Ok(Some(Bytes::from_static(b"abcdef")))),
+                Poll::Ready(Ok(Some(Bytes::from_static(b"ghij")))),
+                Poll::Pending,
+                Poll::Ready(Ok(Some(Bytes::from_static(b"kl")))),
+            ])),
+            prefix: VecDeque::from([Bytes::from_static(b"header-tail")]),
+            error: None,
+        };
+        let mut short = [0; 4];
+        assert_eq!(reader.read(&mut short).await.unwrap(), 4);
+        assert_eq!(&short, b"head");
+        let mut buffer = [0; 64];
+        let n = reader.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"er-tailabcdefghij");
+        let n = reader.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"kl");
+        assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn delivers_buffered_payload_before_reset() {
+        let mut reader = ReplayRecv {
+            raw: Chunks(VecDeque::from([
+                Poll::Ready(Ok(Some(Bytes::from_static(b"payload")))),
+                Poll::Ready(Err(quic::StreamErrorIncoming::StreamTerminated {
+                    error_code: 42,
+                })),
+            ])),
+            prefix: VecDeque::new(),
+            error: None,
+        };
+        let mut buffer = [0; 64];
+        let n = reader.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"payload");
+        assert!(reader.read(&mut buffer).await.is_err());
+    }
 }

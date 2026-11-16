@@ -201,6 +201,23 @@ func embeddedClient(t testing.TB, server string, ca []byte, masked bool, hops ..
 
 func embeddedClientWithAuth(t testing.TB, server string, ca []byte, masked bool, password string, hops ...*udphop.Config) *core.Instance {
 	t.Helper()
+	client, err := core.New(embeddedClientConfig(t, server, ca, masked, password, hops...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func embeddedClientConfig(t testing.TB, server string, ca []byte, masked bool, password string, hops ...*udphop.Config) *core.Config {
+	t.Helper()
 	address, err := net.ResolveUDPAddr("udp", server)
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +242,7 @@ func embeddedClientWithAuth(t testing.TB, server string, ca []byte, masked bool,
 	for _, hop := range hops {
 		stream.Udpmasks = append(stream.Udpmasks, serial.ToTypedMessage(hop))
 	}
-	client, err := core.New(&core.Config{
+	return &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dispatcher.Config{}),
 			serial.ToTypedMessage(&proxyman.InboundConfig{}),
@@ -237,17 +254,5 @@ func embeddedClientWithAuth(t testing.TB, server string, ca []byte, masked bool,
 				Address: xnet.NewIPOrDomain(xnet.IPAddress(address.IP)), Port: uint32(address.Port),
 			}}),
 		}},
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := client.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	if err := client.Start(); err != nil {
-		t.Fatal(err)
-	}
-	return client
 }

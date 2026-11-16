@@ -373,6 +373,10 @@ fn transport(config: &Config) -> Result<quinn::TransportConfig> {
     let (idle, alive) = quic_timers(config)?;
     let mut t = quinn::TransportConfig::default();
     t.max_concurrent_bidi_streams(64u32.into())
+        // Match Xray's Go Hysteria windows on WAN paths, while bounding memory
+        // across streams instead of retaining Quinn's effectively unlimited cap.
+        .stream_receive_window((8u32 * 1024 * 1024).into())
+        .receive_window((20u32 * 1024 * 1024).into())
         .max_idle_timeout(Some(idle.try_into()?))
         .keep_alive_interval(Some(alive));
     t.datagram_receive_buffer_size(Some(256 * 1024));
@@ -396,6 +400,50 @@ fn transport(config: &Config) -> Result<quinn::TransportConfig> {
     Ok(t)
 }
 
+fn udp_buffers(socket: &UdpSocket, diagnostic: bool) {
+    for (option, name) in [(libc::SO_RCVBUF, "recv"), (libc::SO_SNDBUF, "send")] {
+        let get = || {
+            let mut bytes = 0i32;
+            let mut len = std::mem::size_of_val(&bytes) as libc::socklen_t;
+            let result = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    (&mut bytes as *mut i32).cast(),
+                    &mut len,
+                )
+            };
+            (result == 0).then_some(bytes)
+        };
+        let set = |bytes: i32| unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&bytes as *const i32).cast(),
+                std::mem::size_of_val(&bytes) as libc::socklen_t,
+            )
+        };
+        if let Some(before) = get() {
+            if before < 8 * 1024 * 1024 {
+                set(8 * 1024 * 1024);
+                // Linux reports twice the requested value. A capped request
+                // must not shrink a socket configured by the system dialer.
+                if get().is_some_and(|after| after < before) {
+                    set(before / 2);
+                }
+            }
+            if diagnostic {
+                eprintln!(
+                    "[XRAY_NET_DIAG][XHYSTERIA] UDP {name}_buffer={}",
+                    get().unwrap_or(before)
+                );
+            }
+        }
+    }
+}
+
 fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
     let certs = rustls_pemfile::certs(&mut BufReader::new(config.certificate_pem.as_bytes()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -416,6 +464,7 @@ fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
 }
 
 fn endpoint(config: &Config, socket: UdpSocket) -> Result<quinn::Endpoint> {
+    udp_buffers(&socket, config.diagnostic);
     if config.port_hopping.is_some() {
         if config.server {
             return Err("native UDP hopping is client-only".into());
@@ -466,6 +515,24 @@ fn endpoint(config: &Config, socket: UdpSocket) -> Result<quinn::Endpoint> {
         ep.set_default_client_config(client);
     }
     Ok(ep)
+}
+
+async fn connection_diagnostics(connection: quinn::Connection, role: &'static str) -> Result<()> {
+    let peer = connection.remote_address();
+    let mut timer = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            reason = connection.closed() => {
+                eprintln!("[XRAY_NET_DIAG][XHYSTERIA] connection closed role={role} peer={peer} reason={reason}");
+                return Ok(());
+            }
+            _ = timer.tick() => {
+                let s = connection.stats();
+                eprintln!("[XRAY_NET_DIAG][XHYSTERIA] connection role={role} peer={peer} rtt_ms={} tx_bytes={} rx_bytes={} lost_packets={} cwnd={}",
+                    s.path.rtt.as_millis(), s.udp_tx.bytes, s.udp_rx.bytes, s.path.lost_packets, s.path.cwnd);
+            }
+        }
+    }
 }
 
 async fn client_auth(
@@ -653,8 +720,16 @@ async fn relay_server_tcp(
             Err("Go flow closed".into())
         };
         let down = async {
-            while let Some(data) = poll_fn(|cx| rx.poll_data(cx)).await? {
-                bus.payload(Frame::new(DATA, id, data)).await?;
+            // Aggregate ready fragments on the server as on the client. Do not
+            // spend a bridge credit and wake Go for each individual QUIC chunk.
+            let mut buffer = vec![0; 65536];
+            loop {
+                let n = rx.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                bus.payload(Frame::new(DATA, id, Bytes::copy_from_slice(&buffer[..n])))
+                    .await?;
             }
             bus.send(Frame::new(FIN, id, Bytes::new())).await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
@@ -794,6 +869,9 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
     let owner = bus.next.fetch_add(1, Ordering::Relaxed);
     let user = Arc::new(AtomicU32::new(u32::MAX));
     let mut tasks = JoinSet::<Result<()>>::new();
+    if config.diagnostic {
+        tasks.spawn(connection_diagnostics(connection.clone(), "server"));
+    }
     let peer = connection.remote_address().to_string();
     tasks.spawn(server_udp(
         connection.clone(),
@@ -816,7 +894,13 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
             accepted = poll_fn(|cx| h3.poll_accept_request_stream(cx)), if classifiers.len() < 32 && tasks.len() < MAX_FLOWS + 1 => {
                 match accepted {
                     Ok(Some(stream)) => { classifiers.spawn(async { tokio::time::timeout(Duration::from_secs(10), h3_transport::classify(stream)).await? }); }
-                    _ => break,
+                    Ok(None) => break,
+                    Err(error) => {
+                        if config.diagnostic {
+                            eprintln!("[XRAY_NET_DIAG][XHYSTERIA] HTTP/3 closed role=server peer={peer} reason={error}");
+                        }
+                        break;
+                    },
                 }
             }
             Some(done) = classifiers.join_next(), if !classifiers.is_empty() => {
@@ -852,6 +936,9 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
                                 let existing = user.load(Ordering::Acquire);
                                 if existing != u32::MAX && existing != index { return Err("connection auth identity changed".into()); }
                                 user.store(index, Ordering::Release);
+                                if config.diagnostic {
+                                    eprintln!("[XRAY_NET_DIAG][XHYSTERIA] authenticated role=server peer={}", connection.remote_address());
+                                }
                                 let peer_rate = request.headers().get("Hysteria-CC-RX").and_then(|v| v.to_str().ok()).unwrap_or("0");
                                 congestion::negotiate(&connection, &config.congestion, config.tx_bps, peer_rate);
                                 http::Response::builder().status(233).header("Hysteria-UDP", "true")
@@ -865,7 +952,12 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
                 }
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => (),
-            _ = connection.closed() => break,
+            reason = connection.closed() => {
+                if config.diagnostic {
+                    eprintln!("[XRAY_NET_DIAG][XHYSTERIA] session closed role=server peer={peer} reason={reason}");
+                }
+                break;
+            },
         }
     }
     connection.close(0x100u32.into(), b"native session closed");
@@ -892,7 +984,9 @@ fn bridge_tasks(
 ) {
     match bridge {
         Bridge::Socket(bridge) => {
-            let (mut reader, mut writer) = bridge.into_split();
+            // OwnedWriteHalf shuts down the entire socket on drop, including
+            // the duplicate used to report startup errors after pump teardown.
+            let (mut reader, mut writer) = tokio::io::split(bridge);
             tasks.spawn(async move {
                 while let Some(frame) = outgoing.recv().await {
                     write_frame(&mut writer, frame).await?;
@@ -1006,15 +1100,22 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
         let startup = async {
             let connection = ep
                 .connect(config.peer.parse()?, &config.server_name)?
-                .await?;
-            let auth = client_auth(&connection, &config).await?;
+                .await
+                .map_err(|error| format!("QUIC handshake: {error}"))?;
+            let auth = client_auth(&connection, &config)
+                .await
+                .map_err(|error| format!("HTTP/3 auth: {error}"))?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>((connection, auth))
         };
         let (connection, (udp, guard, driver)) = tokio::select! {
-            ready = tokio::time::timeout(Duration::from_secs(10), startup) => ready??,
+            ready = tokio::time::timeout(Duration::from_secs(10), startup) =>
+                ready.map_err(|_| "QUIC/auth startup timed out after 10s")??,
             _ = incoming_rx.recv() => return Err("Go closed native startup".into()),
         };
         udp_enabled = udp;
+        if config.diagnostic {
+            tasks.spawn(connection_diagnostics(connection.clone(), "client"));
+        }
         http_guard = Some(guard);
         http_driver = Some(driver);
         tasks.spawn(client_udp(
@@ -1026,10 +1127,10 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
     }
     bus.send(Frame::new(READY, 0, Bytes::new())).await?;
     let mut next_session = 1u32;
-    loop {
+    let result = loop {
         tokio::select! {
             frame = incoming_rx.recv() => {
-                let Some(frame) = frame else { break };
+                let Some(frame) = frame else { break Ok(()) };
                 if frame.kind == AUTH_RESPONSE {
                     if let Some(sender) = bus.pending_auth.lock().unwrap().remove(&frame.id) {
                         let _ = sender.send(frame.data.as_ref() == [1]);
@@ -1109,12 +1210,18 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
                     });
                 }
             }
-            _ = async { if let Some(c) = &client { c.closed().await; } else { std::future::pending().await } } => break,
+            reason = async { if let Some(c) = &client { c.closed().await } else { std::future::pending().await } } => {
+                break Err(format!("QUIC connection closed: {reason}").into());
+            },
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                if !matches!(result, Ok(Ok(()))) { break; }
+                match result {
+                    Ok(Ok(())) => (),
+                    Ok(Err(error)) => break Err(error),
+                    Err(error) => break Err(error.into()),
+                }
             },
         }
-    }
+    };
     ep.close(0x100u32.into(), b"Go engine stopped");
     drop(http_guard);
     if let Some(driver) = http_driver {
@@ -1123,7 +1230,7 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    Ok(())
+    result
 }
 
 pub struct Engine {
@@ -1269,6 +1376,19 @@ pub unsafe extern "C" fn xhys_engine_start_shared(
                     }));
                 if diagnostic && !matches!(result, Ok(Ok(()))) {
                     eprintln!("[XRAY_NET_DIAG][XHYSTERIA] shared worker: {result:?}");
+                }
+                // The runtime (including the ring writer) is gone. This thread
+                // is now the sole producer, so publish the real failure before
+                // closing; Go drains published events even after close.
+                let error = match result {
+                    Ok(Err(error)) => Some(format!("native engine: {error}")),
+                    Err(_) => Some("native engine panicked".to_string()),
+                    Ok(Ok(())) => None,
+                };
+                if !bridge.closed()
+                    && let Some(error) = error
+                {
+                    let _ = bridge.push(false, ERROR, 0, error.as_bytes());
                 }
                 bridge.close();
             })?;
