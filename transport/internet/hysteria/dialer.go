@@ -410,6 +410,154 @@ type clientManager struct {
 	m map[dialerConf]*client
 }
 
+const (
+	nativeDialAttemptTimeout  = 4 * time.Second
+	nativeDialFailureCooldown = 30 * time.Second
+	nativeFallbackIdle        = 10 * time.Minute
+)
+
+type nativeFallbackKey struct {
+	instance *core.Instance
+	settings *internet.MemoryStreamConfig
+	peer     string
+}
+
+type nativeFallbackEntry struct {
+	until    time.Time
+	lastUsed time.Time
+	probing  bool
+	healthy  bool
+	changed  chan struct{}
+}
+
+type nativeDialFallback struct {
+	mu             sync.Mutex
+	entries        map[nativeFallbackKey]nativeFallbackEntry
+	cooldown       time.Duration
+	attemptTimeout time.Duration
+}
+
+var nativeFallback = nativeDialFallback{
+	entries: make(map[nativeFallbackKey]nativeFallbackEntry),
+}
+
+func (b *nativeDialFallback) open(
+	ctx context.Context,
+	key nativeFallbackKey,
+	tryNative func(context.Context) (stat.Connection, error),
+	tryGo func(context.Context) (stat.Connection, error),
+) (stat.Connection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		now := time.Now()
+		b.mu.Lock()
+		if b.entries == nil {
+			b.entries = make(map[nativeFallbackKey]nativeFallbackEntry)
+		}
+		if len(b.entries) > 512 {
+			for candidate, entry := range b.entries {
+				expired := !entry.until.IsZero() && !now.Before(entry.until)
+				idle := !entry.lastUsed.IsZero() && now.Sub(entry.lastUsed) >= nativeFallbackIdle
+				if !entry.probing && (expired || idle) {
+					delete(b.entries, candidate)
+				}
+			}
+		}
+		entry := b.entries[key]
+		entry.lastUsed = now
+		if entry.probing {
+			b.entries[key] = entry
+			changed := entry.changed
+			b.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-changed:
+				continue
+			}
+		}
+		if now.Before(entry.until) {
+			b.entries[key] = entry
+			b.mu.Unlock()
+			return tryGo(ctx)
+		}
+		var probe chan struct{}
+		if !entry.healthy {
+			entry.probing = true
+			entry.changed = make(chan struct{})
+			probe = entry.changed
+		}
+		b.entries[key] = entry
+		b.mu.Unlock()
+
+		timeout := b.attemptTimeout
+		if timeout <= 0 {
+			timeout = nativeDialAttemptTimeout
+		}
+		nativeCtx, cancel := context.WithTimeout(ctx, timeout)
+		conn, nativeErr := tryNative(nativeCtx)
+		cancel()
+		if nativeErr == nil {
+			if probe != nil {
+				b.finishProbe(key, probe, true, time.Time{})
+			}
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			if probe != nil {
+				b.finishProbe(key, probe, false, time.Time{})
+			}
+			return nil, nativeErr
+		}
+
+		cooldown := b.cooldown
+		if cooldown <= 0 {
+			cooldown = nativeDialFailureCooldown
+		}
+		if probe != nil {
+			b.finishProbe(key, probe, false, time.Now().Add(cooldown))
+		} else {
+			b.mu.Lock()
+			b.entries[key] = nativeFallbackEntry{until: time.Now().Add(cooldown), lastUsed: time.Now()}
+			b.mu.Unlock()
+		}
+
+		if os.Getenv("XRAY_NET_DIAG") == "1" {
+			fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] native dial failed; using Go backend peer=%s cooldown=%s reason=%v\n", key.peer, cooldown, nativeErr)
+		}
+		conn, goErr := tryGo(ctx)
+		if goErr != nil {
+			return nil, fmt.Errorf("native dial failed (%v); Go fallback failed: %w", nativeErr, goErr)
+		}
+		return conn, nil
+	}
+}
+
+func (b *nativeDialFallback) finishProbe(key nativeFallbackKey, probe chan struct{}, healthy bool, until time.Time) {
+	b.mu.Lock()
+	entry, ok := b.entries[key]
+	if ok && entry.probing && entry.changed == probe {
+		entry.probing = false
+		entry.healthy = healthy
+		entry.until = until
+		entry.lastUsed = time.Now()
+		entry.changed = nil
+		if !healthy && until.IsZero() {
+			delete(b.entries, key)
+		} else {
+			b.entries[key] = entry
+		}
+		close(probe)
+	}
+	b.mu.Unlock()
+}
+
 func (m *clientManager) clean() {
 	ticker := time.NewTicker(idleCleanupInterval)
 	for range ticker.C {
@@ -438,8 +586,28 @@ var (
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	if nativeRequested(streamSettings) {
-		return nativeDial(ctx, dest, streamSettings)
+		peer := dest
+		peer.Network = net.Network_UDP
+		key := nativeFallbackKey{
+			instance: core.FromContext(ctx),
+			settings: streamSettings,
+			peer:     peer.String(),
+		}
+		return nativeFallback.open(
+			ctx,
+			key,
+			func(nativeCtx context.Context) (stat.Connection, error) {
+				return nativeDial(nativeCtx, dest, streamSettings)
+			},
+			func(goCtx context.Context) (stat.Connection, error) {
+				return dialGo(goCtx, dest, streamSettings)
+			},
+		)
 	}
+	return dialGo(ctx, dest, streamSettings)
+}
+
+func dialGo(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
 	if tlsConfig == nil {
 		return nil, errors.New("tls config is nil")
