@@ -11,7 +11,9 @@ import (
 	"fmt"
 	stdnet "net"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +134,127 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 		}
 	}
 	return c, nil
+}
+
+func nativeServerLimit(name string, fallback, maximum uint32) (uint32, error) {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || parsed == 0 || parsed > uint64(maximum) {
+		return 0, fmt.Errorf("%s must be 1..%d", name, maximum)
+	}
+	return uint32(parsed), nil
+}
+
+func tuneNativeServerLimits(memoryBytes uint64, cpus int) (uint32, uint32) {
+	const (
+		minConnections = uint64(8)
+		minFlows       = uint64(16)
+		maxConnections = uint64(256)
+		maxFlows       = uint64(1024)
+		connectionMiB  = uint64(12)
+		flowMiB        = uint64(4)
+	)
+	if cpus < 1 {
+		cpus = 1
+	}
+	reserve := max(uint64(256<<20), memoryBytes*60/100)
+	if memoryBytes <= reserve {
+		return uint32(minConnections), uint32(minFlows)
+	}
+	budgetMiB := (memoryBytes - reserve) >> 20
+	connectionBudgetMiB := budgetMiB * 60 / 100
+	flowBudgetMiB := budgetMiB - connectionBudgetMiB
+	connections := min(maxConnections, min(uint64(cpus)*16, connectionBudgetMiB/connectionMiB))
+	flows := min(maxFlows, min(uint64(cpus)*32, flowBudgetMiB/flowMiB))
+	connections = max(minConnections, connections)
+	flows = max(minFlows, flows)
+	return uint32(connections), uint32(flows)
+}
+
+func nativeMemoryLimit(path string, unlimitedAbove uint64) uint64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" || value == "max" {
+		return 0
+	}
+	limit, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || limit == 0 || limit >= unlimitedAbove {
+		return 0
+	}
+	return limit
+}
+
+func nativeHostMemory() uint64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kib, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kib * 1024
+	}
+	return 0
+}
+
+func nativeCgroupMemory() uint64 {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return 0
+	}
+	const unlimited = uint64(1) << 60
+	var paths []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		group := strings.TrimLeft(filepath.Clean("/"+fields[2]), string(filepath.Separator))
+		switch {
+		case fields[0] == "0" && fields[1] == "":
+			paths = append(paths,
+				filepath.Join("/sys/fs/cgroup", group, "memory.max"),
+				"/sys/fs/cgroup/memory.max")
+		case strings.Contains(":"+fields[1]+":", ":memory:"):
+			paths = append(paths,
+				filepath.Join("/sys/fs/cgroup/memory", group, "memory.limit_in_bytes"),
+				"/sys/fs/cgroup/memory/memory.limit_in_bytes",
+				filepath.Join("/sys/fs/cgroup", group, "memory.limit_in_bytes"))
+		}
+	}
+	for _, path := range paths {
+		if limit := nativeMemoryLimit(path, unlimited); limit != 0 {
+			return limit
+		}
+	}
+	return 0
+}
+
+func nativeServerMemory() (uint64, string) {
+	host := nativeHostMemory()
+	cgroup := nativeCgroupMemory()
+	if cgroup != 0 && (host == 0 || cgroup < host) {
+		return cgroup, "cgroup"
+	}
+	if host != 0 {
+		return host, "host"
+	}
+	return 1 << 30, "fallback"
 }
 
 func nativePortHopping(hop *udphop.Config) (*native.PortHoppingConfig, error) {
@@ -273,6 +396,21 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 		return nil, fmt.Errorf("native listener requires an IP address")
 	}
 	config.Server = true
+	memoryBytes, memorySource := nativeServerMemory()
+	cpus := runtime.GOMAXPROCS(0)
+	autoConnections, autoFlows := tuneNativeServerLimits(memoryBytes, cpus)
+	config.MaxConnections, err = nativeServerLimit("XRAY_HYSTERIA_SERVER_CONNECTIONS", autoConnections, 256)
+	if err != nil {
+		return nil, err
+	}
+	config.MaxFlows, err = nativeServerLimit("XRAY_HYSTERIA_SERVER_FLOWS", autoFlows, 1024)
+	if err != nil {
+		return nil, err
+	}
+	if config.Diagnostic {
+		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] server resource limits memory_bytes=%d memory_source=%s gomaxprocs=%d max_connections=%d max_flows=%d\n",
+			memoryBytes, memorySource, cpus, config.MaxConnections, config.MaxFlows)
+	}
 	config.UDPIdleTimeout = uint64(hy.UdpIdleTimeout)
 	validator := ValidatorFromContext(ctx)
 	if validator == nil && hy.Auth == "" {

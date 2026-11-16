@@ -99,7 +99,7 @@ impl Config {
         if self.max_flows != 0 {
             self.max_flows as usize
         } else if self.server {
-            1024
+            64
         } else {
             MAX_FLOWS
         }
@@ -107,7 +107,7 @@ impl Config {
 
     fn connection_limit(&self) -> usize {
         if self.max_connections == 0 {
-            256
+            32
         } else {
             self.max_connections as usize
         }
@@ -423,11 +423,16 @@ fn quic_timers(config: &Config) -> Result<(Duration, Duration)> {
 fn transport(config: &Config) -> Result<quinn::TransportConfig> {
     let (idle, alive) = quic_timers(config)?;
     let mut t = quinn::TransportConfig::default();
+    let receive_window = if config.server {
+        8u32 * 1024 * 1024
+    } else {
+        20u32 * 1024 * 1024
+    };
     t.max_concurrent_bidi_streams(64u32.into())
         // Match Xray's Go Hysteria windows on WAN paths, while bounding memory
         // across streams instead of retaining Quinn's effectively unlimited cap.
         .stream_receive_window((8u32 * 1024 * 1024).into())
-        .receive_window((20u32 * 1024 * 1024).into())
+        .receive_window(receive_window.into())
         .max_idle_timeout(Some(idle.try_into()?))
         .keep_alive_interval(Some(alive));
     t.datagram_receive_buffer_size(Some(256 * 1024));
@@ -1527,6 +1532,16 @@ pub unsafe extern "C" fn xhys_engine_join(engine: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_server_limits_fit_small_vps() {
+        let config = Config {
+            server: true,
+            ..Config::default()
+        };
+        assert_eq!(config.connection_limit(), 32);
+        assert_eq!(config.flow_limit(), 64);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_control_queue_still_delivers_event_space_notifications() {

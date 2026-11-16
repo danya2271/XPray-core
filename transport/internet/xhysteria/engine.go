@@ -281,7 +281,12 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 		if arenaBytes != 0 {
 			mode = "shared"
 		}
-		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] engine started bridge=%s arena_bytes=%d role=%s peer=%s\n", mode, arenaBytes, e.role, e.peer)
+		maxConnections := int(config.MaxConnections)
+		if config.Server && maxConnections == 0 {
+			maxConnections = 32
+		}
+		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] engine started bridge=%s arena_bytes=%d role=%s peer=%s max_flows=%d max_connections=%d\n",
+			mode, arenaBytes, e.role, e.peer, maxFlows, maxConnections)
 	}
 	e.wg.Add(2)
 	go e.readLoop()

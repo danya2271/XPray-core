@@ -3,6 +3,7 @@
 package hysteria
 
 import (
+	"os"
 	"testing"
 
 	"github.com/xtls/xray-core/transport/internet"
@@ -11,6 +12,78 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+func TestNativeServerResourceLimits(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		value     string
+		fallback  uint32
+		maximum   uint32
+		want      uint32
+		wantError bool
+	}{
+		{"default", "", 32, 256, 32, false},
+		{"override", "48", 32, 256, 48, false},
+		{"zero", "0", 32, 256, 0, true},
+		{"over_limit", "257", 32, 256, 0, true},
+		{"invalid", "many", 32, 256, 0, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("XRAY_HYSTERIA_SERVER_CONNECTIONS", test.value)
+			got, err := nativeServerLimit("XRAY_HYSTERIA_SERVER_CONNECTIONS", test.fallback, test.maximum)
+			if (err != nil) != test.wantError || got != test.want {
+				t.Fatalf("limit=%d error=%v, want=%d error=%t", got, err, test.want, test.wantError)
+			}
+		})
+	}
+}
+
+func TestTuneNativeServerLimits(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		memoryBytes uint64
+		cpus        int
+		connections uint32
+		flows       uint32
+	}{
+		{"one_gib_one_cpu", 1 << 30, 1, 16, 32},
+		{"one_gib_two_cpus", 1 << 30, 2, 20, 41},
+		{"512_mib_two_cpus", 512 << 20, 2, 10, 20},
+		{"large_host_eight_cpus", 8 << 30, 8, 128, 256},
+		{"very_small_host", 128 << 20, 4, 8, 16},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			connections, flows := tuneNativeServerLimits(test.memoryBytes, test.cpus)
+			if connections != test.connections || flows != test.flows {
+				t.Fatalf("got connections=%d flows=%d, want %d and %d",
+					connections, flows, test.connections, test.flows)
+			}
+		})
+	}
+}
+
+func TestNativeMemoryLimitParsing(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		data string
+		want uint64
+	}{
+		{"bytes", "1073741824\n", 1 << 30},
+		{"unlimited", "max\n", 0},
+		{"v1_unlimited", "1152921504606846976\n", 0},
+		{"invalid", "invalid\n", 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir() + "/memory.limit"
+			if err := os.WriteFile(path, []byte(test.data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if got := nativeMemoryLimit(path, 1<<60); got != test.want {
+				t.Fatalf("got %d, want %d", got, test.want)
+			}
+		})
+	}
+}
 
 func TestNativeQuicTimers(t *testing.T) {
 	for _, test := range []struct {

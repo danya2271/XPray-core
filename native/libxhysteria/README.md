@@ -212,7 +212,17 @@ also covers an advertised RX limit when the local controller is BBR or Reno.
 | `XRAY_HYSTERIA_BRIDGE` | shared on amd64/arm64 | `socket` restores socket IPC |
 | `XRAY_HYSTERIA_POOL_SIZE` | `2` | `1..8` sessions per outbound; `0` restores per-flow engines |
 | `XRAY_HYSTERIA_SERVER_WORKERS` | `0` | `0`: automatic (up to four); `1..16`: explicit server runtime threads |
+| `XRAY_HYSTERIA_SERVER_CONNECTIONS` | auto | Override native server QUIC connection cap (`1..256`) |
+| `XRAY_HYSTERIA_SERVER_FLOWS` | auto | Override native server TCP/UDP flow cap (`1..1024`) |
 | `XRAY_NET_DIAG` | unset | `1` logs roles, peers, authentication, QUIC counters, buffers and failure reasons |
+
+Server limits use the lower of host RAM and the process cgroup memory limit,
+plus `GOMAXPROCS`. The estimate reserves at least 60% of detected RAM (and at
+least 256 MiB), then budgets about 12 MiB per QUIC connection and 4 MiB per
+active flow. Unknown memory data uses a conservative 8-connection/16-flow
+profile. Set either server environment variable to override that limit
+independently. Startup diagnostics report the memory source and selected
+limits.
 
 With diagnostics enabled, `engine started ... role=server` confirms listener
 startup; `authenticated role=server` confirms successful client authentication.
@@ -280,8 +290,8 @@ to one datagram so batching cannot bypass its pacer. See
 
 The server uses one native engine per inbound listener, with up to four Rust
 runtime worker threads (limited by available parallelism); clients retain one.
-Defaults allow 256 concurrent server connections and 1024 active TCP/UDP flows
-per listener, with bounded queues and backpressure. The Go client engine limit
+Server connection and flow caps are selected from host/cgroup memory and CPU,
+up to 256 connections and 1024 active TCP/UDP flows per listener. The Go client engine limit
 remains 128; the outbound pool
 reserves at most 64 per session. Per-flow credits bound
 queued TCP data and apply backpressure; unread UDP datagrams are dropped when
