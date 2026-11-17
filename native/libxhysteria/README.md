@@ -50,11 +50,15 @@ The app sets `disableChromeParrot=true` and `XRAY_HYSTERIA_NATIVE=1` together,
 deriving the process environment from its saved configuration even on a fast
 restart. Profile QUIC idle/keepalive timers are passed to Rust. Remote port hopping
 (`udphop` with `mode: "intervalRemote"`) runs in Rust, with or without Salamander.
-Local port/IP hopping, unsupported masks, and proxy chains still select Go for
-the entire Xray process; their settings are preserved, not silently dropped.
+The core also supports remote IP-prefix hopping and `perConnRemote` initial
+selection. The current bypclient compatibility gate still selects Go for these
+new modes until its separate profile validator is updated.
+The core supports local socket hopping and additional UDP masks through the
+packet adapter below. The current bypclient compatibility gate still selects Go
+for these profiles; proxy chains and unsupported settings also retain Go.
 The VPN log identifies the selected backend and compatibility fallback reason.
 
-### Remote port hopping
+### Remote address hopping
 
 Keep the existing `finalmask.udp` configuration, for example:
 
@@ -72,14 +76,166 @@ listener, as it does for the Go backend. This is not a multi-port native server.
 The native client uses the same Go-created/protected UDP socket for every hop;
 it does not create unprotected replacement sockets. QUIC keeps one logical peer
 while the socket adapter changes the wire destination and accepts delayed
-replies from earlier configured ports. The initial port is also selected from
+replies from earlier configured IP prefixes and ports. The initial port is selected from
 the range, and successive choices differ when at least two distinct ports exist.
 Intervals may be a fixed value or Xray's min/max range, with a minimum of five
 seconds. Idle sockets choose their next port when they next send traffic.
 
-The app logs `Hysteria backend: native (Rust), UDP port hopping`. Debug builds
-also log the selected remote address when hopping. Client-side cascades and
-`intervalLocal`, `perConnRemote`, or `remoteIPs` configurations still use Go.
+`remoteIPs` accepts IPv4 or IPv6 CIDRs and selects a random host within each
+prefix. With no `remotePorts`, the original port is preserved; with no
+`remoteIPs`, the original IP is preserved. The actual UDP socket must support
+the configured address family. IPv4-mapped prefixes are normalized to IPv4.
+The configured IP addresses/port range must route to the same server; native
+does not create listeners or forwarding rules for them.
+
+`mode: "perConnRemote"` selects an IP/port once for each native QUIC session,
+not for every proxied TCP/UDP flow. It never changes the destination afterward,
+and its send path does not acquire the hopping mutex. When both internal
+`Remote` and `RemoteOnce` flags are set, `Remote` retains interval hopping,
+matching Go. `intervalLocal` uses the hybrid packet adapter described below.
+Chained/custom socket dialers still require Go.
+
+The app logs `Hysteria backend: native (Rust), UDP port hopping`. With
+`XRAY_NET_DIAG=1`, the core also logs each selected remote address.
+
+### UDP mask compatibility adapter
+
+Plain UDP, a single Salamander mask, and supported remote hopping retain direct
+Rust socket I/O. Additional masks use the existing Go `FinalMask` PacketConn chain
+with Rust QUIC/HTTP/3/authentication. This is hybrid support, not a Rust rewrite of
+the masks and not fallback to quic-go.
+
+Mixed Go/native client/server tests cover all six MKCP appearance headers
+(DNS, DTLS, SRTP, UTP, WeChat, WireGuard), MKCP original/AES-GCM, Sudoku,
+custom UDP prefixes (including saved/returned state), standalone custom UDP,
+noise packets, Lua noise scripts, and stacked Salamander masks. Existing mask
+ordering, evaluation, delays and wire formats are preserved. Masks needing
+privileged sockets or external services are not established by these tests.
+
+Client-only local socket hopping uses the existing Go socket dialer for each
+replacement, preserving socket-controller/Android protection hooks. Tests cover
+local-only, local+remote IP/port, and local+remoteOnce profiles with header and
+Salamander masks, against Go and native servers on both bridges. TCP and fragmented
+UDP flows survive a source-port change without creating a replacement QUIC engine.
+Android VPN handover has not been tested on a device.
+
+Packet transfer uses a separate Unix datagram socketpair, two reusable 64 KiB Go
+buffers and 64 KiB requested IPC socket buffers. Rust uses `sendmsg`/`recvmsg`
+directly on Quinn's payload buffers with a stack metadata header; removing its
+two scratch buffers saves approximately 128 KiB per packet-backed engine.
+A bounded 32-entry peer cache eliminates address allocations on cache hits.
+There is no CGO call per QUIC packet or unbounded user-space packet queue.
+
+Rust can submit up to eight datagrams for one peer in an IPC message without a
+batching delay. Go splits them before applying masks, preserving datagram
+boundaries and Salamander salts. This is IPC batching, **not network UDP GSO**.
+`disableGSO=true` disables the IPC batching too; Brutal still paces individual
+sends. The 24-byte address header retains v1 for individual packets and uses
+v2 for outgoing IPC batches. Go and Rust must be rebuilt together; the engine
+FFI/shared-memory ABI has not changed. PMTUD remains disabled on this path and
+QUIC MTU stays at 1200 before masking. Masks can expand the outer UDP payload
+beyond the path MTU; neither batching nor the fixed MTU prevents fragmentation.
+
+The base network socket now gets the same requested buffers as direct Rust I/O:
+server receive/send 4 MiB/1 MiB, client receive/send 1 MiB/256 KiB. Setup runs
+before wrapping masks and on every replacement/local-hopping dial through the
+FinalMask callbacks. Linux doubles and caps these requests; actual values are
+logged with `XRAY_NET_DIAG=1`. No sysctls are changed. Queue memory is allocated
+as needed, is separate from Go allocations/RSS, and is not a whole-node memory
+cap. Masks that create private sockets outside those callbacks are not covered.
+
+Startup diagnostics distinguish `network_gso=false` from `ipc_batch=true`.
+Ten-second send-drop diagnostics distinguish reported `EMSGSIZE` from
+`ENOBUFS`/`ENOMEM` and suppressed/short mask writes. An independent
+`event=udp_bridge` counter reports drops due to exhausted Rust→Go flow credits
+at engine level, not per connection. Silent fragmentation/path drops are not
+captured by the send-error counter. The current adapter benchmarks and their
+idle-latency regression versus Go are recorded in [PERFORMANCE.md](PERFORMANCE.md);
+loss sampling and attribution are in [PACKET_LOSS.md](PACKET_LOSS.md).
+
+UDP receive credits flush immediately when the Go per-flow queue drains rather
+than waiting for a later datagram to complete a credit batch. Queued UDP bursts
+still batch credits, TCP credits are unchanged, and no queue is enlarged. This
+fixes a confirmed application-level drop source under saturated local load;
+unread UDP flows still drop rather than block unrelated sessions.
+
+Transient UDP send errors and suppressed/short mask writes count as send drops;
+closed sockets and permanent mask errors stop the engine. Startup failure and
+concurrent close release the PacketConn, Unix descriptors and relay goroutines.
+Wildcard dual-stack sockets normalize received IPv4 peers to Quinn's mapped IPv6
+form and do not invent destination-IP metadata. Scoped IPv6/zone addresses are
+rejected explicitly by this packet adapter.
+
+Focused compatibility checks (rebuild the release archive first):
+
+```sh
+native_hash=$(sha256sum native/libxhysteria/target/release/libxhysteria.a)
+CGO_ENABLED=1 go test -race -tags 'xhysteria_native xhysteria_interop' \
+  -ldflags="-buildid=xhysteria-${native_hash%% *}" ./native/libxhysteria/interop \
+  -run '^TestNativePacket(Masks|LocalHopping)$' -count=1 -timeout=150s
+```
+
+### HTTP masquerading
+
+Native listeners support the existing `404`, `string`, `file`, and `proxy`
+masquerade types.
+The default 404 now returns the same text, content type, and `nosniff` header as
+Go's `http.NotFoundHandler`. String masquerading forwards `masqString`,
+`masqStringStatusCode`, and `masqStringHeaders`, including HEAD semantics,
+bodyless 204/304 responses, and an HTTP Date header. Valid Hysteria authentication
+still receives status 233; other HTTP/3 requests and invalid authentication
+receive the configured cover response.
+
+The response body is prepared once per engine and shared across requests and
+connections with reference-counted bytes, rather than copied per request.
+Active HTTP request tasks are bounded, retaining the ten-second request and
+unauthenticated-session timeouts. Headers are validated before startup;
+connection-specific HTTP/1 headers and trailer configurations are rejected,
+as are mismatched Content-Length values and provisional 1xx status codes.
+The default string status is 200; supported final codes are 200..999.
+File/proxy requests keep QUIC, HTTP/3, and authentication in Rust while invoking
+Go's existing `http.FileServer` and `httputil.ReverseProxy` through the bounded
+flow bridge. This is hybrid cover-handler support, not a Go QUIC fallback.
+Request/response bodies stream in 16 KiB chunks with a four-frame directional
+window, sharing native flow admission and process send budgets. Large files and
+uploads are not stored in startup JSON or buffered in full. The reverse proxy
+also uses its existing pooled 32 KiB copy buffer. Those bounds do not represent
+a hard cap on total Go/Rust/TLS/kernel memory per request.
+
+File serving preserves HEAD, Range, conditional requests, redirects, directory
+indexes, and missing-file responses. Proxying preserves path/query, host rewrite,
+X-Forwarded settings, repeated headers, request/response trailers, informational
+responses, HTTP/HTTPS upstreams, and Unix sockets. Upstream HTTPS verification
+remains enabled unless `masqUrlInsecure` explicitly disables it. Each native
+listener owns its upstream transport and closes idle connections on shutdown.
+Successful Hysteria authentication bypasses the cover handler and returns 233.
+
+HTTP/3 request field sections and native proxy upstream response headers are
+limited to 32 KiB; serialized bridge metadata is limited to 69,632 bytes.
+Connection-specific HTTP/1 headers never cross the HTTP/3 response bridge.
+Invalid, conflicting, overflowing, or body-mismatched Content-Length values
+are rejected before they can complete a malformed proxied stream.
+The existing ten-second request/unauthenticated-connection timeouts remain.
+Client cancellation stops the upstream request even after the upload completes;
+early responses do not wait for an unread upload. The fixed Go quic-go baseline
+replaces its trailer map at EOF, losing request trailers in ReverseProxy; native
+updates the announced map in place and preserves them.
+
+HTTP protocol upgrades/WebSocket tunneling, TCP finalmasks, custom/chained packet
+dialers, Chrome Parrot, and advanced TLS/ECH settings remain unsupported.
+The existing native setup limit remains 1 MiB of serialized JSON, including
+the string body and TLS configuration; use streaming file/proxy masquerading
+for larger cover pages instead of increasing the startup allocation.
+
+Focused mixed-backend tests (rebuild the native archive first):
+
+```sh
+native_hash=$(sha256sum native/libxhysteria/target/release/libxhysteria.a)
+CGO_ENABLED=1 go test -tags 'xhysteria_native xhysteria_interop' \
+  -ldflags="-buildid=xhysteria-${native_hash%% *}" \
+  ./transport/internet/hysteria ./native/libxhysteria/interop \
+  -run 'TestNative(RemotePortHopping|StringMasquerade)$|TestEmbeddedNative(PortHopping|RemoteAddressHopping|HTTPMasquerade)$|TestEmbeddedHTTP(FileMasquerade|ProxyMasquerade|ProxyLifecycle)$' -count=1
+```
 
 ## Enable the prototype
 
@@ -128,6 +284,11 @@ with an empty user list is supported. Direct C ABI consumers can still select
 the bounded static-user mode.
 
 ## Verify
+
+For separating QUIC declared loss, local DATAGRAM queue evictions, and kernel
+UDP drops, see [packet-loss diagnostics](PACKET_LOSS.md). The read-only sampler
+works with an already running Xray; per-connection QUIC logging additionally
+requires starting a diagnostic build with `XRAY_NET_DIAG=1`.
 
 ```sh
 bash native/libxhysteria/test-linux.sh
@@ -449,8 +610,11 @@ then Rust duplicates the descriptor and owns packet I/O. This preserves socket
 controllers during setup, including Android protection where the embedding app
 provides it; network handover and replacement sockets still need validation.
 
-Salamander and client-only remote port hopping are supported as UDP masks, and
-only 404 HTTP masquerading is implemented. Unsupported masks, advanced TLS
+Salamander, client-only remote IP/port hopping, and once-per-session remote
+selection have direct Rust support; additional UDP masks and local socket hopping
+use the bounded hybrid adapter above. HTTP masquerading supports 404/string
+directly in Rust and streaming file/proxy through bounded Go cover handlers.
+Unsupported mask/socket combinations, advanced TLS
 options, verification-CA reload, and custom QUIC windows/stream limits are
 rejected explicitly. Server UDP idle timeout accepts the configured value
 (default 60 seconds). The native engine uses rustls/ring certificate

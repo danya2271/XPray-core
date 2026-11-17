@@ -5,7 +5,9 @@ package xhysteria
 import (
 	"bytes"
 	"errors"
+	"net"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,6 +103,53 @@ func TestReceiveCreditsAreBatchedWithoutDelayingPayload(t *testing.T) {
 	}
 }
 
+func TestSparseUDPCreditsReturnImmediatelyAndBurstsStayBatched(t *testing.T) {
+	for _, role := range []string{"client", "server"} {
+		t.Run(role, func(t *testing.T) {
+			engine := &Engine{role: role, done: make(chan struct{}), out: make(chan frame, 16)}
+			connection := newConn(engine, 1, xnet.Destination{Network: xnet.Network_UDP}, nil)
+			read := func() {
+				queued, err := connection.nextFrame()
+				if err != nil {
+					t.Fatal(err)
+				}
+				queued.release()
+			}
+			for range 3 {
+				connection.in <- frame{kind: datagramFrame, id: connection.id, data: []byte("sparse")}
+				read()
+				select {
+				case credit := <-engine.out:
+					if credit.kind != creditFrame || len(credit.data) != 1 || credit.data[0] != 1 {
+						t.Fatalf("sparse UDP credit was delayed: %+v", credit)
+					}
+				default:
+					t.Fatal("sparse UDP credit waits for another datagram")
+				}
+			}
+			window := cap(connection.writeCredit)
+			for range window - 1 {
+				connection.in <- frame{kind: datagramFrame, id: connection.id, data: []byte("burst")}
+			}
+			for range window - 1 {
+				read()
+			}
+			if len(engine.out) != 2 {
+				t.Fatalf("UDP burst did not batch credits: %d", len(engine.out))
+			}
+			for _, count := range []int{window / 2, window/2 - 1} {
+				credit := <-engine.out
+				if credit.kind != creditFrame || len(credit.data) != 1 || int(credit.data[0]) != count {
+					t.Fatalf("incorrect UDP burst credit count: %+v", credit)
+				}
+			}
+			if connection.readCredits != 0 {
+				t.Fatal("last UDP burst retained unused credits")
+			}
+		})
+	}
+}
+
 func TestQueuedPayloadSurvivesEngineShutdownAtCreditBoundary(t *testing.T) {
 	e := &Engine{done: make(chan struct{}), out: make(chan frame, 16)}
 	c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
@@ -154,6 +203,96 @@ func TestChangingDeadlineInterruptsBlockedNativeReadAndWrite(t *testing.T) {
 				}
 			case <-time.After(time.Second):
 				t.Fatal("deadline update did not wake the blocked operation")
+			}
+		})
+	}
+}
+
+func TestAvailableWriteCreditHonorsDeadlineAndShutdown(t *testing.T) {
+	for _, state := range []string{"expired", "engine_closed", "flow_closed"} {
+		t.Run(state, func(t *testing.T) {
+			e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+			c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+			want := error(net.ErrClosed)
+			switch state {
+			case "expired":
+				c.SetWriteDeadline(time.Now().Add(-time.Second))
+				want = os.ErrDeadlineExceeded
+			case "engine_closed":
+				close(e.done)
+			case "flow_closed":
+				c.fail(net.ErrClosed)
+			}
+			if err := c.awaitWriteCredit(); !errors.Is(err, want) {
+				t.Fatalf("got %v, want %v", err, want)
+			}
+			if len(c.writeCredit) != cap(c.writeCredit) {
+				t.Fatal("failed operation consumed an available write credit")
+			}
+		})
+	}
+}
+
+func TestAvailableWriteCreditDoesNotAllocateDeadlineTimer(t *testing.T) {
+	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+	c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	c.SetWriteDeadline(time.Now().Add(time.Minute))
+	allocations := testing.AllocsPerRun(100, func() {
+		if err := c.awaitWriteCredit(); err != nil {
+			t.Fatal(err)
+		}
+		c.writeCredit <- struct{}{}
+	})
+	if allocations != 0 {
+		t.Fatalf("available write credit allocated %.1f times", allocations)
+	}
+}
+
+func TestDirectSharedWriteDoesNotAllocateDeadlineTimer(t *testing.T) {
+	bridge := testSharedBridge(t)
+	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1), bridge: bridge}
+	c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	c.SetWriteDeadline(time.Now().Add(time.Minute))
+	payload := frame{kind: dataFrame, id: c.id, data: []byte("direct")}
+	allocations := testing.AllocsPerRun(100, func() {
+		if err := c.sendFrame(payload); err != nil {
+			t.Fatal(err)
+		}
+		atomic.StoreUint32(bridge.word(128), atomic.LoadUint32(bridge.word(64)))
+	})
+	if allocations != 0 {
+		t.Fatalf("direct shared write allocated %.1f times", allocations)
+	}
+	if e.queued.Load() != 0 || len(e.out) != 0 {
+		t.Fatal("direct publication queued a frame")
+	}
+	c.SetWriteDeadline(time.Now().Add(-time.Second))
+	if err := c.sendFrame(payload); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("got %v, want deadline exceeded", err)
+	}
+	if atomic.LoadUint32(bridge.word(128)) != atomic.LoadUint32(bridge.word(64)) {
+		t.Fatal("expired write published a frame")
+	}
+}
+
+func BenchmarkAvailableWriteCredit(b *testing.B) {
+	for _, deadline := range []bool{false, true} {
+		name := "no_deadline"
+		if deadline {
+			name = "future_deadline"
+		}
+		b.Run(name, func(b *testing.B) {
+			engine := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+			conn := newConn(engine, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+			if deadline {
+				conn.SetWriteDeadline(time.Now().Add(time.Minute))
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := conn.awaitWriteCredit(); err != nil {
+					b.Fatal(err)
+				}
+				conn.writeCredit <- struct{}{}
 			}
 		})
 	}

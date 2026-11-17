@@ -268,8 +268,16 @@ func (c *client) dial(ctx context.Context) error {
 }
 
 func reportConnectionStats(conn *quic.Conn, dest net.Destination, aliveTCP *atomic.Int64, udpSM *udpSessionManager) {
+	var previousSent, previousLost uint64
+	sampled := time.Now()
 	logStats := func() {
 		stats := conn.ConnectionStats()
+		sent := stats.PacketsSent - previousSent
+		lost := stats.PacketsLost - previousLost
+		windowPercent := "n/a"
+		if sent > 0 {
+			windowPercent = fmt.Sprintf("%.3f", 100*float64(lost)/float64(sent))
+		}
 		udpSessions := 0
 		if udpSM != nil {
 			udpSM.RLock()
@@ -277,7 +285,7 @@ func reportConnectionStats(conn *quic.Conn, dest net.Destination, aliveTCP *atom
 			udpSM.RUnlock()
 		}
 		fmt.Printf(
-			"[XRAY_NET_DIAG][HYSTERIA] peer=%s rtt_ms=%d/%d/%d tx_bytes=%d tx_packets=%d rx_bytes=%d rx_packets=%d lost_packets=%d tcp=%d udp=%d\n",
+			"[XRAY_NET_DIAG][HYSTERIA] peer=%s rtt_ms=%d/%d/%d tx_bytes=%d tx_packets=%d rx_bytes=%d rx_packets=%d lost_packets=%d tcp=%d udp=%d loss_total_pct=%.3f sample_ms=%d sent_delta=%d lost_delta=%d loss_window_pct=%s\n",
 			dest,
 			stats.LatestRTT.Milliseconds(),
 			stats.SmoothedRTT.Milliseconds(),
@@ -289,7 +297,14 @@ func reportConnectionStats(conn *quic.Conn, dest net.Destination, aliveTCP *atom
 			stats.PacketsLost,
 			aliveTCP.Load(),
 			udpSessions,
+			100*float64(stats.PacketsLost)/float64(max(1, stats.PacketsSent)),
+			time.Since(sampled).Milliseconds(),
+			sent,
+			lost,
+			windowPercent,
 		)
+		previousSent, previousLost = stats.PacketsSent, stats.PacketsLost
+		sampled = time.Now()
 	}
 
 	ticker := time.NewTicker(10 * time.Second)
@@ -298,6 +313,7 @@ func reportConnectionStats(conn *quic.Conn, dest net.Destination, aliveTCP *atom
 	for {
 		select {
 		case <-conn.Context().Done():
+			logStats()
 			return
 		case <-ticker.C:
 			logStats()

@@ -10,6 +10,9 @@ import (
 	"encoding/pem"
 	"fmt"
 	stdnet "net"
+	"net/http"
+	"net/http/httputil"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,6 +30,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	native "github.com/xtls/xray-core/transport/internet/xhysteria"
+	"golang.org/x/net/http/httpguts"
 )
 
 func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) {
@@ -118,16 +122,27 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 			return c, fmt.Errorf("native Hysteria does not support TCP finalmasks")
 		}
 		masks := settings.FinalMask.UDPMasks()
+		direct := true
 		for index, mask := range masks {
 			switch s := mask.(type) {
 			case *salamander.Config:
-				if c.Salamander != "" || len(s.Password) < 4 {
-					return c, fmt.Errorf("native Salamander requires one mask with a password of at least four bytes")
+				if len(s.Password) < 4 {
+					return c, fmt.Errorf("native Salamander requires a password of at least four bytes")
+				}
+				if c.Salamander != "" {
+					direct = false
 				}
 				c.Salamander = s.Password
 			case *udphop.Config:
 				if index != 0 || c.PortHopping != nil {
 					return c, fmt.Errorf("native UDP hopping must be the outermost network mask")
+				}
+				if s.Local {
+					direct = false
+					if _, err := nativeHoppingConfig(s, true); err != nil {
+						return c, err
+					}
+					continue
 				}
 				var err error
 				c.PortHopping, err = nativePortHopping(s)
@@ -135,8 +150,13 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 					return c, err
 				}
 			default:
-				return c, fmt.Errorf("unsupported native UDP mask %T", mask)
+				direct = false
 			}
+		}
+		if !direct {
+			c.PacketBridge = true
+			c.Salamander = ""
+			c.PortHopping = nil
 		}
 	}
 	return c, nil
@@ -269,20 +289,38 @@ func nativeServerMemory() (uint64, string) {
 }
 
 func nativePortHopping(hop *udphop.Config) (*native.PortHoppingConfig, error) {
+	return nativeHoppingConfig(hop, false)
+}
+
+func nativeHoppingConfig(hop *udphop.Config, allowLocal bool) (*native.PortHoppingConfig, error) {
 	const maxTimerSeconds = int64((1<<63 - 1) / time.Second)
-	if hop.Local || !hop.Remote || hop.RemoteOnce || len(hop.RemoteIPs) != 0 {
-		return nil, fmt.Errorf("native UDP hopping supports intervalRemote ports only, without local/IP hopping")
+	if (!allowLocal && hop.Local) || (!hop.Local && !hop.Remote && !hop.RemoteOnce) {
+		return nil, fmt.Errorf("native UDP hopping requires remote hopping without local socket replacement")
 	}
 	if hop.IntervalMin < 5 || hop.IntervalMax < hop.IntervalMin || hop.IntervalMax > maxTimerSeconds {
 		return nil, fmt.Errorf("native UDP hopping requires ordered intervals of at least five seconds")
 	}
-	if len(hop.RemotePorts) == 0 || len(hop.RemotePorts) > 65535 {
-		return nil, fmt.Errorf("native UDP hopping requires 1..65535 remote ports")
+	if (!hop.Local && len(hop.RemotePorts) == 0 && len(hop.RemoteIPs) == 0) || len(hop.RemotePorts) > 65535 || len(hop.RemoteIPs) > 65535 {
+		return nil, fmt.Errorf("native UDP hopping requires remote ports or IP prefixes, with at most 65535 of each")
 	}
 	c := &native.PortHoppingConfig{
 		IntervalMin: uint64(hop.IntervalMin),
 		IntervalMax: uint64(hop.IntervalMax),
 		Ports:       make([]uint16, len(hop.RemotePorts)),
+		Once:        !hop.Remote,
+	}
+	for _, address := range hop.RemoteIPs {
+		prefix, err := netip.ParsePrefix(address)
+		if err != nil {
+			return nil, fmt.Errorf("invalid native UDP hopping IP prefix %q: %w", address, err)
+		}
+		if prefix.Addr().Is4In6() {
+			if prefix.Bits() < 96 {
+				return nil, fmt.Errorf("native UDP hopping mapped IPv4 prefixes require at least 96 bits")
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		c.IPs = append(c.IPs, prefix.Masked().String())
 	}
 	for i, port := range hop.RemotePorts {
 		if port == 0 || port > 65535 {
@@ -299,6 +337,48 @@ func nativePacketFile(packet stdnet.PacketConn) (*os.File, error) {
 		return nil, fmt.Errorf("native Hysteria requires an OS UDP socket; proxy/custom packet dialers are unsupported")
 	}
 	return socket.File()
+}
+
+func nativeMasquerade(hy *Config) (*native.MasqueradeConfig, error) {
+	switch strings.ToLower(hy.MasqType) {
+	case "", "404":
+		return nil, nil
+	case "string":
+	default:
+		return nil, fmt.Errorf("native Hysteria supports 404 and string HTTP masquerading only")
+	}
+	status := hy.MasqStringStatusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if status < 200 || status > 999 {
+		return nil, fmt.Errorf("native string masquerading requires a final HTTP status from 200 to 999")
+	}
+	headers := make(map[string]string, len(hy.MasqStringHeaders)+1)
+	for name, value := range hy.MasqStringHeaders {
+		if !httpguts.ValidHeaderFieldName(name) || !httpguts.ValidHeaderFieldValue(value) {
+			return nil, fmt.Errorf("invalid native string masquerade header %q", name)
+		}
+		name = strings.ToLower(name)
+		switch name {
+		case "connection", "proxy-connection", "keep-alive", "transfer-encoding", "upgrade", "te", "trailer":
+			return nil, fmt.Errorf("native string masquerade header %q is unsupported in HTTP/3", name)
+		}
+		if _, exists := headers[name]; exists {
+			return nil, fmt.Errorf("duplicate native string masquerade header %q", name)
+		}
+		if name == "content-length" {
+			length, err := strconv.ParseUint(value, 10, 63)
+			if err != nil || length != uint64(len(hy.MasqString)) {
+				return nil, fmt.Errorf("native string masquerade Content-Length must match the body length")
+			}
+		}
+		headers[name] = value
+	}
+	if _, exists := headers["content-type"]; !exists && headers["content-encoding"] == "" && hy.MasqString != "" && status != http.StatusNoContent && status != http.StatusNotModified {
+		headers["content-type"] = http.DetectContentType([]byte(hy.MasqString[:min(512, len(hy.MasqString))]))
+	}
+	return &native.MasqueradeConfig{Status: uint16(status), Headers: headers, Body: hy.MasqString}, nil
 }
 
 func nativeDial(ctx context.Context, dest net.Destination, settings *internet.MemoryStreamConfig) (connection stat.Connection, resultErr error) {
@@ -324,22 +404,42 @@ func nativeDial(ctx context.Context, dest net.Destination, settings *internet.Me
 	}
 	dest.Network = net.Network_UDP
 	create := func(ctx context.Context) (*native.Engine, error) {
-		raw, err := internet.DialSystem(ctx, dest, settings.SocketSettings)
+		var raw net.Conn
+		var err error
+		if config.PacketBridge && settings.FinalMask != nil {
+			masks := settings.FinalMask.WithPacketConnSetup(func(packet stdnet.PacketConn) { native.TunePacketSocket(packet, false, config.Diagnostic) })
+			raw, err = masks.DialUDP(ctx, dest)
+		} else {
+			raw, err = internet.DialSystem(ctx, dest, settings.SocketSettings)
+		}
 		if err != nil {
 			return nil, err
 		}
-		defer raw.Close()
 		wrapped, ok := raw.(*net.PacketConnWrapper)
 		if !ok {
+			raw.Close()
 			return nil, fmt.Errorf("native Hysteria cannot use a chained/custom outbound")
 		}
+		current := config
+		current.Peer = raw.RemoteAddr().String()
+		if current.PacketBridge {
+			current.Peer = dest.NetAddr()
+			if peer, ok := raw.RemoteAddr().(*stdnet.UDPAddr); ok && peer != nil && peer.Port > 0 && peer.IP != nil && !peer.IP.IsUnspecified() {
+				current.Peer = peer.String()
+			}
+			if peer, err := stdnet.ResolveUDPAddr("udp", current.Peer); err == nil && peer.IP != nil {
+				current.Peer = peer.String()
+				return native.StartPacketConn(ctx, current, wrapped.PacketConn, raw.LocalAddr(), peer, nil)
+			}
+			raw.Close()
+			return nil, fmt.Errorf("native masked Hysteria requires a resolved peer address")
+		}
+		defer raw.Close()
 		file, err := nativePacketFile(wrapped.PacketConn)
 		if err != nil {
 			return nil, err
 		}
 		defer file.Close()
-		current := config
-		current.Peer = raw.RemoteAddr().String()
 		return native.Start(ctx, current, file, raw.LocalAddr(), raw.RemoteAddr(), nil)
 	}
 	limit, err := nativePoolLimit(config)
@@ -369,14 +469,18 @@ func nativeDial(ctx context.Context, dest net.Destination, settings *internet.Me
 }
 
 type nativeListener struct {
-	engine *native.Engine
-	addr   stdnet.Addr
-	wg     sync.WaitGroup
+	engine              *native.Engine
+	addr                stdnet.Addr
+	wg                  sync.WaitGroup
+	masqueradeTransport *http.Transport
 }
 
 func (l *nativeListener) Close() error {
 	err := l.engine.Close()
 	l.wg.Wait()
+	if l.masqueradeTransport != nil {
+		l.masqueradeTransport.CloseIdleConnections()
+	}
 	return err
 }
 func (l *nativeListener) Addr() stdnet.Addr { return l.addr }
@@ -397,8 +501,22 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 		return nil, fmt.Errorf("native UDP hopping is client-only")
 	}
 	hy := settings.ProtocolSettings.(*Config)
-	if hy.MasqType != "" && hy.MasqType != "404" {
-		return nil, fmt.Errorf("native prototype supports 404 masquerading only")
+	if kind := strings.ToLower(hy.MasqType); kind == "file" || kind == "proxy" {
+		config.ExternalMasquerade = true
+		config.MasqueradeHandler, err = newMasqueradeHandler(hy)
+	} else {
+		config.Masquerade, err = nativeMasquerade(hy)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var masqueradeTransport *http.Transport
+	if proxy, ok := config.MasqueradeHandler.(*httputil.ReverseProxy); ok {
+		masqueradeTransport = proxy.Transport.(*http.Transport).Clone()
+		masqueradeTransport.MaxResponseHeaderBytes = 32 << 10
+		masqueradeTransport.MaxIdleConns = masqueradeProxyMaxIdleConnections
+		masqueradeTransport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
+		proxy.Transport = masqueradeTransport
 	}
 	if hy.UdpIdleTimeout < 0 || hy.UdpIdleTimeout > 600 {
 		return nil, fmt.Errorf("native UDP idle timeout must be 0..600 seconds")
@@ -440,9 +558,23 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 		}
 		return nil, hy.Auth != "" && subtle.ConstantTimeCompare([]byte(auth), []byte(hy.Auth)) == 1
 	}
-	raw, err := internet.ListenSystemPacket(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, settings.SocketSettings)
+	var raw net.PacketConn
+	if config.PacketBridge && settings.FinalMask != nil {
+		masks := settings.FinalMask.WithPacketConnSetup(func(packet stdnet.PacketConn) { native.TunePacketSocket(packet, true, config.Diagnostic) })
+		raw, err = masks.ListenPacket(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)})
+	} else {
+		raw, err = internet.ListenSystemPacket(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)}, settings.SocketSettings)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if config.PacketBridge {
+		local := raw.LocalAddr()
+		engine, err := native.StartPacketConn(ctx, config, raw, local, nil, func(conn *native.Conn) { handler(&nativeInbound{Conn: conn, user: conn.User}) })
+		if err != nil {
+			return nil, err
+		}
+		return finishNativeListener(engine, local, settings, masqueradeTransport), nil
 	}
 	defer raw.Close()
 	file, err := nativePacketFile(raw)
@@ -457,7 +589,11 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	if err != nil {
 		return nil, err
 	}
-	listener := &nativeListener{engine: engine, addr: local}
+	return finishNativeListener(engine, local, settings, masqueradeTransport), nil
+}
+
+func finishNativeListener(engine *native.Engine, local stdnet.Addr, settings *internet.MemoryStreamConfig, masqueradeTransport *http.Transport) *nativeListener {
+	listener := &nativeListener{engine: engine, addr: local, masqueradeTransport: masqueradeTransport}
 	for _, certificate := range tls.ConfigFromStreamSettings(settings).Certificate {
 		if certificate.Usage == tls.Certificate_ENCIPHERMENT && !certificate.OneTimeLoading &&
 			(certificate.CertificatePath != "" || certificate.KeyPath != "") {
@@ -468,5 +604,5 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 			}()
 		}
 	}
-	return listener, nil
+	return listener
 }

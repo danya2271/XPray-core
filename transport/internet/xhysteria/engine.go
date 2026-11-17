@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
@@ -55,6 +56,9 @@ const (
 	authClosed    = 17
 	updateTLS     = 18
 	controlResult = 19
+	incomingHTTP  = 20
+	httpHead      = 21
+	httpTrailers  = 22
 	maxFrame      = 65536 + 4096
 	// Leave time to deliver Rust's ten-second handshake/auth timeout over IPC.
 	StartupTimeout = 12 * time.Second
@@ -81,6 +85,12 @@ type Config struct {
 	MaxIdleTimeout            uint64                                    `json:"max_idle_timeout"`
 	KeepAlivePeriod           uint64                                    `json:"keep_alive_period"`
 	PortHopping               *PortHoppingConfig                        `json:"port_hopping,omitempty"`
+	Masquerade                *MasqueradeConfig                         `json:"masquerade,omitempty"`
+	MasqueradeHandler         http.Handler                              `json:"-"`
+	ExternalMasquerade        bool                                      `json:"external_masquerade,omitempty"`
+	PacketBridge              bool                                      `json:"packet_bridge,omitempty"`
+	PacketBatch               bool                                      `json:"packet_batch,omitempty"`
+	PacketLocal               string                                    `json:"packet_local,omitempty"`
 	Diagnostic                bool                                      `json:"diagnostic"`
 	ExternalAuth              bool                                      `json:"external_auth"`
 	UDPIdleTimeout            uint64                                    `json:"udp_idle_timeout"`
@@ -97,8 +107,16 @@ type Config struct {
 
 type PortHoppingConfig struct {
 	Ports       []uint16 `json:"ports"`
+	IPs         []string `json:"ips,omitempty"`
+	Once        bool     `json:"once,omitempty"`
 	IntervalMin uint64   `json:"interval_min"`
 	IntervalMax uint64   `json:"interval_max"`
+}
+
+type MasqueradeConfig struct {
+	Status  uint16            `json:"status"`
+	Headers map[string]string `json:"headers"`
+	Body    string            `json:"body"`
 }
 
 type frame struct {
@@ -153,6 +171,7 @@ func writeFrame(w io.Writer, f frame) error {
 type Engine struct {
 	handle        unsafe.Pointer
 	bridge        frameBridge
+	packet        *packetRelay
 	arenaBytes    int64
 	local, remote net.Addr
 	mu            sync.Mutex
@@ -169,6 +188,7 @@ type Engine struct {
 	queued        atomic.Int64
 	stopping      bool
 	authenticate  func(string) (*protocol.MemoryUser, bool)
+	masquerade    http.Handler
 	authUsers     map[uint64]nativeIdentity
 	controls      map[uint64]chan frame
 	maxFlows      int
@@ -197,6 +217,9 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 	}
 	if config.MaxFlows > 65536 || config.MaxConnections > 4096 || config.ServerWorkers > 16 || config.ProcessWorkers > 16 || (config.SendBufferBytes != 0 && (config.SendBufferBytes < maxFrame || config.SendBufferBytes > 1<<30)) || (config.ExternalAuth && config.Authenticate == nil) {
 		return nil, errors.New("invalid native engine limits or authenticator")
+	}
+	if config.ExternalMasquerade && (!config.Server || config.MasqueradeHandler == nil) {
+		return nil, errors.New("native HTTP masquerade requires a server handler")
 	}
 	for _, limit := range []uint32{config.ReceiveBufferBytes, config.ProcessSendBufferBytes, config.ProcessReceiveBufferBytes} {
 		if limit != 0 && (limit < maxFrame || limit > 1<<30) {
@@ -279,6 +302,7 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 	}
 	e := &Engine{handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept,
 		authenticate: config.Authenticate, authUsers: make(map[uint64]nativeIdentity), controls: make(map[uint64]chan frame), maxFlows: maxFlows, diagnostic: config.Diagnostic, role: "client", peer: config.Peer}
+	e.masquerade = config.MasqueradeHandler
 	if config.Server {
 		e.role = "server"
 		e.peer = fmt.Sprint(local)
@@ -413,6 +437,10 @@ func (e *Engine) stop() {
 func (e *Engine) Close() error {
 	e.stop()
 	e.wg.Wait()
+	if e.packet != nil {
+		e.packet.stop(net.ErrClosed)
+		e.packet.wg.Wait()
+	}
 	e.submitWG.Wait()
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -563,6 +591,12 @@ func (e *Engine) readLoop() {
 			f.release()
 			if e.send(frame{kind: authResponse, id: id, data: response}, time.Now().Add(10*time.Second)) != nil {
 				return
+			}
+			continue
+		}
+		if f.kind == incomingHTTP {
+			if err := e.acceptHTTP(f); err != nil {
+				e.diagnose("HTTP masquerade request rejected", err)
 			}
 			continue
 		}
@@ -898,9 +932,9 @@ func (c *Conn) nextFrame() (frame, error) {
 }
 
 func (c *Conn) received(f frame) (frame, error) {
-	if f.kind == dataFrame || f.kind == datagramFrame {
+	if f.kind == dataFrame || f.kind == datagramFrame || f.kind == httpTrailers {
 		c.readCredits++
-		if c.readCredits >= uint8(cap(c.writeCredit)/2) {
+		if c.readCredits >= uint8(cap(c.writeCredit)/2) || f.kind == datagramFrame && len(c.in) == 0 {
 			count := c.readCredits
 			c.readCredits = 0
 			if err := c.engine.send(frame{kind: creditFrame, id: c.id, data: creditCounts[count : count+1]}, time.Now().Add(10*time.Second)); err != nil {
@@ -937,12 +971,30 @@ func (c *Conn) waitWrite(f *frame) error {
 		if err != nil {
 			return err
 		}
+		if !until.IsZero() && !time.Now().Before(until) {
+			return os.ErrDeadlineExceeded
+		}
+		select {
+		case <-c.engine.done:
+			return net.ErrClosed
+		default:
+		}
+		if f == nil {
+			select {
+			case <-c.writeCredit:
+				return nil
+			default:
+			}
+		} else if !reserved {
+			direct, err := c.engine.prepareFrame(*f)
+			if direct || err != nil {
+				return err
+			}
+			reserved = true
+		}
 		var timeout <-chan time.Time
 		var timer *time.Timer
 		if !until.IsZero() {
-			if !time.Now().Before(until) {
-				return os.ErrDeadlineExceeded
-			}
 			timer = time.NewTimer(time.Until(until))
 			timeout = timer.C
 		}
@@ -950,16 +1002,6 @@ func (c *Conn) waitWrite(f *frame) error {
 		var value frame
 		var credit <-chan struct{}
 		if f != nil {
-			if !reserved {
-				direct, err := c.engine.prepareFrame(*f)
-				if direct || err != nil {
-					if timer != nil {
-						timer.Stop()
-					}
-					return err
-				}
-				reserved = true
-			}
 			send = c.engine.out
 			value = *f
 		} else {

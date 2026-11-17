@@ -1292,6 +1292,7 @@ impl Connection {
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;
+        stats.datagrams = self.datagrams.stats;
         stats.path.rtt = self.path.rtt.get();
         stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();

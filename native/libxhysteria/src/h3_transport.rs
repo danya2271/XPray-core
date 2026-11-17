@@ -20,6 +20,16 @@ pub struct ReplayRecv<S = quinn::RecvStream> {
 }
 
 impl Replay {
+    pub fn stopped(
+        &self,
+    ) -> impl std::future::Future<
+        Output = std::result::Result<Option<quinn::VarInt>, quinn::StoppedError>,
+    > + Send
+    + Sync
+    + 'static {
+        self.raw.stopped()
+    }
+
     pub fn split(self) -> Result<(quinn::SendStream, ReplayRecv)> {
         let (send, recv) = quic::BidiStream::split(self.raw);
         Ok((
@@ -136,6 +146,49 @@ impl quic::SendStreamUnframed<Bytes> for Replay {
         buf: &mut D,
     ) -> Poll<std::result::Result<usize, quic::StreamErrorIncoming>> {
         self.raw.poll_send(cx, buf)
+    }
+}
+
+impl quic::BidiStream<Bytes> for Replay {
+    type SendStream = h3_quinn::SendStream<Bytes>;
+    type RecvStream = HttpRecv;
+
+    fn split(self) -> (Self::SendStream, Self::RecvStream) {
+        let (send, recv) = quic::BidiStream::split(self.raw);
+        (
+            send,
+            HttpRecv {
+                raw: recv,
+                prefix: self.prefix,
+            },
+        )
+    }
+}
+
+pub struct HttpRecv {
+    raw: h3_quinn::RecvStream,
+    prefix: VecDeque<Bytes>,
+}
+
+impl quic::RecvStream for HttpRecv {
+    type Buf = Bytes;
+
+    fn poll_data(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<std::result::Result<Option<Bytes>, quic::StreamErrorIncoming>> {
+        if let Some(data) = self.prefix.pop_front() {
+            return Poll::Ready(Ok(Some(data)));
+        }
+        self.raw.poll_data(context)
+    }
+
+    fn stop_sending(&mut self, code: u64) {
+        self.raw.stop_sending(code);
+    }
+
+    fn recv_id(&self) -> quic::StreamId {
+        self.raw.recv_id()
     }
 }
 

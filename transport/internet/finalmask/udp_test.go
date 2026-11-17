@@ -89,6 +89,83 @@ type scriptedPacketConn struct {
 	deadline atomic.Int64
 }
 
+func TestPacketConnSetupRunsBeforeMasksAndOnEveryDial(t *testing.T) {
+	var setups, wraps int
+	var fail bool
+	expectSetup := true
+	raw := newScriptedPacketConn()
+	mask := &packetSetupMask{wrap: func(packet net.PacketConn) {
+		if packet != raw {
+			t.Fatal("mask did not receive base socket")
+		}
+		if expectSetup && setups != wraps+1 {
+			t.Fatal("socket setup did not precede masking")
+		}
+		wraps++
+	}}
+	original := finalmask.NewFinalMask(nil, []finalmask.UDPMask{mask}, nil, nil,
+		func(context.Context, net.Destination) (net.PacketConn, net.Addr, error) {
+			if fail {
+				return nil, nil, os.ErrPermission
+			}
+			return raw, &net.UDPAddr{IP: gonet.IPv4(127, 0, 0, 1), Port: 443}, nil
+		},
+		func(context.Context, net.Addr) (net.PacketConn, error) {
+			if fail {
+				return nil, os.ErrPermission
+			}
+			return raw, nil
+		})
+	configured := original.WithPacketConnSetup(func(packet net.PacketConn) {
+		if packet != raw {
+			t.Fatal("setup did not receive base socket")
+		}
+		setups++
+	})
+	for range 2 {
+		if _, err := configured.DialUDP(context.Background(), net.UDPDestination(net.LocalHostIP, 443)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := configured.ListenPacket(context.Background(), raw.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	if setups != 3 || wraps != 3 {
+		t.Fatalf("socket replacements missed setup: setups=%d wraps=%d", setups, wraps)
+	}
+	expectSetup = false
+	if _, err := original.DialUDP(context.Background(), net.UDPDestination(net.LocalHostIP, 443)); err != nil {
+		t.Fatal(err)
+	}
+	if setups != 3 {
+		t.Fatal("setup changed original finalmask")
+	}
+	fail = true
+	if _, err := configured.DialUDP(context.Background(), net.UDPDestination(net.LocalHostIP, 443)); err != os.ErrPermission {
+		t.Fatalf("dial error changed: %v", err)
+	}
+	if _, err := configured.ListenPacket(context.Background(), raw.LocalAddr()); err != os.ErrPermission {
+		t.Fatalf("listen error changed: %v", err)
+	}
+	if setups != 3 || wraps != 4 {
+		t.Fatal("failed socket setup reached callback or masks")
+	}
+}
+
+type packetSetupMask struct {
+	wrap func(net.PacketConn)
+}
+
+func (mask *packetSetupMask) WrapPacketConnClient(packet net.PacketConn, _ *net.Destination, _ *finalmask.Dialer) (net.PacketConn, error) {
+	mask.wrap(packet)
+	return packet, nil
+}
+
+func (mask *packetSetupMask) WrapPacketConnServer(packet net.PacketConn, _ net.Addr, _ *finalmask.ListenConfig) (net.PacketConn, error) {
+	mask.wrap(packet)
+	return packet, nil
+}
+
 func newScriptedPacketConn() *scriptedPacketConn {
 	return &scriptedPacketConn{
 		local:  &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 40000},

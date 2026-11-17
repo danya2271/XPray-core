@@ -291,6 +291,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -881,6 +887,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "http",
+ "httpdate",
  "libc",
  "quinn",
  "quinn-proto",

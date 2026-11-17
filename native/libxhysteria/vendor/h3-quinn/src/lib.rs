@@ -271,6 +271,16 @@ where
     recv: RecvStream,
 }
 
+impl<B: Buf> BidiStream<B> {
+    #[doc = "Wait for the peer to stop receiving or acknowledge a finished stream."]
+    pub fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> + Send + Sync + 'static
+    {
+        self.send.stream.stopped()
+    }
+}
+
 impl<B> quic::BidiStream<B> for BidiStream<B>
 where
     B: Buf,

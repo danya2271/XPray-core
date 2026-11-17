@@ -48,6 +48,25 @@ func (fm *FinalMask) UDPMasks() []UDPMask {
 
 func (fm *FinalMask) HasTCPMasks() bool { return len(fm.tcpMasks) != 0 }
 
+func (fm *FinalMask) WithPacketConnSetup(setup func(net.PacketConn)) *FinalMask {
+	configured := *fm
+	configured.dialUDP = func(ctx context.Context, dest net.Destination) (net.PacketConn, net.Addr, error) {
+		packet, address, err := fm.dialUDP(ctx, dest)
+		if err == nil {
+			setup(packet)
+		}
+		return packet, address, err
+	}
+	configured.listenPacket = func(ctx context.Context, address net.Addr) (net.PacketConn, error) {
+		packet, err := fm.listenPacket(ctx, address)
+		if err == nil {
+			setup(packet)
+		}
+		return packet, err
+	}
+	return &configured
+}
+
 func NewFinalMask(tcpMasks []TCPMask, udpMasks []UDPMask, dialTCP func(context.Context, net.Destination) (net.Conn, error), listen func(context.Context, net.Addr) (net.Listener, error), dialUDP func(context.Context, net.Destination) (net.PacketConn, net.Addr, error), listenPacket func(context.Context, net.Addr) (net.PacketConn, error)) *FinalMask {
 	slices.Reverse(tcpMasks)
 	slices.Reverse(udpMasks)

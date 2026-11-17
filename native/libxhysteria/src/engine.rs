@@ -4,11 +4,13 @@ use crate::{
     congestion,
     h3_transport::{self, Dispatch, Replay, Result},
     hopping::{self, HoppingSocket},
+    masquerade,
+    packet_socket::PacketSocket,
     protocol, shared,
     socket::{MaskedSocket, ReceiveSocket},
     udp::{Defragger, Message},
 };
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use h3::quic::{RecvStream as _, SendStream as _};
 use quinn::{AsyncUdpSocket, Runtime};
 use serde::Deserialize;
@@ -18,8 +20,8 @@ use std::{
     future::poll_fn,
     io::{self, BufReader},
     net::UdpSocket,
-    os::fd::{FromRawFd, IntoRawFd},
-    os::unix::net::UnixStream,
+    os::fd::{FromRawFd, IntoRawFd, OwnedFd},
+    os::unix::net::{UnixDatagram, UnixStream},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -52,6 +54,9 @@ const AUTH_RESPONSE: u8 = 16;
 const AUTH_CLOSED: u8 = 17;
 const UPDATE_TLS: u8 = 18;
 const CONTROL_RESULT: u8 = 19;
+const INCOMING_HTTP: u8 = 20;
+const HTTP_HEAD: u8 = 21;
+const HTTP_TRAILERS: u8 = 22;
 const MAX_FRAME: usize = 65536 + 4096;
 const MAX_FLOWS: usize = 128;
 const SERVER_CHUNK: usize = 16384;
@@ -84,6 +89,16 @@ pub struct Config {
     pub keep_alive_period: u64,
     #[serde(default)]
     pub port_hopping: Option<hopping::Config>,
+    #[serde(default)]
+    pub masquerade: Option<masquerade::Config>,
+    #[serde(default)]
+    pub external_masquerade: bool,
+    #[serde(default)]
+    pub packet_bridge: bool,
+    #[serde(default)]
+    pub packet_batch: bool,
+    #[serde(default)]
+    pub packet_local: String,
     pub diagnostic: bool,
     #[serde(default)]
     pub external_auth: bool,
@@ -297,6 +312,7 @@ struct Bus {
     next: AtomicU64,
     max_flows: usize,
     flow_window: usize,
+    udp_credit_dropped: AtomicU64,
     capacity: Option<ServerCapacity>,
     send_budget: Option<Arc<Semaphore>>,
     process_send_budget: Option<Arc<Semaphore>>,
@@ -483,7 +499,11 @@ impl Drop for Flow {
 }
 
 impl Bus {
-    async fn register(&self, id: u64, owner: u64) -> Result<mpsc::Receiver<Frame>> {
+    async fn register(
+        &self,
+        id: u64,
+        owner: u64,
+    ) -> Result<(mpsc::Receiver<Frame>, Arc<Semaphore>)> {
         let mut flows = self.flows.lock().unwrap();
         if flows.len() >= self.max_flows {
             if let Some(capacity) = &self.capacity {
@@ -496,15 +516,16 @@ impl Bus {
             return Err("duplicate native flow".into());
         }
         let (tx, rx) = mpsc::channel(self.flow_window);
+        let receive_credit = Arc::new(Semaphore::new(self.flow_window));
         flows.insert(
             id,
             Flow {
                 owner,
                 sender: tx,
-                receive_credit: Arc::new(Semaphore::new(self.flow_window)),
+                receive_credit: receive_credit.clone(),
             },
         );
-        Ok(rx)
+        Ok((rx, receive_credit))
     }
     async fn buffered_chunk(&self, data: Bytes) -> Result<Bytes> {
         let Some(budget) = &self.send_budget else {
@@ -543,17 +564,10 @@ impl Bus {
             .await
             .map_err(|_| "Go bridge closed".into())
     }
-    async fn payload_bytes(&self, id: u64, data: &[u8]) -> Result<()> {
-        self.payload_parts(id, &[data]).await
+    async fn payload_bytes(&self, id: u64, credit: &Semaphore, data: &[u8]) -> Result<()> {
+        self.payload_parts(id, credit, &[data]).await
     }
-    async fn payload_parts(&self, id: u64, parts: &[&[u8]]) -> Result<()> {
-        let credit = self
-            .flows
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|flow| flow.receive_credit.clone())
-            .ok_or("closed native flow")?;
+    async fn payload_parts(&self, id: u64, credit: &Semaphore, parts: &[&[u8]]) -> Result<()> {
         credit
             .acquire()
             .await
@@ -569,7 +583,13 @@ impl Bus {
             self.send(Frame::new(DATA, id, data)).await
         }
     }
-    async fn payload_chunks(&self, id: u64, chunks: &[Bytes], frame_size: usize) -> Result<usize> {
+    async fn payload_chunks(
+        &self,
+        id: u64,
+        credit: &Semaphore,
+        chunks: &[Bytes],
+        frame_size: usize,
+    ) -> Result<usize> {
         let mut parts = [b"".as_slice(); 16];
         let mut count = 0;
         let mut size = 0;
@@ -583,7 +603,7 @@ impl Bus {
                 size += len;
                 data = &data[len..];
                 if size == frame_size || count == parts.len() {
-                    self.payload_parts(id, &parts[..count]).await?;
+                    self.payload_parts(id, credit, &parts[..count]).await?;
                     total += size;
                     count = 0;
                     size = 0;
@@ -591,7 +611,7 @@ impl Bus {
             }
         }
         if count != 0 {
-            self.payload_parts(id, &parts[..count]).await?;
+            self.payload_parts(id, credit, &parts[..count]).await?;
             total += size;
         }
         Ok(total)
@@ -606,6 +626,7 @@ impl Bus {
         let Some(credit) = credit else { return Ok(()) };
         // An unread UDP session drops payloads instead of blocking other sessions.
         let Ok(permit) = credit.try_acquire() else {
+            self.udp_credit_dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         };
         permit.forget();
@@ -834,39 +855,109 @@ fn crypto_provider() -> rustls::crypto::CryptoProvider {
     provider
 }
 
-fn endpoint(config: &Config, socket: UdpSocket) -> Result<quinn::Endpoint> {
-    udp_buffers(&socket, config.server, config.diagnostic);
-    if config.port_hopping.is_some() {
-        if config.server {
-            return Err("native UDP hopping is client-only".into());
-        }
-        if socket.peer_addr().is_ok() {
-            return Err("native UDP hopping requires an unconnected UDP socket".into());
-        }
+enum NetworkSocket {
+    Udp(UdpSocket),
+    Packet(UnixDatagram),
+}
+
+fn network_socket(config: &Config, descriptor: i32) -> Result<NetworkSocket> {
+    let descriptor = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 0) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error().into());
     }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let mut kind: libc::c_int = 0;
+    let mut kind_length = std::mem::size_of_val(&kind) as libc::socklen_t;
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut address_length = std::mem::size_of_val(&address) as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            descriptor.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut kind_length,
+        )
+    } != 0
+        || unsafe {
+            libc::getsockname(
+                descriptor.as_raw_fd(),
+                (&mut address as *mut libc::sockaddr_storage).cast(),
+                &mut address_length,
+            )
+        } != 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    let family = address.ss_family as libc::c_int;
+    if kind != libc::SOCK_DGRAM
+        || if config.packet_bridge {
+            family != libc::AF_UNIX
+        } else {
+            family != libc::AF_INET && family != libc::AF_INET6
+        }
+    {
+        return Err("native network socket has an incompatible family or type".into());
+    }
+    if config.packet_bridge {
+        let socket = unsafe { UnixDatagram::from_raw_fd(descriptor.into_raw_fd()) };
+        socket.set_nonblocking(true)?;
+        Ok(NetworkSocket::Packet(socket))
+    } else {
+        let socket = unsafe { UdpSocket::from_raw_fd(descriptor.into_raw_fd()) };
+        socket.set_nonblocking(true)?;
+        Ok(NetworkSocket::Udp(socket))
+    }
+}
+
+fn endpoint(config: &Config, socket: NetworkSocket) -> Result<quinn::Endpoint> {
     let runtime = Arc::new(quinn::TokioRuntime);
-    let descriptor = socket.as_raw_fd();
-    let udp: Arc<dyn AsyncUdpSocket> = if config.salamander.is_empty() {
-        runtime.wrap_udp_socket(socket)?
-    } else {
-        Arc::new(MaskedSocket::new(socket, config.salamander.as_bytes())?)
-    };
-    let udp: Arc<dyn AsyncUdpSocket> = Arc::new(ReceiveSocket::new(
-        udp,
-        descriptor,
-        !config.server
-            && config.receive_buffer_bytes != 0
-            && config.receive_buffer_bytes <= 2 * 1024 * 1024,
-    ));
-    let udp: Arc<dyn AsyncUdpSocket> = if let Some(hop) = &config.port_hopping {
-        Arc::new(HoppingSocket::new(
-            udp,
-            config.peer.parse()?,
-            hop.clone(),
-            config.diagnostic,
-        )?)
-    } else {
-        udp
+    let udp: Arc<dyn AsyncUdpSocket> = match socket {
+        NetworkSocket::Packet(socket) => {
+            if !config.salamander.is_empty() || config.port_hopping.is_some() {
+                return Err("packet bridge masks must be applied by Go".into());
+            }
+            Arc::new(PacketSocket::new(
+                socket,
+                config.packet_local.parse()?,
+                config.packet_batch,
+            )?)
+        }
+        NetworkSocket::Udp(socket) => {
+            udp_buffers(&socket, config.server, config.diagnostic);
+            if config.port_hopping.is_some() {
+                if config.server {
+                    return Err("native UDP hopping is client-only".into());
+                }
+                if socket.peer_addr().is_ok() {
+                    return Err("native UDP hopping requires an unconnected UDP socket".into());
+                }
+            }
+            let descriptor = socket.as_raw_fd();
+            let udp: Arc<dyn AsyncUdpSocket> = if config.salamander.is_empty() {
+                runtime.wrap_udp_socket(socket)?
+            } else {
+                Arc::new(MaskedSocket::new(socket, config.salamander.as_bytes())?)
+            };
+            let udp: Arc<dyn AsyncUdpSocket> = Arc::new(ReceiveSocket::new(
+                udp,
+                descriptor,
+                !config.server
+                    && config.receive_buffer_bytes != 0
+                    && config.receive_buffer_bytes <= 2 * 1024 * 1024,
+            ));
+            let udp: Arc<dyn AsyncUdpSocket> = if let Some(hop) = &config.port_hopping {
+                Arc::new(HoppingSocket::new(
+                    udp,
+                    config.peer.parse()?,
+                    hop.clone(),
+                    config.diagnostic,
+                )?)
+            } else {
+                udp
+            };
+            udp
+        }
     };
     let server = if config.server {
         Some(server_config(config)?)
@@ -897,19 +988,69 @@ fn endpoint(config: &Config, socket: UdpSocket) -> Result<quinn::Endpoint> {
 async fn connection_diagnostics(connection: quinn::Connection, role: &'static str) -> Result<()> {
     let peer = connection.remote_address();
     let mut timer = tokio::time::interval(Duration::from_secs(10));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut previous = quinn::ConnectionStats::default();
+    let mut sampled = Instant::now();
     loop {
         tokio::select! {
             reason = connection.closed() => {
+                report_connection_diagnostics(&connection, role, &mut previous, &mut sampled);
                 eprintln!("[XRAY_NET_DIAG][XHYSTERIA] connection closed role={role} peer={peer} reason={reason}");
                 return Ok(());
             }
             _ = timer.tick() => {
-                let s = connection.stats();
-                eprintln!("[XRAY_NET_DIAG][XHYSTERIA] connection role={role} peer={peer} rtt_ms={} tx_bytes={} rx_bytes={} lost_packets={} cwnd={}",
-                    s.path.rtt.as_millis(), s.udp_tx.bytes, s.udp_rx.bytes, s.path.lost_packets, s.path.cwnd);
+                report_connection_diagnostics(&connection, role, &mut previous, &mut sampled);
             }
         }
     }
+}
+
+fn report_connection_diagnostics(
+    connection: &quinn::Connection,
+    role: &str,
+    previous: &mut quinn::ConnectionStats,
+    sampled: &mut Instant,
+) {
+    let stats = connection.stats();
+    let elapsed = sampled.elapsed().as_millis();
+    let sent = stats
+        .path
+        .sent_packets
+        .saturating_sub(previous.path.sent_packets);
+    let lost = stats
+        .path
+        .lost_packets
+        .saturating_sub(previous.path.lost_packets);
+    let total_percent =
+        100.0 * stats.path.lost_packets as f64 / stats.path.sent_packets.max(1) as f64;
+    let window_percent = if sent == 0 {
+        "n/a".to_owned()
+    } else {
+        format!("{:.3}", 100.0 * lost as f64 / sent as f64)
+    };
+    eprintln!(
+        "[XRAY_NET_DIAG][XHYSTERIA] connection role={role} peer={} rtt_ms={} min_rtt_ms={} tx_bytes={} rx_bytes={} lost_packets={} cwnd={} tx_packets={} rx_packets={} sent_packets={} lost_bytes={} loss_total_pct={total_percent:.3} sample_ms={elapsed} sent_delta={sent} lost_delta={lost} loss_window_pct={window_percent} mtu={} mtu_probe_lost={} black_holes={} udp_received={} udp_rx_dropped={} udp_tx_dropped={} udp_mtu_dropped={}",
+        connection.remote_address(),
+        stats.path.rtt.as_millis(),
+        stats.path.min_rtt.as_millis(),
+        stats.udp_tx.bytes,
+        stats.udp_rx.bytes,
+        stats.path.lost_packets,
+        stats.path.cwnd,
+        stats.udp_tx.datagrams,
+        stats.udp_rx.datagrams,
+        stats.path.sent_packets,
+        stats.path.lost_bytes,
+        stats.path.current_mtu,
+        stats.path.lost_plpmtud_probes,
+        stats.path.black_holes_detected,
+        stats.datagrams.received,
+        stats.datagrams.receive_dropped,
+        stats.datagrams.send_dropped,
+        stats.datagrams.send_dropped_mtu,
+    );
+    *previous = stats;
+    *sampled = Instant::now();
 }
 
 async fn client_auth(
@@ -956,6 +1097,7 @@ async fn relay_client_tcp(
     connection: quinn::Connection,
     frame: Frame,
     mut commands: mpsc::Receiver<Frame>,
+    receive_credit: Arc<Semaphore>,
     bus: Arc<Bus>,
 ) -> Result<()> {
     let target = std::str::from_utf8(&frame.data)?;
@@ -981,7 +1123,7 @@ async fn relay_client_tcp(
                 bus.send(Frame::new(OPENED, id, Bytes::new())).await?;
                 if header.consumed < response.len() {
                     for chunk in response[header.consumed..].chunks(SERVER_CHUNK) {
-                        bus.payload_bytes(id, chunk).await?;
+                        bus.payload_bytes(id, &receive_credit, chunk).await?;
                     }
                 }
                 break;
@@ -1024,7 +1166,7 @@ async fn relay_client_tcp(
         let mut budget = 0;
         while let Some(count) = rx.read_chunks(&mut chunks).await? {
             budget += bus
-                .payload_chunks(id, &chunks[..count], SERVER_CHUNK)
+                .payload_chunks(id, &receive_credit, &chunks[..count], SERVER_CHUNK)
                 .await?;
             for chunk in &mut chunks[..count] {
                 *chunk = Bytes::new();
@@ -1070,7 +1212,7 @@ async fn relay_server_tcp(
     })
     .await??;
     let id = bus.next.fetch_add(1, Ordering::Relaxed);
-    let mut commands = match bus.register(id, owner).await {
+    let (mut commands, receive_credit) = match bus.register(id, owner).await {
         Ok(commands) => commands,
         Err(error) => {
             stream.reset(0x107);
@@ -1095,7 +1237,7 @@ async fn relay_server_tcp(
         )
         .await?;
         for chunk in header[consumed..].chunks(SERVER_CHUNK) {
-            bus.payload_bytes(id, chunk).await?;
+            bus.payload_bytes(id, &receive_credit, chunk).await?;
         }
         drop(header);
         let (mut tx, mut rx) = stream.split()?;
@@ -1132,7 +1274,7 @@ async fn relay_server_tcp(
             let mut budget = 0;
             while let Some(count) = rx.read_chunks(&mut chunks).await? {
                 let received = bus
-                    .payload_chunks(id, &chunks[..count], SERVER_CHUNK)
+                    .payload_chunks(id, &receive_credit, &chunks[..count], SERVER_CHUNK)
                     .await?;
                 receive_window.observe(received);
                 budget += received;
@@ -1153,6 +1295,126 @@ async fn relay_server_tcp(
     .await;
     bus.done(id, result).await;
     Ok(())
+}
+
+async fn relay_http(
+    request: http::Request<()>,
+    stream: h3::server::RequestStream<Replay, Bytes>,
+    bus: Arc<Bus>,
+    owner: u64,
+    id: u64,
+    peer: &str,
+) -> Result<()> {
+    let request_length = masquerade::content_length(request.headers())?;
+    let metadata = serde_json::to_vec(&masquerade::RequestHead {
+        method: request.method().as_str(),
+        uri: request.uri().to_string(),
+        headers: masquerade::encode_headers(request.headers())?,
+        remote: peer,
+        content_length: request_length.map_or(-1, |length| length as i64),
+    })?;
+    if metadata.len() > MAX_FRAME {
+        return Err("native HTTP request headers exceed bridge limit".into());
+    }
+    let (mut commands, receive_credit) = bus.register(id, owner).await?;
+    bus.send(Frame::new(INCOMING_HTTP, id, metadata)).await?;
+    let (mut response_stream, mut request_stream) = stream.split();
+    let upload = async {
+        let mut received = 0u64;
+        while let Some(mut data) = request_stream.recv_data().await? {
+            received = received
+                .checked_add(data.remaining() as u64)
+                .ok_or("HTTP request body too large")?;
+            if request_length.is_some_and(|length| received > length) {
+                return Err("HTTP request exceeds Content-Length".into());
+            }
+            while data.has_remaining() {
+                let chunk = data.chunk();
+                let count = chunk.len().min(SERVER_CHUNK);
+                bus.payload_bytes(id, &receive_credit, &chunk[..count])
+                    .await?;
+                data.advance(count);
+            }
+        }
+        if request_length.is_some_and(|length| received != length) {
+            return Err("HTTP request shorter than Content-Length".into());
+        }
+        if let Some(trailers) = request_stream.recv_trailers().await? {
+            let data = serde_json::to_vec(&masquerade::encode_headers(&trailers)?)?;
+            if data.len() > MAX_FRAME {
+                return Err("native HTTP request trailers exceed bridge limit".into());
+            }
+            receive_credit.acquire().await?.forget();
+            bus.send(Frame::new(HTTP_TRAILERS, id, data)).await?;
+        }
+        bus.send(Frame::new(FIN, id, Bytes::new())).await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let download = async {
+        let mut headers_sent = false;
+        let mut trailers_sent = false;
+        let mut credit = 0;
+        let mut body_allowed = true;
+        let mut response_length = None;
+        let mut sent = 0u64;
+        while let Some(command) = commands.recv().await {
+            match command.kind {
+                HTTP_HEAD if !headers_sent => {
+                    let response = masquerade::decode_response(&command.data)?;
+                    let final_response = response.status().as_u16() >= 200;
+                    body_allowed = request.method() != http::Method::HEAD
+                        && !matches!(
+                            response.status(),
+                            http::StatusCode::NO_CONTENT | http::StatusCode::NOT_MODIFIED
+                        );
+                    if final_response {
+                        response_length = masquerade::content_length(response.headers())?;
+                    }
+                    response_stream.send_response(response).await?;
+                    headers_sent = final_response;
+                    bus.writable(id, &mut credit).await?;
+                }
+                DATA if headers_sent && !trailers_sent => {
+                    if body_allowed {
+                        sent = sent
+                            .checked_add(command.data.len() as u64)
+                            .ok_or("HTTP response body too large")?;
+                        if response_length.is_some_and(|length| sent > length) {
+                            return Err("HTTP response exceeds Content-Length".into());
+                        }
+                        response_stream
+                            .send_data(bus.buffered_chunk(command.data).await?)
+                            .await?;
+                    }
+                    bus.writable(id, &mut credit).await?;
+                }
+                HTTP_TRAILERS if headers_sent && !trailers_sent => {
+                    let trailers: HashMap<String, Vec<String>> =
+                        serde_json::from_slice(&command.data)?;
+                    response_stream
+                        .send_trailers(masquerade::decode_headers(trailers)?)
+                        .await?;
+                    trailers_sent = true;
+                    bus.writable(id, &mut credit).await?;
+                }
+                FIN if headers_sent => {
+                    if body_allowed && response_length.is_some_and(|length| sent != length) {
+                        return Err("HTTP response shorter than Content-Length".into());
+                    }
+                    response_stream.finish().await?;
+                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
+                }
+                _ => return Err("invalid native HTTP response frame".into()),
+            }
+        }
+        Err("Go HTTP handler closed".into())
+    };
+    tokio::pin!(upload);
+    tokio::pin!(download);
+    tokio::select! {
+        result = &mut download => result,
+        result = &mut upload => { result?; download.await }
+    }
 }
 
 async fn send_udp(
@@ -1263,7 +1525,7 @@ async fn server_udp(
                 } else {
                     if sessions.len() >= MAX_FLOWS { continue; }
                     let id = bus.next.fetch_add(1, Ordering::Relaxed);
-                    let Ok(mut commands) = bus.register(id, owner).await else { continue };
+                    let Ok((mut commands, _)) = bus.register(id, owner).await else { continue };
                     let mut metadata = who.to_be_bytes().to_vec();
                     metadata.extend_from_slice(&owner.to_be_bytes());
                     metadata.extend_from_slice(&address_data(peer.as_bytes(), address)?);
@@ -1313,7 +1575,12 @@ async fn server_udp(
     }
 }
 
-async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>) -> Result<()> {
+async fn serve(
+    connection: quinn::Connection,
+    config: Arc<Config>,
+    bus: Arc<Bus>,
+    masquerade: Arc<masquerade::Prepared>,
+) -> Result<()> {
     let owner = bus.next.fetch_add(1, Ordering::Relaxed);
     let user = Arc::new(AtomicU32::new(u32::MAX));
     let receive_window = Arc::new(ReceiveWindow {
@@ -1340,11 +1607,13 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
     tokio::pin!(auth_deadline);
     let mut incoming = h3_quinn::Connection::new(connection.clone());
     let (http_streams, http_receiver) = mpsc::channel(32);
-    let mut h3 = h3::server::Connection::new(Dispatch(
-        h3_quinn::Connection::new(connection.clone()),
-        http_receiver,
-    ))
-    .await?;
+    let mut h3 = h3::server::builder()
+        .max_field_section_size(32 * 1024)
+        .build(Dispatch(
+            h3_quinn::Connection::new(connection.clone()),
+            http_receiver,
+        ))
+        .await?;
     loop {
         tokio::select! {
             _ = &mut auth_deadline, if user.load(Ordering::Acquire) == u32::MAX => break,
@@ -1372,16 +1641,19 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
                     Err(_) => break,
                 }
             }
-            accepted = poll_fn(|cx| h3.poll_accept_request_stream(cx)) => {
+            accepted = poll_fn(|cx| h3.poll_accept_request_stream(cx)), if tasks.len() < MAX_FLOWS + 1 => {
                 match accepted {
                     Ok(Some(stream)) => {
+                        let stopped = config.external_masquerade.then(|| stream.stopped());
                         let resolver = h3.create_resolver(h3::frame::FrameStream::new(h3::stream::BufRecvStream::new(stream)));
                         let user = user.clone();
                         let config = config.clone();
                         let connection = connection.clone();
                         let bus = bus.clone();
+                        let masquerade = masquerade.clone();
+                        let http_id = config.external_masquerade.then(|| bus.next.fetch_add(1, Ordering::Relaxed));
                         tasks.spawn(async move {
-                            tokio::time::timeout(Duration::from_secs(10), async {
+                            let response = async { tokio::time::timeout(Duration::from_secs(10), async {
                                 let (request, mut stream) = resolver.resolve_request().await?;
                                 let mut matched = None;
                                 if request.method() == "POST" && request.uri().host() == Some("hysteria") && request.uri().path() == "/auth"
@@ -1395,7 +1667,7 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
                                         }
                                     }
                                 }
-                                let response = if let Some(index) = matched {
+                                let (response, body) = if let Some(index) = matched {
                                     let existing = user.load(Ordering::Acquire);
                                     if existing != u32::MAX && existing != index { return Err("connection auth identity changed".into()); }
                                     user.store(index, Ordering::Release);
@@ -1404,13 +1676,26 @@ async fn serve(connection: quinn::Connection, config: Arc<Config>, bus: Arc<Bus>
                                     }
                                     let peer_rate = request.headers().get("Hysteria-CC-RX").and_then(|v| v.to_str().ok()).unwrap_or("0");
                                     congestion::negotiate(&connection, &config.congestion, config.tx_bps, peer_rate);
-                                    http::Response::builder().status(233).header("Hysteria-UDP", "true")
-                                        .header("Hysteria-CC-RX", config.rx_bps.to_string()).header("Hysteria-Padding", "n".repeat(256)).body(())?
-                                } else { http::Response::builder().status(404).body(())? };
+                                    (http::Response::builder().status(233).header("Hysteria-UDP", "true")
+                                        .header("Hysteria-CC-RX", config.rx_bps.to_string()).header("Hysteria-Padding", "n".repeat(256)).body(())?, Bytes::new())
+                                } else if let Some(id) = http_id {
+                                    return relay_http(request, stream, bus.clone(), owner, id, &connection.remote_address().to_string()).await;
+                                } else { masquerade.response(request.method()) };
                                 stream.send_response(response).await?;
+                                if !body.is_empty() { stream.send_data(body).await?; }
                                 stream.finish().await?;
                                 Ok(())
-                            }).await?
+                            }).await? };
+                            let result: Result<()> = tokio::select! {
+                                biased;
+                                result = response => result,
+                                _ = async { stopped.unwrap().await }, if config.external_masquerade => Err("HTTP request cancelled".into()),
+                            };
+                            if let Some(id) = http_id {
+                                bus.done(id, result).await;
+                                return Ok(());
+                            }
+                            result
                         });
                     }
                     Ok(None) => break,
@@ -1547,7 +1832,14 @@ fn bridge_tasks(
     }
 }
 
-async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
+async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Result<()> {
+    let masquerade = if config.server {
+        Some(Arc::new(masquerade::Prepared::new(
+            config.masquerade.take(),
+        )?))
+    } else {
+        None
+    };
     let ep = endpoint(&config, socket)?;
     let _endpoint_owner = EndpointOwner(ep.clone());
     let (events, outgoing) = mpsc::channel(128);
@@ -1561,6 +1853,7 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
         next: AtomicU64::new(1),
         max_flows: config.flow_limit(),
         flow_window: config.flow_window(),
+        udp_credit_dropped: AtomicU64::new(0),
         capacity: config.server.then(|| ServerCapacity::new(&config)),
         send_budget: Some({
             Arc::new(Semaphore::new(if config.send_buffer_bytes == 0 {
@@ -1578,6 +1871,7 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
     });
     let config = Arc::new(config);
     let mut capacity_timer = tokio::time::interval(Duration::from_secs(10));
+    let mut previous_udp_credit_dropped = 0;
     let mut tasks = JoinSet::<Result<()>>::new();
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     bridge_tasks(bridge, outgoing, incoming_tx, bus.clone(), &mut tasks);
@@ -1648,10 +1942,10 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
                     if frame.kind == OPEN_TCP {
                         let id = frame.id;
                         match bus.register(id, 0).await {
-                            Ok(commands) => {
+                            Ok((commands, receive_credit)) => {
                                 let bus = bus.clone(); let connection = connection.clone();
                                 tasks.spawn(async move {
-                                    let result = relay_client_tcp(connection, frame, commands, bus.clone()).await;
+                                    let result = relay_client_tcp(connection, frame, commands, receive_credit, bus.clone()).await;
                                     bus.done(id, result).await;
                                     Ok(())
                                 });
@@ -1665,7 +1959,7 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
                         if !udp_enabled { bus.send(Frame::new(ERROR, id, "server disabled UDP")).await?; continue; }
                         let session = next_session;
                         next_session = next_session.checked_add(1).ok_or("UDP session IDs exhausted")?;
-                        let Ok(mut commands) = bus.register(id, 0).await else {
+                        let Ok((mut commands, _)) = bus.register(id, 0).await else {
                             bus.send(Frame::new(ERROR, id, "native flow capacity reached")).await?;
                             continue;
                         };
@@ -1700,16 +1994,26 @@ async fn run(config: Config, socket: UdpSocket, bridge: Bridge) -> Result<()> {
                     continue;
                 };
                 let config = config.clone(); let bus = bus.clone();
+                let masquerade = masquerade.as_ref().unwrap().clone();
                 tasks.spawn(async move {
                     let _permit = permit;
                     if let Ok(Ok(connection)) = tokio::time::timeout(Duration::from_secs(10), incoming).await {
-                        let _ = serve(connection, config, bus).await;
+                        let _ = serve(connection, config, bus, masquerade).await;
                     }
                     Ok(())
                 });
             }
-            _ = capacity_timer.tick(), if config.server && config.diagnostic => {
-                bus.capacity.as_ref().unwrap().report("capacity", bus.flows.lock().unwrap().len());
+            _ = capacity_timer.tick(), if config.diagnostic => {
+                if let Some(capacity) = &bus.capacity {
+                    capacity.report("capacity", bus.flows.lock().unwrap().len());
+                }
+                let dropped = bus.udp_credit_dropped.load(Ordering::Relaxed);
+                eprintln!(
+                    "[XRAY_NET_DIAG][XHYSTERIA] event=udp_bridge role={} credit_dropped_total={dropped} credit_dropped_delta={}",
+                    if config.server { "server" } else { "client" },
+                    dropped.saturating_sub(previous_udp_credit_dropped),
+                );
+                previous_udp_credit_dropped = dropped;
             }
             reason = async { if let Some(c) = &client { c.closed().await } else { std::future::pending().await } } => {
                 break Err(format!("QUIC connection closed: {reason}").into());
@@ -1783,12 +2087,7 @@ pub unsafe extern "C" fn xhys_engine_start(
         {
             return Err("invalid native congestion configuration".into());
         }
-        let fd = unsafe { libc::fcntl(udp_fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let udp = unsafe { UdpSocket::from_raw_fd(fd) };
-        udp.set_nonblocking(true)?;
+        let udp = network_socket(&config, udp_fd)?;
         let (go, native) = UnixStream::pair()?;
         native.set_nonblocking(true)?;
         let worker = start_worker(&config.clone(), async move {
@@ -1871,12 +2170,7 @@ pub unsafe extern "C" fn xhys_engine_start_shared(
         {
             return Err("invalid native shared engine configuration".into());
         }
-        let fd = unsafe { libc::fcntl(udp_fd, libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let udp = unsafe { UdpSocket::from_raw_fd(fd) };
-        udp.set_nonblocking(true)?;
+        let udp = network_socket(&config, udp_fd)?;
         let bridge = shared::Bridge::new()?;
         let owner = bridge.clone();
         let worker = start_worker(&config.clone(), async move {
@@ -1943,6 +2237,24 @@ pub unsafe extern "C" fn xhys_engine_join(engine: *mut c_void) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn network_socket_validates_packet_bridge_descriptor_type_and_family() {
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (packet, _) = UnixDatagram::pair().unwrap();
+        let (stream, _) = UnixStream::pair().unwrap();
+        let direct = Config::default();
+        let bridge = Config {
+            packet_bridge: true,
+            ..Config::default()
+        };
+        assert!(network_socket(&direct, udp.as_raw_fd()).is_ok());
+        assert!(network_socket(&bridge, packet.as_raw_fd()).is_ok());
+        assert!(network_socket(&bridge, udp.as_raw_fd()).is_err());
+        assert!(network_socket(&direct, packet.as_raw_fd()).is_err());
+        assert!(network_socket(&bridge, stream.as_raw_fd()).is_err());
+        assert!(network_socket(&bridge, -1).is_err());
+    }
+
     fn capacity_bus() -> Bus {
         let config = Config {
             server: true,
@@ -1958,11 +2270,44 @@ mod tests {
             next: AtomicU64::new(1),
             max_flows: config.flow_limit(),
             flow_window: config.flow_window(),
+            udp_credit_dropped: AtomicU64::new(0),
             capacity: Some(ServerCapacity::new(&config)),
             send_budget: Some(Arc::new(Semaphore::new(8))),
             process_send_budget: None,
             pending_auth: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn unread_udp_flow_counts_credit_drops_without_blocking_other_flows() {
+        let mut bus = capacity_bus();
+        let (events, mut receiver) = mpsc::channel(1);
+        bus.events = events;
+        let (_, blocked) = bus.register(1, 1).await.unwrap();
+        let (_, readable) = bus.register(2, 1).await.unwrap();
+        let window = blocked.available_permits();
+        blocked.acquire_many(window as u32).await.unwrap().forget();
+        bus.udp_payload(Frame::new(DATAGRAM, 1, b"dropped".as_slice()))
+            .await
+            .unwrap();
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
+        assert!(receiver.try_recv().is_err());
+        bus.udp_payload(Frame::new(DATAGRAM, 2, b"delivered".as_slice()))
+            .await
+            .unwrap();
+        let frame = receiver.try_recv().unwrap();
+        assert_eq!(frame.id, 2);
+        assert_eq!(&frame.data[..], b"delivered");
+        assert_eq!(readable.available_permits(), window - 1);
+        assert_eq!(blocked.available_permits(), 0);
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
+        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])))
+            .await;
+        bus.udp_payload(Frame::new(DATAGRAM, 1, b"resumed".as_slice()))
+            .await
+            .unwrap();
+        assert_eq!(&receiver.try_recv().unwrap().data[..], b"resumed");
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -2054,13 +2399,15 @@ mod tests {
         let mut bus = capacity_bus();
         let bridge = shared::Bridge::new().unwrap();
         bus.shared = Some(bridge.clone());
-        let _commands = bus.register(1, 1).await.unwrap();
+        let (_commands, receive_credit) = bus.register(1, 1).await.unwrap();
         let chunks = [
             Bytes::from(vec![0xa7; 10000]),
             Bytes::from(vec![0x71; 40000]),
         ];
         assert_eq!(
-            bus.payload_chunks(1, &chunks, SERVER_CHUNK).await.unwrap(),
+            bus.payload_chunks(1, &receive_credit, &chunks, SERVER_CHUNK)
+                .await
+                .unwrap(),
             50000
         );
         let mut received = Vec::new();
@@ -2072,6 +2419,44 @@ mod tests {
         }
         assert_eq!(received, [chunks[0].as_ref(), chunks[1].as_ref()].concat());
         assert!(bridge.pop(false).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_flow_credit_wakes_on_close_and_is_not_reused() {
+        let mut bus = capacity_bus();
+        let bridge = shared::Bridge::new().unwrap();
+        bus.shared = Some(bridge.clone());
+        let (_commands, credit) = bus.register(1, 1).await.unwrap();
+        for _ in 0..bus.flow_window {
+            bus.payload_bytes(1, &credit, b"data").await.unwrap();
+            assert_eq!(bridge.pop(false).unwrap().unwrap().2.as_ref(), b"data");
+        }
+        let pending = bus.payload_bytes(1, &credit, b"blocked");
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        bus.route(Frame::new(CLOSE, 1, Bytes::new())).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut pending)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        let (_replacement_commands, replacement_credit) = bus.register(1, 2).await.unwrap();
+        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])))
+            .await;
+        assert!(bus.payload_bytes(1, &credit, b"stale").await.is_err());
+        assert!(bridge.pop(false).unwrap().is_none());
+        bus.payload_bytes(1, &replacement_credit, b"replacement")
+            .await
+            .unwrap();
+        assert_eq!(
+            bridge.pop(false).unwrap().unwrap().2.as_ref(),
+            b"replacement"
+        );
     }
 
     #[test]
@@ -2189,6 +2574,7 @@ mod tests {
             next: AtomicU64::new(1),
             max_flows: 128,
             flow_window: 16,
+            udp_credit_dropped: AtomicU64::new(0),
             capacity: None,
             send_budget: None,
             process_send_budget: None,

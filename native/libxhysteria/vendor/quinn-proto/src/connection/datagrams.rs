@@ -116,6 +116,7 @@ impl Datagrams<'_> {
 
 #[derive(Default)]
 pub(super) struct DatagramState {
+    pub(super) stats: super::stats::DatagramStats,
     pub(super) incoming: DatagramBuffer,
     pub(super) outgoing: DatagramBuffer,
     pub(super) send_blocked: bool,
@@ -143,9 +144,11 @@ impl DatagramState {
         }
 
         let was_empty = self.incoming.is_empty();
+        self.stats.received += 1;
         while self.incoming.memory_used() + size_with_overhead > window {
             debug!("dropping stale datagram");
             self.recv();
+            self.stats.receive_dropped += 1;
         }
 
         self.incoming.push_back(datagram);
@@ -158,6 +161,7 @@ impl DatagramState {
                 break;
             };
             trace!(len = prev.data.len(), "dropping outgoing datagram");
+            self.stats.send_dropped += 1;
         }
     }
 
@@ -191,6 +195,7 @@ impl DatagramState {
                     max_payload
                 );
                 self.outgoing.payload_bytes -= datagram.data.len();
+                self.stats.send_dropped_mtu += 1;
                 dropped_any = true;
             }
             result
@@ -281,6 +286,7 @@ mod tests {
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 2);
         assert_eq!(state.outgoing.payload_bytes, 2);
+        assert_eq!(state.stats.send_dropped, 1);
     }
 
     #[test]
@@ -333,6 +339,29 @@ mod tests {
         assert_eq!(state.outgoing.queue.len(), 1);
         assert_eq!(state.outgoing.queue[0].data.len(), 10);
         assert_eq!(state.outgoing.payload_bytes, 10);
+        assert_eq!(state.stats.send_dropped_mtu, 1);
+    }
+
+    #[test]
+    fn counts_receive_queue_drops_separately_from_network_loss() {
+        let mut state = DatagramState::default();
+        let window = Some(size_of::<Datagram>() + 4);
+        for _ in 0..3 {
+            state
+                .received(
+                    Datagram {
+                        data: Bytes::from_static(b"test"),
+                    },
+                    &window,
+                )
+                .unwrap();
+        }
+        assert_eq!(state.stats.received, 3);
+        assert_eq!(state.stats.receive_dropped, 2);
+        assert_eq!(state.stats.send_dropped, 0);
+        assert_eq!(state.incoming.queue.len(), 1);
+        state.recv();
+        assert_eq!(state.stats.receive_dropped, 2);
     }
 }
 

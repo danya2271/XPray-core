@@ -62,7 +62,7 @@ impl BandwidthEstimation {
         };
 
         let bandwidth = send_rate.min(ack_rate);
-        if !app_limited && self.max_filter.get() < bandwidth {
+        if !app_limited || self.max_filter.get() < bandwidth {
             self.max_filter.update_max(round, bandwidth);
         }
     }
@@ -97,5 +97,52 @@ impl Display for BandwidthEstimation {
             "{:.3} MB/s",
             self.get_estimate() as f32 / (1024 * 1024) as f32
         )
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn bandwidth_decrease_expires_old_peak() {
+        let mut estimator = BandwidthEstimation::default();
+        let mut now = Instant::now();
+        for round in 0..=30 {
+            let interval = if round == 0 {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(10)
+            };
+            estimator.on_sent(now, 1200);
+            now += interval;
+            estimator.on_sent(now, 1200);
+            estimator.on_ack(now, now - interval, 1200, round, false);
+            now += interval;
+            estimator.on_ack(now, now - interval, 1200, round, false);
+            estimator.end_acks(round, false);
+        }
+        assert_eq!(estimator.get_estimate(), 120_000);
+    }
+
+    #[test]
+    fn app_limited_samples_do_not_expire_peak_but_can_raise_it() {
+        let mut estimator = BandwidthEstimation::default();
+        let mut now = Instant::now();
+        estimator.max_filter.update_max(0, 1_200_000);
+        for round in 1..=30 {
+            estimator.on_sent(now, 1200);
+            now += Duration::from_millis(10);
+            estimator.on_ack(now, now - Duration::from_millis(10), 1200, round, true);
+            estimator.end_acks(round, true);
+        }
+        assert_eq!(estimator.get_estimate(), 1_200_000);
+        for round in 31..=32 {
+            estimator.on_sent(now, 1200);
+            now += Duration::from_micros(100);
+            estimator.on_ack(now, now - Duration::from_micros(100), 1200, round, true);
+            estimator.end_acks(round, true);
+        }
+        assert_eq!(estimator.get_estimate(), 12_000_000);
     }
 }

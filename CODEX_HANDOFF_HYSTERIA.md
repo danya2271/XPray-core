@@ -11,10 +11,11 @@ Go, including memory, throughput, CPU and latency. The requested 2.5x improvemen
 in every metric is not universally achieved. The user authorized commits.
 Do not push or modify remote VPSs.
 
-The user-owned change in `transport/internet/splithttp/client.go` is unrelated:
-preserve it and exclude it from commits. Neighboring DanVlessBot and bypclient
-worktrees also contain unrelated changes. Generated binaries and measurements
-belong in ignored `build_assets` or `/tmp`.
+The previously user-owned `transport/internet/splithttp/client.go` change was
+committed separately as `3cc7b38a` at the user's request. Neighboring DanVlessBot
+and bypclient worktrees contain unrelated changes. kettuRay has a user-owned
+`cores/slipstream-client` change. Preserve these neighboring changes. Generated
+binaries and measurements belong in ignored `build_assets` or `/tmp`.
 
 ## Production Evidence
 
@@ -283,6 +284,290 @@ TUN. Windows/insecure/unsupported settings and chained exits keep compatibility
 backends. Actual local TLS/Salamander HTTP traffic verifies Rust startup without
 Go fallback. Core race tests and the Linux Wails app build pass. Preserve its
 user-owned `cores/slipstream-client` change outside commits.
+
+## Latest Flow-Credit Follow-up
+
+TCP tasks retain their receive-credit semaphore from registration, removing
+the flow-map mutex, ID lookup and per-frame `Arc` clone/drop on publication.
+Removing a flow still closes its semaphore. A regression exhausts credits,
+closes/re-registers a flow ID and verifies the old handle cannot publish.
+UDP lookup, shared layout 5, engine ABI 4 and memory budgets are unchanged.
+
+Go `Conn.waitWrite` tries ready credits and direct shared publication before
+creating a deadline timer. Errors, expired deadlines and engine shutdown are
+checked first; blocked operations keep their deadline-change/close select and
+queued-frame accounting. Tests verify zero allocations on the ready-credit and
+direct-publication paths with a future deadline, and failed ready operations
+do not consume credits.
+
+`build_assets/native-flow-20261117` contains source/binary hashes, implementation
+patch, the runner, raw data and summaries. Three fresh two-second samples per
+before/current/Go routing cell rotate backend order on CPU 14, GOMAXPROCS=1,
+Salamander, 32 MiB/s paced load, without simultaneous builds. Before uses the
+`ed2b49a0` allocation-follow-up binary. Current paced p99 is 1009.7us versus
+1048.0us before (3.7% lower), Go 1114.7us, at approximately equal delivered
+31.94 MiB/s. Idle TCP p99 is unchanged: 230.6 -> 231.2us, Go 145.5us.
+Transfer/upload/download rates are 116.71/155.13/151.52 MB/s versus before
+117.95/154.97/150.30 and Go 91.46/87.24/89.20. Transfer CPU falls about 1%.
+No universal or statistically established gain follows from three short runs.
+
+Three fresh native 500-user samples per version pass; before/current means:
+101.09/100.52 MiB/s, entry cgroup peak 262.7/264.4 MiB, post-close RSS
+278.1/280.5 MiB, CPU 6.873/6.799 seconds, heartbeat p99 1684.9/1744.5us.
+There is no demonstrated capacity-memory or capacity-tail improvement.
+One fresh Go sample gives 26.56 MiB/s, 308.4 MiB cgroup peak, 268.4 MiB
+post-close RSS, 16.578 CPU seconds, heartbeat p99 3891.2us. The native/Go
+rate ratio is 3.78x in this fixture; upstream session counts differ as usual.
+
+Passed: 45 Rust engine tests with and without allocation profiling, all-target
+Clippy with warnings denied, Go race tests for xhysteria/hysteria/full interop
+(capacity run separately), packaged NodeX config/API/traffic, native/Go interop,
+both bridges, deadlines, short-flow capacity recovery, hopping, fragmented UDP,
+and the synthetic 100ms RTT transfer. Linux amd64 and Android arm64/API 26 CLI
+artifacts are rebuilt. kettuRay was not changed or rebuilt during this stage.
+
+## Packet-Loss Follow-Up
+
+Packet-loss follow-up on 2026-11-17: see `native/libxhysteria/PACKET_LOSS.md`.
+Added per-native-QUIC send/loss/MTU and DATAGRAM queue eviction diagnostics,
+Go loss deltas, a read-only Linux per-process UDP sampler, and native/Go saturated
+single-leg/cascade UDP sequence tests. Fixed a confirmed native BBR max-filter
+expiration bug; a 10x bandwidth decrease previously retained the peak for
+30 rounds. Regression tests cover falling rates and application-limited samples.
+Current desktop Xray had zero kernel UDP/socket drops over 60 seconds, with no
+QUIC diagnostic environment enabled. Local native load delivered 8000/8000 UDP
+messages; Go lost 0.8–3.35% in the four matching saturated single-core scenarios.
+Twelve native 10s samples showed 4,288,480 sent QUIC packets and no declared loss
+or observed queue/MTU drops. This is loopback evidence, not VPS/WAN verification.
+Artifacts: `build_assets/packet-loss-20261117/`. No production VPN/VPS restart,
+sysctl changes, or deployment occurred. Compatibility/masking request remains
+pending beyond the address-hopping/string-HTTP stage described below.
+All 181 vendored Quinn tests, 45 engine tests, all-target Clippy, Go race/short
+interop, Go-only Hysteria, and eight loaded/four idle loss scenarios passed.
+Linux diagnostic Xray rebuilt; Android not rebuilt in this stage. A subsequent
+unmixed 30-second live sample also showed zero kernel/Xray/physical-NIC drops.
+
+## Native Masking Follow-Up
+
+Native `udphop` now supports `remoteIPs` CIDRs, IP-only hopping with the original
+port, combined IP/port selection, and `remoteOnce` (`perConnRemote`). Once-only
+selection is per QUIC session and has a lock-free fixed destination. Combined
+Remote/RemoteOnce flags preserve interval hopping like Go. Go normalizes CIDRs
+and validates addresses/ports/timers; Rust independently validates serialized
+prefixes and IPv4 socket compatibility. Logical QUIC peers and protected local
+sockets remain unchanged, including GRO/GSO metadata and delayed replies.
+Ten Rust hopping tests cover prefix validation, mapped/IPv6 families, once-only
+selection, stable sockets and delayed GRO replies. Wire tests cover Go/native
+server × Salamander combinations, with engine-count assertions preventing
+fallback false positives. The combined IP/port fixture must bind the full
+Cartesian product: native correctly samples IP and port independently; the
+first two-front diagonal-only fixture caused expected startup/transfer failures.
+The corrected twenty-case address suite passed with Go race enabled, including
+four IPv6 wire cases. The four original remote-port cases also passed.
+
+Native HTTP masquerading now supports `string` and a Go-compatible default
+404 response, with status/headers/body, HEAD, bodyless 204/304 and Date handling.
+Prepared response bodies are shared across requests/connections, not copied.
+The active HTTP request-task count is bounded, preserving ten-second request
+and unauthenticated-session limits. Invalid/header-injection, connection-specific
+HTTP/1 headers, trailers, mismatched Content-Length and provisional 1xx settings
+fail before startup. Twenty-four HTTP interop scenarios compare
+Go/native × Salamander × six cover-response types, including 640 KiB bodies,
+invalid/valid auth and authenticated TCP/fragmented UDP.
+`httpdate` 1.0.3 is the only new dependency; other locked versions are preserved.
+The CGO configuration remains capped at 1 MiB of serialized JSON, including
+the cover body; this stage does not remove that existing startup bound.
+Validation: all 54 native engine tests, all-target Clippy with warnings denied,
+the full Go race/short hysteria+xhysteria+interop suite, focused HTTP race tests,
+and Go-only Hysteria tests passed. Linux amd64 and Android arm64/API 26 binaries
+are at `build_assets/xray-native-masking` and
+`build_assets/xray-native-masking-android-arm64`. No runtime/service restart,
+deployment, sibling-repo modification, or commit occurred in this stage.
+
+Remaining masking work after the streaming stage below: arbitrary UDP/TCP finalmask
+adapters, local socket/IP hopping, custom/chained packet dialers, Chrome Parrot,
+and advanced TLS/ECH. bypclient's separate Kotlin gate still forces Go for new
+IP/once modes; it and kettuRay were not modified or deployed in this stage.
+
+## Streaming HTTP Cover Handlers
+
+Native listeners now support HTTP `file` and `proxy` masquerading without
+falling back to Go QUIC. Rust owns QUIC/H3/auth and forwards only cover requests
+over existing bounded flows to the same Go FileServer/ReverseProxy handlers as
+the Go backend. Shared/socket bridges use optional frame kinds 20/21/22 for
+request/response metadata and trailers; rebuild Rust and Go together. The public
+ABI remains version 4, shared layout 5. There are no new dependencies this stage.
+Default 404/string retain their Rust fast path without a Go cover flow or
+cancellation-monitor allocation.
+
+Bodies stream in 16 KiB chunks with four directional credits, native flow
+admission, and engine/process send budgets; proxy copies use the existing 32 KiB
+pool. Large files/uploads are not serialized into the 1 MiB startup JSON limit.
+H3 request field sections and native upstream response headers are limited to
+32 KiB; bridge metadata is bounded at 69,632 bytes. These are local buffer bounds,
+not a whole-process RSS guarantee. Native listeners clone/own proxy transports
+and close idle upstream connections on shutdown.
+Content-Length is independently validated for both bridge directions, including
+conflicts, overflow, and short/long bodies; early responses and HEAD/204/304 do
+not require reading or sending disallowed bodies.
+
+The bridge preserves HEAD, Range, conditional file requests, redirects/indexes,
+path/query, host/X-Forwarded settings, repeated response headers, request/response
+trailers, informational responses, HTTP/HTTPS/Unix upstreams, and explicit
+HTTPS-insecure settings. Auth still returns 233 without invoking cover handlers.
+Request/unauthenticated-session deadlines remain ten seconds. Request cancellation
+now watches Quinn's send-side stopped future and promptly cancels Go upstream
+work even after upload EOF; download completion does not wait for unread uploads.
+Invalid bridge requests close immediately instead of holding a flow until timeout.
+The pinned Go quic-go server replaces req.Trailer at EOF, losing request trailers
+when ReverseProxy copies the announced map. Native mutates that map in place;
+shared handler Rewrite preserves its live map. The upstream Go bug is documented,
+not patched in the module cache.
+
+Validation: 57 Rust engine tests, all-target Clippy with warnings denied,
+focused bridge Go race tests repeated ten times, and all 30 streaming HTTP
+wire scenarios passed. File cases cover Go/native × Salamander × shared/socket;
+proxy cases cover Go/native × HTTP/HTTPS/Unix × forwarding settings. Lifecycle
+cases cover request trailers, informational responses, cancel, early response,
+default TLS verification, and excessive upstream response headers. Approximately
+2 MiB files and full-duplex uploads
+exercise bodies larger than the startup JSON limit. Engine-count assertions
+prevent native fallback false positives. The full Go race/short suite across
+hysteria/xhysteria/interop passed; the final native transport adjustment is also
+checked by the focused HTTP suite. Existing 404/string interop remains covered.
+Linux amd64 and Android arm64/API 26 binaries are rebuilt at the masking paths
+above. No deployment, runtime/service restart, sibling edit, or commit occurs.
+
+Remaining after this HTTP stage: HTTP protocol upgrades/WebSocket tunneling,
+UDP/TCP masks, local hopping, custom/chained PacketConn, Chrome Parrot, advanced TLS/ECH,
+and sibling client gates. No new throughput/latency factor is established here.
+
+## UDP Mask Packet Adapter — November 17, 2026
+
+Additional UDP finalmasks and client-only local socket hopping now use the existing
+Go PacketConn wrappers while native Rust continues QUIC/H3/authentication. Plain
+UDP, single Salamander and supported remote hopping retain direct Rust I/O.
+Packet transport uses a separate Unix SOCK_DGRAM pair with 24-byte address/length
+metadata, reusable 64 KiB buffers and 64 KiB requested kernel socket buffers.
+The engine ABI/shared layout stay unchanged; optional JSON packet_bridge and
+packet_local fields require matching Go/Rust builds. Network descriptor family
+and type are validated before wrapping them as UDP or Unix datagrams.
+
+Fixed native-client startup on dual-stack wildcard sockets: Quinn maps outgoing
+IPv4 addresses to IPv6, so the adapter now maps incoming peers equivalently and
+omits unknown destination-IP metadata. Prior client transfer tests succeeded only
+by falling back to Go; current mixed-backend tests explicitly assert native
+engine counts, preventing that false-positive. Client hostname peers are resolved
+and normalized before native startup. IPv6 zone addresses are rejected explicitly.
+
+Transient kernel UDP send errors and short/suppressed mask writes are counted,
+not fatal; permanent errors and closure stop the engine. Optional ten-second
+diagnostics expose packet-bridge send drops. Startup failure, external socket
+closure and concurrent Engine.Close release relays/sockets/native handles.
+There are no per-QUIC-packet CGO callbacks or unbounded user-space queues.
+
+Initial validation: 61 Rust tests and all-target Clippy; 105 mixed Go/native mask
+scenarios with -race (15 mask configurations times seven backend/bridge combinations),
+including TCP and fragmented UDP; 12 local hopping scenarios against Go/native
+servers on shared/socket bridges, covering local-only, local+remote IP/port and
+local+remoteOnce with stacked header/Salamander. Flow continuity and observed
+source-port replacement are asserted without reconnecting QUIC engines. The mask
+matrix additionally repeats twice with pooling disabled and per-TCP/UDP native
+engine-count assertions, so neither flow can hide a Go fallback.
+Relay tests repeat under -race and include maximum IPv4 UDP datagrams, ENOBUFS,
+bad local/peer/TLS config, context cancellation, and concurrent shutdown.
+
+This compatibility path adds copies/syscalls and retains existing mask allocation
+and delay behavior. GSO/PMTUD are disabled and QUIC MTU is fixed at 1200 before
+mask expansion. It is not a guarantee against outer fragmentation or network
+loss, and no 2.5x or other new performance ratio is claimed. Android VPN handover,
+privileged/external-service UDP masks, TCP finalmask, custom/chained packet
+dialers, Chrome Parrot, advanced TLS/ECH and sibling gates remain unvalidated or
+unsupported. Linux amd64 and Android arm64/API 26 masking binaries are rebuilt at
+the paths above; HTTP masquerade and native transfer/concurrency regressions also
+pass under -race. No deployment, runtime restart, sibling edit or commit occurs.
+
+## Hybrid Packet Overhead and Loss — November 17, 2026
+
+The subsequent adapter stage removes Rust send/receive scratch buffers and
+mutexes. `sendmsg` sends a stack header plus Quinn payload; `recvmsg` receives
+directly into Quinn storage, drops malformed/truncated IPC frames and preserves
+Tokio readiness. This saves roughly 128 KiB per packet-backed engine. The Go
+32-entry direct-mapped peer cache owns stable address copies (zero allocations
+on hits; eviction does not mutate previously returned pointers).
+
+Up to eight same-peer QUIC datagrams share one outgoing IPC message, with no
+batching wait timer. Go splits them into separate mask writes, including a short
+last segment; a transient failure does not discard later segments. This is not
+network UDP GSO. `disableGSO=true` opts out, while Brutal remains individually
+paced. Header v1 stays for single packets; v2 uses the existing 24 bytes with
+stride-u16/length-u16 fields. Only Rust→Go sends batches. Optional JSON
+`packet_batch` joins `packet_bridge`/`packet_local`; Go and Rust must be rebuilt
+together although engine/shared ABI is unchanged. PMTUD remains off at inner
+MTU 1200; outer masks can still exceed path MTU.
+
+The generic path had missed the direct Rust base-socket buffer setup. New
+`FinalMask.WithPacketConnSetup` returns a copy, runs before masks and on each
+replacement/local hop, and leaves the original untouched. Native config uses
+`TunePacketSocket`: requested server RX/TX 4 MiB/1 MiB, client 1 MiB/256 KiB,
+matching direct Rust. Linux doubles/caps requests; diagnostics log actual sizes
+and errors. No sysctls are changed. Busy kernel queues can retain more memory;
+this is not a peak-RSS reduction or whole-node OOM protection. Private sockets
+constructed outside FinalMask callbacks are not covered automatically.
+
+The saturated header-mask loss matrix after setup: native one-leg 0% for 256
+and 4096 bytes; two-leg 0.35%/0%, with zero observed kernel drops. The two-leg
+256-byte repeats miss 0.40%/0.15%; one later diagnostic run misses 0%. Go rows
+miss 0.80–2.90% and have 3,464–17,699 process-owned UDP socket drops. The kernel
+sampler includes persistent echo sockets, excludes closed/replaced sockets,
+and is not per-QUIC loss attribution. Remaining native missing replies are
+not retrospectively localized. An engine-level `event=udp_bridge` counter now attributes
+exhausted receive-credit drops separately from QUIC DATAGRAM and socket losses.
+The latest diagnostic run has zero samples in every counter, not proof of
+loss-free production behavior.
+
+The next repeated diagnostic matrix localizes 12/2000 one-leg and 1/2000
+two-leg 256-byte missing replies to exactly matching server UDP credit drops.
+Go now flushes outstanding receive credits when a UDP per-flow queue drains:
+sparse traffic no longer waits for the half-window batch, queued UDP bursts
+still batch, and TCP batching/windows stay unchanged. No buffers are enlarged.
+An unread Rust flow still drops UDP explicitly and increments the counter.
+After this fix, all four native loss rows plus two two-leg/256-byte repeats
+deliver 2000/2000 with zero kernel and sampled credit drops; saturated TCP
+background is 101.21/101.18 MiB/s one-leg and 49.93/49.51 two-leg. This is not
+a production zero-loss guarantee.
+
+Latest hybrid transfer median: native 100.85 MB/s versus Go 86.50 MB/s (~1.17×);
+preceding socket-tuned runs showed ~1.14×. Go allocations 12,128 B/op and 394
+allocs/op versus 27,262/724. Native CPU remains 1.978 ms/op versus Go 1.404.
+Latest idle TCP p50/p99 native 137.9/264.3 µs versus Go 87.7/131.3; UDP
+130.4/253.1 versus Go 86.6/144.9 µs. No idle-latency win versus Go or universal
+2.5× is demonstrated. The unmodified Go baseline also improves across samples;
+do not attribute all timing differences to the credit fix. Runs use
+GOMAXPROCS=1, no affinity, three one-second repetitions; do not combine them
+with direct-path tables. Go allocation counts exclude Rust and kernel memory.
+
+Current Rust unit tests: 64 (including IPC batching/truncation and credit-drop
+isolation). The mask matrix now has 112 combinations (the prior 105 plus seven
+`disableGSO` cases), alongside 12 local-hopping cases; both pass under `-race`.
+The wider interop run passes native/Go traffic, Brutal, remote IP/port/once
+hopping, HTTP file/proxy/string cover handlers and lifecycle, pool/capacity
+recovery, dynamic users, short-stream credit recovery, UDP idle expiry and
+100 ms RTT transfer. It takes 282 seconds; the initial 180-second runner limit
+expired during remote hopping, and the full rerun passes with a 600-second
+limit. Rust all-target Clippy and format checks pass, as do all native transport
+and finalmask package race tests. The Go-only run passes for hysteria and
+finalmask packages; xhysteria is intentionally build-tagged out without native
+CGO and must not be listed as a Go-only test package. After the UDP credit fix,
+the 112-mask/12-local-hop matrix, traffic/concurrency, Brutal, cascade, cover
+handlers/lifecycle, pooling and UDP expiry pass again under -race (110 seconds).
+Focused metadata/credit/socket-policy tests repeat five times under -race.
+Linux and Android binaries include the final credit fix. Base-socket setup tests
+verify before-mask ordering, repeat dials/listens, failed opens, unchanged
+original callbacks and actual buffer policy under host clamping. Details/raw
+benchmarks: `PERFORMANCE.md`, `PACKET_LOSS.md`, ignored
+`build_assets/hybrid-packet-20261117/`. Linux/Android masking binaries at the
+existing paths are rebuilt together, not deployed. No commit or sibling edits.
 
 ## Remaining Limits
 

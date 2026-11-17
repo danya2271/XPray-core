@@ -3,13 +3,9 @@ package hysteria
 import (
 	"context"
 	"crypto/rand"
-	gotls "crypto/tls"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -218,72 +214,9 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		return nil, errors.New("validator is nil")
 	}
 
-	var masqHandler http.Handler
-	switch strings.ToLower(config.MasqType) {
-	case "", "404":
-		masqHandler = http.NotFoundHandler()
-	case "file":
-		masqHandler = http.FileServer(http.Dir(config.MasqFile))
-	case "proxy":
-		u, err := url.Parse(config.MasqUrl)
-		if err != nil {
-			return nil, err
-		}
-		transport := http.DefaultTransport.(*http.Transport)
-		switch u.Scheme {
-		case "http", "https":
-			if config.MasqUrlInsecure {
-				transport = transport.Clone()
-				if transport.TLSClientConfig == nil {
-					transport.TLSClientConfig = &gotls.Config{}
-				}
-				transport.TLSClientConfig.InsecureSkipVerify = true
-			}
-		case "", "unix":
-			path := u.Path
-			u = &url.URL{Scheme: "http", Host: "localhost"}
-			dialer := &net.Dialer{Timeout: 30 * time.Second}
-			transport = transport.Clone()
-			transport.Proxy = nil
-			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "unix", path)
-			}
-			transport.MaxIdleConns = masqueradeProxyMaxIdleConnections
-			transport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
-		default:
-			return nil, errors.New("unknown scheme")
-		}
-		masqHandler = &httputil.ReverseProxy{
-			Rewrite: func(r *httputil.ProxyRequest) {
-				r.SetURL(u)
-				if !config.MasqUrlRewriteHost {
-					r.Out.Host = r.In.Host
-				}
-				if config.MasqUrlXForwarded {
-					r.SetXForwarded()
-				}
-			},
-			Transport:  transport,
-			BufferPool: newMasqueradeProxyBufferPool(),
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				errors.LogErrorInner(context.Background(), err, "HTTP reverse proxy error")
-				w.WriteHeader(http.StatusBadGateway)
-			},
-		}
-	case "string":
-		masqHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			for k, v := range config.MasqStringHeaders {
-				w.Header().Set(k, v)
-			}
-			if config.MasqStringStatusCode != 0 {
-				w.WriteHeader(int(config.MasqStringStatusCode))
-			} else {
-				w.WriteHeader(http.StatusOK)
-			}
-			_, _ = w.Write([]byte(config.MasqString))
-		})
-	default:
-		return nil, errors.New("unknown masq type")
+	masqHandler, err := newMasqueradeHandler(config)
+	if err != nil {
+		return nil, err
 	}
 
 	quicParams := streamSettings.QuicParams
@@ -327,7 +260,6 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	var pktConn net.PacketConn
-	var err error
 	if streamSettings.FinalMask != nil {
 		pktConn, err = streamSettings.FinalMask.ListenPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)})
 	} else {

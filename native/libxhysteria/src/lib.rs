@@ -18,6 +18,10 @@ pub mod engine;
 mod h3_transport;
 #[cfg(feature = "engine")]
 pub mod hopping;
+#[cfg(feature = "engine")]
+mod masquerade;
+#[cfg(all(feature = "engine", unix))]
+mod packet_socket;
 #[cfg(all(feature = "engine", any(target_os = "linux", target_os = "android")))]
 mod shared;
 #[cfg(feature = "probe")]

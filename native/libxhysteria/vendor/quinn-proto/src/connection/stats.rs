@@ -159,10 +159,22 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub struct DatagramStats {
+    pub received: u64,
+    pub receive_dropped: u64,
+    pub send_dropped: u64,
+    pub send_dropped_mtu: u64,
+}
+
 /// Connection statistics
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
 pub struct ConnectionStats {
+    #[allow(missing_docs)]
+    pub datagrams: DatagramStats,
     /// Statistics about UDP datagrams transmitted on a connection
     pub udp_tx: UdpStats,
     /// Statistics about UDP datagrams received on a connection

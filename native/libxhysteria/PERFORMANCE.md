@@ -1,9 +1,16 @@
 # Native Hysteria performance checks
 
+Packet-loss sampling, the native BBR bandwidth-peak expiration fix, and the
+read-only production diagnostic procedure are documented separately in
+[PACKET_LOSS.md](PACKET_LOSS.md). Its saturated loopback results do not establish
+packet-loss rates on deployed servers or a before/after WAN improvement.
+
 The initial sections are historical measurements from earlier implementations.
 The November 17 delivery, latency follow-up and allocation follow-up sections
 describe successive implementations and their comparison boundaries. The
-allocation follow-up is the latest state; do not combine different stages.
+allocation follow-up describes the latest direct-path comparison. The hybrid
+UDP-mask adapter follow-up at the end measures a different path; do not combine
+different stages or compare its figures with the direct-path tables.
 
 Measurements were taken on November 15, 2026 on Linux amd64, an Intel Xeon
 E5-2698 v3 at 2.30 GHz, with Go 1.27.1-X:nodwarf5 and Rust 1.99.0. The host
@@ -722,7 +729,7 @@ slot reuse. Full native interop and the NodeX-generated configuration pass.
 Linux amd64 and Android arm64/API 26 CLI builds succeed. The vendored BBR code
 is unchanged from its 314-test validation. No remote or device test is included.
 
-## November 17, 2026: allocation follow-up (latest)
+## November 17, 2026: allocation follow-up
 
 CPU and allocation profiles of the latency-follow-up binary are recorded in
 `build_assets/native-max-20261117`. Native-inclusive `perf` sampling of a
@@ -823,6 +830,86 @@ recovery/repeated reads/EOF, both bridges and the packaged NodeX configuration.
 Linux amd64 and Android arm64/API 26 CLI builds succeed. Rust, shared ABI and
 vendored Quinn are unchanged from the latency follow-up.
 
+## November 17, 2026: flow-credit fast paths (latest)
+
+TCP forwarding tasks retain the receive-credit semaphore returned at flow
+registration. Publishing each TCP frame no longer locks the flow map, hashes
+its ID, or clones/drops the semaphore `Arc`. Flow removal still closes that
+semaphore, waking blocked publishers. A regression exhausts credits, closes
+the flow, registers its ID again, and verifies that the retained old handle
+cannot publish into the replacement flow. UDP retains its existing lookup.
+Shared storage layout 5, engine ABI 4 and byte budgets are unchanged.
+
+Go `Conn.waitWrite` checks connection errors, the current deadline and engine
+shutdown before attempting an immediate credit receive. It also attempts direct
+shared publication before creating a deadline timer. Blocked operations retain
+the existing selectable close/deadline-change path and queued-frame accounting.
+Regressions cover ready credits after shutdown/expiry and zero allocations for
+ready credits and direct shared writes with a future deadline.
+
+### Paired routing benchmarks
+
+Raw samples, binary hashes, the implementation patch, runner and summaries are
+in `build_assets/native-flow-20261117`. Before is the allocation-follow-up binary
+from `ed2b49a0`; current includes only these two optimizations. Go uses the
+current common-buffer implementation. Three fresh two-second processes per
+cell rotate before/current/Go order, all threads/endpoints pinned to logical
+CPU 14, `GOMAXPROCS=1`, Salamander and 32 MiB/s offered paced load. No build
+runs concurrently with the routing matrix. Values are arithmetic means.
+Transfer counts 64 KiB each way; Go allocations exclude Rust and shared arenas.
+
+| Metric | Native before | Native current | Go current |
+| --- | ---: | ---: | ---: |
+| Transfer MB/s | 117.95 | 116.71 | 91.46 |
+| Upload MB/s | 154.97 | 155.13 | 87.24 |
+| Download MB/s | 150.30 | 151.52 | 89.20 |
+| Transfer CPU ms/op | 1.006 | 0.996 | 1.330 |
+| Transfer Go B/op | 4,292 | 4,285 | 27,167 |
+| Transfer Go allocs/op | 116.0 | 115.7 | 723.0 |
+| Idle TCP p50/p99 microseconds | 159.4 / 230.6 | 158.6 / 231.2 | 89.5 / 145.5 |
+| Idle UDP p50/p99 microseconds | 147.4 / 216.9 | 148.3 / 215.6 | 88.8 / 151.2 |
+| Paced TCP p99 microseconds | 1,048.0 | 1,009.7 | 1,114.7 |
+| Paced achieved background MiB/s | 31.94 | 31.94 | 31.95 |
+| Saturated TCP p99 microseconds | 4,720 | 4,633 | 7,297 |
+| Saturated achieved background MiB/s | 133.20 | 134.33 | 85.64 |
+
+Observed paced p99 decreases 3.7%, with all three current samples below the
+before samples. Idle latency is effectively unchanged and still worse than Go.
+Transfer rate decreases 1.1%, upload is unchanged, download increases 0.8%,
+and Transfer CPU work decreases 1.0%. These short samples do not establish
+statistical significance or a universal improvement. Native/current-Go
+Transfer/upload/download ratios are 1.28x/1.78x/1.70x; paced p99 is 9.4% lower
+at approximately equal delivered load. Saturated delivered loads differ.
+
+### Capacity check
+
+Three fresh native samples each before/current, in alternating pair order
+current/before, before/current, current/before; one fresh Go sample between
+the first and second pairs. Only the entry is in a 1 GiB/100%-CPU cgroup;
+generator/exit remain outside. The existing 500-user fixture opens 1000 QUIC
+sessions and 1000 TCP flows, eight cascade routes, sixteen native or eight Go
+upstreams, transfers 500 MiB duplex with a two-second reader delay, then checks
+twelve seconds of heartbeats. `GOMAXPROCS=1`, `GOMEMLIMIT=256MiB`, Salamander.
+Raw samples and `capacity-summary.json` are in the same artifact directory.
+
+| Metric | Native before mean | Native current mean | Go single sample |
+| --- | ---: | ---: | ---: |
+| Duplex MiB/s | 101.09 | 100.52 | 26.56 |
+| Idle entry RSS MiB | 143.0 | 143.7 | 180.3 |
+| Buffered entry RSS MiB | 240.3 | 237.1 | 268.8 |
+| Peak entry RSS MiB | 280.1 | 282.6 | 312.8 |
+| Peak entry cgroup MiB | 262.7 | 264.4 | 308.4 |
+| Entry RSS two seconds after close MiB | 278.1 | 280.5 | 268.4 |
+| Entry cgroup CPU seconds | 6.873 | 6.799 | 16.578 |
+| Heartbeat p50/p99 microseconds | 932.5 / 1,684.9 | 894.5 / 1,744.5 | 2,059.1 / 3,891.2 |
+
+All samples pass. Current versus before: duplex rate decreases 0.6%, cgroup
+peak increases 0.6%, CPU decreases 1.1%, heartbeat p99 increases 3.5%. This
+stage does not demonstrate a capacity-memory or capacity-tail improvement.
+Current native mean versus the one Go sample is 3.78x throughput with 14%
+lower cgroup peak and 59% lower CPU, but native retains more RSS after close.
+Different upstream counts and the limited samples prevent a universal factor.
+
 ### Desktop integration
 
 The sibling kettuRay commit `dde0370` builds and embeds native Rust Hysteria on
@@ -836,3 +923,83 @@ Go fallback. Its core race tests and Linux Wails build pass.
 No remote deployment, running application restart or Android-device change was
 performed. `XPRAY_SOURCE_DIR` can build a local Xray checkout without modifying
 its Git state; no unpublished revision is pinned as a remote build default.
+
+## Hybrid UDP-mask adapter follow-up — November 17, 2026
+
+This measures Salamander plus a WireGuard appearance header, which selects the
+Go PacketConn mask chain with native Rust QUIC rather than direct Rust UDP I/O.
+Both endpoints use the same backend; shared flow bridges and pool size one are
+selected. The harness asserts exactly two native engines to exclude fallback.
+Go 1.27.1-X:nodwarf5, Rust 1.99.0, release Rust, `GOMAXPROCS=1`, the same Xeon
+E5-2698 v3, three one-second repetitions, without CPU affinity. Other benchmark
+and load tests were not run concurrently. Values below are medians. Short runs
+and host scheduling variation limit the precision of before/after comparisons.
+
+Transfer is a 64 KiB bidirectional TCP echo, so MB/s counts both directions.
+`process-cpu-ns/op` includes Rust threads; `B/op` and `allocs/op` cover only Go
+allocations and cannot establish a total-process memory advantage.
+
+| Implementation | Transfer MB/s | Process CPU ms/op | Go bytes/op | Go allocations/op |
+|---|---:|---:|---:|---:|
+| Previous native adapter | 85.56 | 2.44 | 18,210 | 521 |
+| Scatter/cache native adapter | 84.31 | — | 12,180 | 395 |
+| Socket-tuned native adapter, before UDP credit flush | 92.63 | 2.146 | 12,084 | 391 |
+| Current Go mask path | 86.50 | 1.404 | 27,262 | 724 |
+| Current native adapter | 100.85 | 1.978 | 12,128 | 394 |
+
+Current native is approximately 1.17× Go throughput here, but consumes about
+41% more process CPU per exchange. The preceding socket-tuned run showed 1.14×,
+so no precise single multiplier should be extrapolated. Versus the previous
+native adapter the latest run shows about 18% higher throughput, 19% less CPU,
+33% fewer Go allocation bytes and 24% fewer Go allocations. CPU/throughput also
+improved in the unmodified Go baseline across runs, so these differences are
+not entirely attributable to the final credit change. This does not demonstrate
+the requested universal 2.5×.
+Rust scatter/gather also removes two 64 KiB scratch buffers per packet engine;
+this is a storage reduction, not a measured peak-RSS reduction. Cache hits
+measure zero allocations versus two allocations for uncached address decoding.
+
+| Implementation | Idle TCP ns/op | p50 µs | p95 µs | p99 µs |
+|---|---:|---:|---:|---:|
+| Current Go mask path | 91,820 | 87.7 | 111.5 | 131.3 |
+| Current native adapter | 147,132 | 137.9 | 202.2 | 264.3 |
+
+Native is still substantially slower than Go on this hybrid loopback path.
+The preceding socket-tuned native run measured 169,037 ns/op and 328.7 µs p99;
+the latest native result is lower, but the unmodified Go baseline also improved
+and the final change only affects UDP credits. These unpinned runs do not
+establish a causal TCP idle-latency improvement. IPC batching has no wait timer,
+but the two-runtime scheduling and extra socket crossings remain overheads.
+These measurements do not cover WAN/Android latency, loaded percentiles or
+CPU-affinity-normalized results.
+
+| Implementation | Idle UDP ns/op | p50 µs | p95 µs | p99 µs | Go bytes/op | Go allocations/op |
+|---|---:|---:|---:|---:|---:|---:|
+| Current Go mask path | 88,208 | 86.6 | 116.7 | 144.9 | 1,834 | 56 |
+| Current native adapter | 139,530 | 130.4 | 187.2 | 253.1 | 935 | 38 |
+
+This is the first adapter-specific UDP latency baseline; no same-harness
+before/after UDP latency comparison is established. Native uses fewer Go
+allocations, but neither TCP nor UDP idle latency beats Go in this run.
+
+The adapter now uses scatter/gather on Rust, a bounded peer cache, up to eight
+outgoing QUIC datagrams per IPC message, and the direct-native network socket
+buffer policy. Batching is only IPC; mask `WriteTo` still sees separate packets.
+It is disabled by `disableGSO`; generic-path PMTUD stays disabled at 1200 bytes.
+UDP receive credits now flush when the Go per-flow queue drains, retaining
+batching for bursts and leaving TCP batching/windows unchanged. This fixes a
+confirmed source of UDP application drops without increasing queue capacity.
+See [PACKET_LOSS.md](PACKET_LOSS.md) for saturated loss measurements and limits,
+including kernel queue memory that is not included in Go allocation statistics.
+
+Reproduce after rebuilding the release library:
+
+```sh
+native_hash=$(sha256sum native/libxhysteria/target/release/libxhysteria.a)
+CGO_ENABLED=1 go test -c -tags 'xhysteria_native xhysteria_interop' \
+  -ldflags="-buildid=xhysteria-${native_hash%% *}" \
+  -o /tmp/xhys-packet-bench.test ./native/libxhysteria/interop
+GOMAXPROCS=1 /tmp/xhys-packet-bench.test -test.run '^$' \
+  -test.bench '^BenchmarkNativePacket(Transfer|Latency|UDPLatency)$' \
+  -test.benchtime=1s -test.count=3 -test.benchmem
+```
