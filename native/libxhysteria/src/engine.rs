@@ -667,6 +667,15 @@ impl Bus {
         Ok(total)
     }
     async fn udp_payload(&self, id: u64, address: &[u8], payload: &[u8]) -> Result<()> {
+        self.udp_payload_parts(id, address, std::iter::once(payload))
+            .await
+    }
+    async fn udp_payload_parts<'a>(
+        &self,
+        id: u64,
+        address: &[u8],
+        payloads: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
+    ) -> Result<()> {
         if address.is_empty() || address.len() > protocol::MAX_ADDRESS {
             return Err("invalid bridge address".into());
         }
@@ -685,12 +694,32 @@ impl Bus {
         permit.forget();
         if let Some(shared) = &self.shared {
             let length = (address.len() as u16).to_be_bytes();
-            shared
-                .send_vectored(DATAGRAM, id, &[&length, address, payload])
-                .await
+            if payloads.len() <= 6 {
+                let mut parts = [b"".as_slice(); 8];
+                parts[0] = &length;
+                parts[1] = address;
+                let count = payloads.len() + 2;
+                for (index, payload) in payloads.enumerate() {
+                    parts[index + 2] = payload;
+                }
+                shared.send_vectored(DATAGRAM, id, &parts[..count]).await
+            } else {
+                let mut parts = Vec::with_capacity(payloads.len() + 2);
+                parts.extend([length.as_slice(), address]);
+                for payload in payloads {
+                    parts.push(payload);
+                }
+                shared.send_vectored(DATAGRAM, id, &parts).await
+            }
         } else {
-            self.send(Frame::new(DATAGRAM, id, address_data(address, payload)?))
-                .await
+            let size: usize = payloads.clone().map(<[u8]>::len).sum();
+            let mut data = Vec::with_capacity(2 + address.len() + size);
+            data.extend_from_slice(&(address.len() as u16).to_be_bytes());
+            data.extend_from_slice(address);
+            for payload in payloads {
+                data.extend_from_slice(payload);
+            }
+            self.send(Frame::new(DATAGRAM, id, data)).await
         }
     }
     async fn writable(&self, id: u64, pending: &mut u8) -> Result<()> {
@@ -1506,14 +1535,8 @@ async fn send_udp(
         payload,
     };
     let limit = connection.max_datagram_size().ok_or("peer disabled UDP")?;
-    if message.header_len()? + payload.len() <= limit {
-        let mut wire = Vec::with_capacity(message.header_len()? + payload.len());
-        message.encode(&mut wire)?;
-        connection.send_datagram_wait(Bytes::from(wire)).await?;
-        return Ok(());
-    }
-    for part in message.fragment(limit)? {
-        let mut wire = Vec::new();
+    for part in message.fragments(limit)? {
+        let mut wire = Vec::with_capacity(part.header_len()? + part.payload.len());
         part.encode(&mut wire)?;
         connection.send_datagram_wait(Bytes::from(wire)).await?;
     }
@@ -1532,24 +1555,27 @@ async fn client_udp(
         let Ok(message) = Message::decode(&data) else {
             continue;
         };
-        let assembled;
-        let (session, address, payload) = if message.count == 1 {
-            (message.session, message.address, message.payload)
+        let assembled = if message.count == 1 {
+            None
         } else {
-            let Ok(Some(datagram)) = defrag.feed(start.elapsed().as_nanos() as u64, &message)
+            let Ok(Some(datagram)) = defrag.feed_parts(start.elapsed().as_nanos() as u64, &message)
             else {
                 continue;
             };
-            assembled = datagram;
-            (
-                assembled.session,
-                assembled.address.as_slice(),
-                assembled.payload.as_slice(),
-            )
+            Some(datagram)
         };
+        let session = assembled
+            .as_ref()
+            .map_or(message.session, |datagram| datagram.session);
         let id = sessions.lock().await.get(&session).copied();
         if let Some(id) = id {
-            bus.udp_payload(id, address, payload).await?;
+            if let Some(datagram) = &assembled {
+                bus.udp_payload_parts(id, &datagram.address, datagram.payloads())
+                    .await?;
+            } else {
+                bus.udp_payload(id, message.address, message.payload)
+                    .await?;
+            }
         }
     }
 }
@@ -1582,14 +1608,16 @@ async fn server_udp(
                 let who = user.load(Ordering::Acquire);
                 if who == u32::MAX { continue; }
                 let Ok(message) = Message::decode(&data) else { continue };
-                let assembled;
-                let (session_id, address, payload) = if message.count == 1 {
-                    (message.session, message.address, message.payload)
+                let assembled = if message.count == 1 {
+                    None
                 } else {
-                    let Ok(Some(datagram)) = defrag.feed(start.elapsed().as_nanos() as u64, &message) else { continue };
-                    assembled = datagram;
-                    (assembled.session, assembled.address.as_slice(), assembled.payload.as_slice())
+                    let Ok(Some(datagram)) = defrag.feed_parts(start.elapsed().as_nanos() as u64, &message) else { continue };
+                    Some(datagram)
                 };
+                let (session_id, address) = assembled.as_ref().map_or(
+                    (message.session, message.address),
+                    |datagram| (datagram.session, datagram.address.as_slice()),
+                );
                 let now_ns = start.elapsed().as_nanos() as u64;
                 let id = if let Some((id, activity)) = sessions.get(&session_id) {
                     activity.store(now_ns, Ordering::Relaxed);
@@ -1637,7 +1665,11 @@ async fn server_udp(
                     sessions.insert(session_id, (id, session_activity));
                     id
                 };
-                bus.udp_payload(id, address, payload).await?;
+                if let Some(datagram) = &assembled {
+                    bus.udp_payload_parts(id, address, datagram.payloads()).await?;
+                } else {
+                    bus.udp_payload(id, address, message.payload).await?;
+                }
             }
             _ = cleanup.tick(), if defrag.pending() != 0 => { defrag.expire(start.elapsed().as_nanos() as u64); }
             Some(done) = tasks.join_next(), if !tasks.is_empty() => {
@@ -2738,6 +2770,44 @@ mod tests {
         }
         assert_eq!(received, [chunks[0].as_ref(), chunks[1].as_ref()].concat());
         assert!(bridge.pop(false).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn vectored_udp_uses_one_credit_and_keeps_fragment_order_on_both_bridges() {
+        for shared in [false, true] {
+            for count in [1, 4, 7, 255] {
+                let mut bus = capacity_bus();
+                let bridge = shared::Bridge::new().unwrap();
+                if shared {
+                    bus.shared = Some(bridge.clone());
+                }
+                let (events, mut received) = mpsc::channel(16);
+                bus.events = events;
+                let (_commands, credit) = bus.register(1, 1).await.unwrap();
+                let window = credit.available_permits();
+                let fragments: Vec<_> = (0..count).map(|index| vec![index as u8; 8]).collect();
+                bus.udp_payload_parts(1, b"target", fragments.iter().map(Vec::as_slice))
+                    .await
+                    .unwrap();
+                let data = if shared {
+                    let (kind, id, data) = bridge.pop(false).unwrap().unwrap();
+                    assert_eq!((kind, id), (DATAGRAM, 1));
+                    data
+                } else {
+                    let frame = received.try_recv().unwrap();
+                    assert_eq!((frame.kind, frame.id), (DATAGRAM, 1));
+                    frame.data
+                };
+                let (address, payload) = parse_address(&data).unwrap();
+                assert_eq!(address, b"target");
+                assert_eq!(payload, fragments.concat());
+                assert_eq!(credit.available_permits(), window - 1);
+                bus.udp_payload_parts(1, b"target", fragments.iter().map(Vec::as_slice))
+                    .await
+                    .unwrap();
+                assert_eq!(credit.available_permits(), window - 2);
+            }
+        }
     }
 
     #[tokio::test]

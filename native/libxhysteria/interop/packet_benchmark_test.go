@@ -121,3 +121,26 @@ func BenchmarkNativePacketUDPLatency(b *testing.B) {
 		benchmarkLatency(b, client, target, false)
 	})
 }
+
+func BenchmarkNativePacketUDPTransfer(b *testing.B) {
+	benchmarkPacketModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
+		_, address := echoTargets(b)
+		target, err := xnet.ParseDestination("udp:" + address)
+		if err != nil {
+			b.Fatal(err)
+		}
+		connection := benchmarkDial(b, client, target)
+		defer connection.Close()
+		payload, reply := make([]byte, 4096), make([]byte, 4096)
+		benchmarkExchange(b, connection, payload, reply)
+		b.SetBytes(int64(2 * len(payload)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		cpu := processCPU()
+		for b.Loop() {
+			benchmarkExchange(b, connection, payload, reply)
+		}
+		b.StopTimer()
+		b.ReportMetric(float64(processCPU()-cpu)/float64(b.N), "process-cpu-ns/op")
+	})
+}

@@ -1273,3 +1273,141 @@ It does not invalidate the previous unrestricted-CPU run with 0–0.25% missing
 replies. The test's pass condition still permits partial loss; actual counts,
 not PASS alone, establish this run's zero observed losses. See
 `loss-go-native.log` for per-scenario diagnostics.
+
+## 2026-11-18: Arena Lifetime and Fragmented UDP Copies
+
+This pass replaces malloc-owned shared arenas with anonymous private mappings.
+Only the header is initialized eagerly; the virtual arena remains 1,639,744
+bytes and is unmapped after the last view/payload reference. Supported kernels
+receive `MADV_NOHUGEPAGE` before the header write. The mapping is outside Rust
+system-allocator and `mallinfo2` allocation counters, so those counters alone
+cannot establish a memory improvement. Engine ABI 5 and shared layout 6 are
+unchanged, as are credit limits, session limits and buffer budgets.
+
+Direct Go vectored publication borrows the caller's pointer array. Only queue
+fallback copies the array, outside the publication lock; buffers are released
+exactly once on failure, successful publication or shutdown. Shared payload
+publication still copies into independently owned bridge storage. Rust keeps
+the established `Bytes`/permit ownership rather than introducing a new generic
+owner representation.
+
+UDP transmit no longer allocates a fragment plan and reserves each wire buffer
+once. Completed fragmented receive retains the existing compact fragment
+allocations and publishes header/address/fragments directly into one bridge
+frame. Up to six fragments use stack-only references; larger fragment counts
+allocate only a reference array. Socket fallback constructs its final frame
+without an intermediate joined payload. The contiguous `Defragger::feed` API
+remains available for probe/echo. Incoming fragment copies are intentional:
+holding slices of a large GRO backing allocation could pin substantially more
+memory than the compact fragment itself.
+
+### Same-Harness Peak RSS
+
+The baseline is rebuilt from `16745cf2` engine code with the same updated
+benchmark sources as the shipped variant. Each sample starts a fresh process,
+uploads exactly 512 MiB (8,192 × 64 KiB), and uses Linux `wait4` peak RSS.
+`GOMAXPROCS=4`, CPUs 12–15; five rotating-order rounds. Both endpoints use the
+selected backend with the packet/header-mask benchmark configuration.
+
+| Backend | Samples, KiB | Median, MiB |
+| --- | --- | ---: |
+| Baseline native | 86,616; 81,996; 83,916; 81,900; 84,024 | 81.95 |
+| Shipped native | 79,500; 79,068; 78,444; 81,984; 77,908 | 77.21 |
+| Go | 39,852; 42,156; 41,644; 39,636; 41,764 | 40.67 |
+
+Median native peak RSS is **5.8% lower than the rebuilt baseline**, but remains
+**1.90× Go**. The ranges overlap; this is not a guarantee for every workload.
+Peak includes setup and teardown, not just live QUIC allocations or a 500-user
+VPS. It does not prove that the November 16 OOM problem is fixed.
+
+Earlier `before`/`mapping` binaries use an older test binary layout and produce
+different RSS even when compared with a newly rebuilt baseline. Do not mix
+those samples with the same-harness comparison or attribute their differences
+to the generic ownership experiment. The experiment is not shipped. Blanket
+client GRO disable is also not shipped because download throughput regressed.
+
+### Native A/B
+
+ABBA order, two 2-second samples per phase (four per variant), same CPU pinning,
+normal non-profiled builds. Median results:
+
+| Metric | Baseline | Shipped |
+| --- | ---: | ---: |
+| TCP upload, MB/s | 339.02 | 346.16 |
+| TCP download, MB/s | 301.04 | 298.41 |
+| UDP 4 KiB request+reply, MB/s | 41.96 | 43.35 |
+| Go upload allocated bytes / 64 KiB | 1,744 | 1,609 |
+| Go upload allocations / 64 KiB | 36 | 31 |
+| Go download allocated bytes / 64 KiB | 1,813 | 1,713.5 |
+| Go download allocations / 64 KiB | 46 | 42 |
+| Upload process CPU, µs / 64 KiB | 514.05 | 503.21 |
+| Download process CPU, µs / 64 KiB | 563.44 | 572.72 |
+| UDP process CPU, µs / request+reply | 296.57 | 289.35 |
+| Paced TCP p50 / p99, µs | 163.75 / 697.65 | 163.10 / 670.15 |
+| Paced background, MiB/s | 63.44 | 62.53 |
+
+Upload/UDP throughput gains are about 2.1%/3.3%; download is 0.9% lower and
+its CPU cost is 1.6% higher. Small changes need not generalize beyond this
+loopback workload. Paced p99 is 3.9% lower with slightly lower achieved
+background load, not proof of an equal-load WAN latency improvement. Go
+allocation metrics exclude native allocations; process CPU includes both.
+
+### Go Comparison
+
+Both-native versus both-Go, three 2-second samples per metric in the shipped
+binary, `GOMAXPROCS=4`, CPUs 12–15, shared bridge/pool size 1, Salamander plus
+WireGuard-header masks. Median loopback results:
+
+| Metric | Go | Native |
+| --- | ---: | ---: |
+| TCP upload, MB/s | 172.71 | 343.93 |
+| TCP download, MB/s | 173.03 | 284.04 |
+| TCP 64 KiB request+reply, MB/s | 159.52 | 190.85 |
+| UDP 4 KiB request+reply, MB/s | 37.48 | 41.00 |
+| TCP unloaded p50 / p99, µs | 124.90 / 199.80 | 150.90 / 239.10 |
+| UDP unloaded p50 / p99, µs | 112.00 / 183.70 | 143.20 / 229.50 |
+| Paced TCP p50 / p99, µs | 135.30 / 486.70 | 157.10 / 777.70 |
+| Paced background, MiB/s | 63.93 | 62.54 |
+| Go upload allocated bytes / allocations | 14,593 / 379 | 1,607 / 31 |
+| Go UDP allocated bytes / allocations | 57,900 / 152 | 847 / 34 |
+
+Native upload/download throughput is about **1.99×/1.64× Go**; echoed TCP/UDP
+is about 1.20×/1.09×. **Native latency still loses to Go**, including about
+1.60× Go's paced p99 despite slightly less background traffic. Native peak RSS
+also remains higher. Fewer Go allocations are not a whole-process memory
+advantage, and the requested 2.5× improvement across metrics is not achieved.
+
+### Loaded UDP and Validation
+
+The shipped eight-scenario loss run uses Salamander + WireGuard-header masks,
+four saturated TCP flows, the same CPU pinning, direct/cascade paths and
+256/4096-byte UDP requests. All Go scenarios and three native scenarios receive
+2,000/2,000 replies. Native cascade/256 receives **1,993/2,000 (0.35% missing)**;
+sampled kernel socket drops are zero in every scenario. Native background
+throughput is 278.69–279.70 MiB/s direct and 154.87–157.46 cascade; Go is
+200.98–206.89 direct and 132.57–132.66 cascade. The achieved loads differ.
+
+A subsequent ABBA comparison of native cascade/256 receives 2,000/2,000 in
+each of two rebuilt-baseline and two shipped samples, with zero sampled kernel
+drops. Background rates are 155.33/157.75 MiB/s baseline and 158.85/150.44
+shipped. This does not reproduce a persistent regression, but does not erase
+the earlier 0.35% loss or establish WAN/VPS reliability. The test only fails
+on complete loss; actual counts, not PASS, determine these conclusions.
+
+Validation: 19 default-feature core tests and 89 engine tests (also with the
+allocation-profile feature); all-target Clippy with warnings denied; fresh
+archive-hash-linked Go race tests for buffers/native transport/Hysteria/full
+FinalMask; 140 mask interoperability cases plus both bridges, HTTP masquerade,
+local/remote hopping, pooling, short flows, UDP expiry, capacity recovery and
+100ms RTT under race detection. Go-only tests pass for applicable packages.
+Linux amd64 and Android arm64 artifacts are rebuilt, not deployed.
+
+Logs and artifact hashes are in ignored `build_assets/memory-overhead-20261118/`.
+Use `rss-shipped-summary.log`, `abba-shipped-*`, `go-native-shipped.log` and
+`loss-header-shipped.log` for shipped results; `lean`, `owner`, `compact`, `final`,
+`novec` and isolated-mapping logs are experiments, not the final comparison.
+`loss-abba-*` contains the targeted repetition. The earlier `loss-shipped.log`
+is an invalid mask-name invocation without traffic; `go-only-shipped.log`
+similarly tries an exclusively native-tagged package without its tag. Corrected
+validation logs are `loss-header-shipped.log`, `go-only-valid-shipped.log` and
+`go-race-fresh-shipped.log`; preserve failed invocations instead of hiding them.

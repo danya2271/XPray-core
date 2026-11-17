@@ -68,6 +68,13 @@ impl<'a> Message<'a> {
     }
 
     pub fn fragment(&self, max_datagram: usize) -> Result<Vec<Self>, Error> {
+        Ok(self.fragments(max_datagram)?.collect())
+    }
+
+    pub fn fragments(
+        &self,
+        max_datagram: usize,
+    ) -> Result<impl ExactSizeIterator<Item = Self> + DoubleEndedIterator + 'a, Error> {
         self.validate()?;
         let capacity = max_datagram
             .checked_sub(self.header_len()?)
@@ -77,17 +84,17 @@ impl<'a> Message<'a> {
         if count > 255 {
             return Err(Error::Invalid("too many UDP fragments"));
         }
+        let message = self.clone();
         Ok(self
             .payload
             .chunks(capacity)
             .enumerate()
-            .map(|(id, payload)| Self {
+            .map(move |(id, payload)| Self {
                 fragment: id as u8,
                 count: count as u8,
                 payload,
-                ..self.clone()
-            })
-            .collect())
+                ..message.clone()
+            }))
     }
 }
 
@@ -96,6 +103,31 @@ pub struct Datagram {
     pub session: u32,
     pub address: Vec<u8>,
     pub payload: Vec<u8>,
+}
+
+pub struct DatagramParts {
+    pub session: u32,
+    pub address: Vec<u8>,
+    parts: Vec<Option<Vec<u8>>>,
+    bytes: usize,
+}
+
+impl DatagramParts {
+    pub fn payloads(&self) -> impl ExactSizeIterator<Item = &[u8]> + Clone {
+        self.parts.iter().map(|part| part.as_deref().unwrap())
+    }
+
+    pub fn into_datagram(self) -> Datagram {
+        let mut payload = Vec::with_capacity(self.bytes);
+        for part in self.parts {
+            payload.extend_from_slice(&part.unwrap());
+        }
+        Datagram {
+            session: self.session,
+            address: self.address,
+            payload,
+        }
+    }
 }
 
 struct Assembly {
@@ -135,13 +167,33 @@ impl Defragger {
     }
 
     pub fn feed(&mut self, now_ns: u64, message: &Message<'_>) -> Result<Option<Datagram>, Error> {
-        message.validate()?;
-        self.expire(now_ns);
         if message.count == 1 {
+            message.validate()?;
+            self.expire(now_ns);
             return Ok(Some(Datagram {
                 session: message.session,
                 address: message.address.into(),
                 payload: message.payload.into(),
+            }));
+        }
+        Ok(self
+            .feed_parts(now_ns, message)?
+            .map(DatagramParts::into_datagram))
+    }
+
+    pub fn feed_parts(
+        &mut self,
+        now_ns: u64,
+        message: &Message<'_>,
+    ) -> Result<Option<DatagramParts>, Error> {
+        message.validate()?;
+        self.expire(now_ns);
+        if message.count == 1 {
+            return Ok(Some(DatagramParts {
+                session: message.session,
+                address: message.address.into(),
+                parts: vec![Some(message.payload.into())],
+                bytes: message.payload.len(),
             }));
         }
         let found = self
@@ -197,14 +249,11 @@ impl Defragger {
             return Ok(None);
         }
         let slot = self.slots.swap_remove(index);
-        let mut payload = Vec::with_capacity(slot.bytes);
-        for part in slot.parts {
-            payload.extend_from_slice(&part.unwrap());
-        }
-        Ok(Some(Datagram {
+        Ok(Some(DatagramParts {
             session: slot.session,
             address: slot.address,
-            payload,
+            parts: slot.parts,
+            bytes: slot.bytes,
         }))
     }
 }
@@ -252,6 +301,79 @@ mod tests {
             result = defrag.feed(1, &Message::decode(&wire).unwrap()).unwrap();
         }
         assert_eq!(result.unwrap().payload, payload);
+    }
+
+    #[test]
+    fn fragment_iterator_matches_collected_wire_parts() {
+        let payload = vec![0xa5; MAX_PAYLOAD];
+        let message = Message {
+            count: 1,
+            ..msg(1, 0, &payload)
+        };
+        let expected = message.fragment(1200).unwrap();
+        let mut fragments = message.fragments(1200).unwrap();
+        assert_eq!(fragments.len(), expected.len());
+        assert_eq!(fragments.next(), expected.first().cloned());
+        assert_eq!(fragments.next_back(), expected.last().cloned());
+        assert_eq!(
+            fragments.collect::<Vec<_>>(),
+            expected[1..expected.len() - 1]
+        );
+        assert!(message.fragments(1).is_err());
+        assert!(
+            message
+                .fragments(message.header_len().unwrap() + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn completed_parts_retain_compact_fragment_allocations_without_joining() {
+        let mut defrag = Defragger::new(8).unwrap();
+        let mut source = vec![0x71; 3000];
+        assert!(defrag.feed_parts(0, &msg(1, 1, &source)).unwrap().is_none());
+        let retained = defrag.slots[0].parts[1].as_ref().unwrap().as_ptr();
+        assert_ne!(retained, source.as_ptr());
+        source.fill(0);
+        assert!(
+            defrag
+                .feed_parts(1, &msg(1, 1, b"duplicate"))
+                .unwrap()
+                .is_none()
+        );
+        let completed = defrag
+            .feed_parts(2, &msg(1, 0, b"prefix"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.session, 1);
+        assert_eq!(completed.address, b"example.com:53");
+        assert_eq!(completed.payloads().len(), 2);
+        assert_eq!(completed.payloads().nth(1).unwrap().as_ptr(), retained);
+        assert_eq!(completed.payloads().next().unwrap(), b"prefix");
+        assert_eq!(completed.payloads().nth(1).unwrap(), &[0x71; 3000]);
+        assert_eq!(defrag.pending(), 0);
+    }
+
+    #[test]
+    fn vectored_reassembly_expires_rejects_oversize_and_preserves_small_datagrams() {
+        let mut defrag = Defragger::new(1).unwrap();
+        defrag.feed_parts(0, &msg(1, 0, b"expired")).unwrap();
+        defrag.expire(FRAGMENT_TTL_NS + 1);
+        assert_eq!(defrag.pending(), 0);
+        defrag.feed_parts(0, &msg(1, 0, &[0; 3000])).unwrap();
+        assert!(defrag.feed_parts(1, &msg(1, 1, &[0; 2000])).is_err());
+        assert_eq!(defrag.pending(), 0);
+        let message = Message {
+            count: 1,
+            ..msg(2, 0, b"single")
+        };
+        let completed = defrag
+            .feed_parts(2, &message)
+            .unwrap()
+            .unwrap()
+            .into_datagram();
+        assert_eq!(completed.session, 2);
+        assert_eq!(completed.payload, b"single");
     }
 
     #[test]

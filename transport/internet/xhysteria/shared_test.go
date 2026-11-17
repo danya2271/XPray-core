@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -544,6 +545,63 @@ func TestSharedQueuedBorrowedWriteTakesSnapshotAndReleasesOnClose(t *testing.T) 
 	engine.Close()
 	if queued.storage.Bytes() != nil || engine.queued.Load() != 0 {
 		t.Fatal("queued write was not released on close")
+	}
+}
+
+func TestSharedQueuedVectoredWriteRetainsIndependentPointers(t *testing.T) {
+	bridge := testSharedBridge(t)
+	engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame, 16), flows: make(map[uint64]*Conn)}
+	connection := newConn(engine, 1, xnet.TCPDestination(xnet.LocalHostIP, 80), nil)
+	atomic.StoreUint32(bridge.word(64), sharedCapacity)
+	var released atomic.Int32
+	parts := buf.MultiBuffer{
+		buf.FromBytesWithRelease([]byte("first"), func() { released.Add(1) }),
+		buf.FromBytesWithRelease([]byte("second"), func() { released.Add(1) }),
+	}
+	if err := connection.WriteMultiBuffer(parts); err != nil {
+		t.Fatal(err)
+	}
+	queued := <-engine.out
+	if queued.borrowed || len(queued.parts) != 2 || parts[0] != nil || parts[1] != nil || released.Load() != 0 {
+		t.Fatal("queued vector lost ownership")
+	}
+	parts[0] = buf.FromBytes([]byte("replacement"))
+	defer buf.ReleaseMulti(parts)
+	if string(queued.parts[0].Bytes()) != "first" || string(queued.parts[1].Bytes()) != "second" {
+		t.Fatal("queued vector retained caller's pointer array")
+	}
+	engine.out <- queued
+	engine.Close()
+	if released.Load() != 2 || engine.queued.Load() != 0 {
+		t.Fatal("queued vector was not released exactly once")
+	}
+}
+
+func TestSharedVectoredWriteFailureReleasesOnce(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		t.Run(fmt.Sprint(full), func(t *testing.T) {
+			bridge := testSharedBridge(t)
+			engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame), flows: make(map[uint64]*Conn)}
+			connection := newConn(engine, 1, xnet.TCPDestination(xnet.LocalHostIP, 80), nil)
+			if full {
+				atomic.StoreUint32(bridge.word(64), sharedCapacity)
+				connection.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
+			} else {
+				atomic.StoreUint32(bridge.word(32), 1)
+			}
+			var released atomic.Int32
+			parts := buf.MultiBuffer{
+				buf.FromBytesWithRelease([]byte("first"), func() { released.Add(1) }),
+				buf.FromBytesWithRelease([]byte("second"), func() { released.Add(1) }),
+			}
+			if err := connection.WriteMultiBuffer(parts); err == nil {
+				t.Fatal("failed bridge write succeeded")
+			}
+			if released.Load() != 2 || parts[0] != nil || parts[1] != nil || engine.queued.Load() != 0 {
+				t.Fatal("failed vector publication lost ownership")
+			}
+			engine.Close()
+		})
 	}
 }
 

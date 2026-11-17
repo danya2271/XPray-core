@@ -435,9 +435,13 @@ func (e *Engine) prepareFrame(f *frame) (bool, error) {
 	e.queued.Add(1)
 	e.publishMu.Unlock()
 	if f.borrowed {
-		f.storage = buf.NewWithSize(int32(len(f.data)))
-		f.storage.Write(f.data)
-		f.data = f.storage.Bytes()
+		if f.parts != nil {
+			f.parts = append(buf.MultiBuffer(nil), f.parts...)
+		} else {
+			f.storage = buf.NewWithSize(int32(len(f.data)))
+			f.storage.Write(f.data)
+			f.data = f.storage.Bytes()
+		}
 		f.borrowed = false
 	}
 	if bridge, ok := e.bridge.(*sharedBridge); ok {
@@ -1091,7 +1095,7 @@ func (c *Conn) awaitWriteCredit() error { return c.waitWrite(nil) }
 func (c *Conn) sendFrame(f frame) error {
 	borrowed := f.borrowed
 	err := c.waitWrite(&f)
-	if err != nil && borrowed {
+	if err != nil && borrowed && f.parts == nil {
 		f.release()
 	}
 	return err
@@ -1288,8 +1292,7 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					count++
 				}
 				if count != 0 {
-					parts := append(buf.MultiBuffer(nil), mb[:count]...)
-					if err := c.sendFrame(frame{kind: dataFrame, id: c.id, parts: parts}); err != nil {
+					if err := c.sendFrame(frame{kind: dataFrame, id: c.id, parts: mb[:count], borrowed: true}); err != nil {
 						return err
 					}
 					clear(mb[:count])

@@ -6,7 +6,6 @@
 use crate::h3_transport::Result;
 use bytes::Bytes;
 use std::{
-    alloc::{Layout, alloc_zeroed, dealloc},
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr::NonNull,
@@ -106,9 +105,27 @@ impl Bridge {
         let go = eventfd()?;
         let native = eventfd()?;
         let space = eventfd()?;
-        let layout = Layout::from_size_align(ARENA_BYTES, 64).unwrap();
-        let data = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .ok_or_else(|| io::Error::other("native shared arena allocation failed"))?;
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                ARENA_BYTES,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::madvise(mapping, ARENA_BYTES, libc::MADV_NOHUGEPAGE) } != 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+                unsafe { libc::munmap(mapping, ARENA_BYTES) };
+                return Err(error);
+            }
+        }
+        let data = NonNull::new(mapping.cast::<u8>()).unwrap();
         unsafe {
             data.cast::<Header>().as_ptr().write(Header {
                 magic: MAGIC,
@@ -456,17 +473,51 @@ pub unsafe extern "C" fn xhys_shared_release(owner: *mut std::ffi::c_void) {
 impl Drop for Bridge {
     fn drop(&mut self) {
         unsafe {
-            dealloc(
-                self.data.as_ptr(),
-                Layout::from_size_align(ARENA_BYTES, 64).unwrap(),
-            )
-        }
+            libc::munmap(self.data.as_ptr().cast(), ARENA_BYTES);
+        };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arena_is_zeroed_aligned_and_released_with_last_payload() {
+        let bridge = Bridge::new().unwrap();
+        assert_eq!(bridge.data.as_ptr() as usize % 64, 0);
+        let storage = unsafe { std::slice::from_raw_parts(bridge.data.as_ptr(), ARENA_BYTES) };
+        assert!(storage[HEADER..].iter().all(|&value| value == 0));
+        let owner = Arc::downgrade(&bridge);
+        assert!(bridge.push(true, 3, 1, b"retained").unwrap());
+        let (_, _, payload) = bridge.pop(true).unwrap().unwrap();
+        drop(bridge);
+        assert!(owner.upgrade().is_some());
+        assert_eq!(payload.as_ref(), b"retained");
+        drop(payload);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn fresh_arena_does_not_commit_unused_payload_pages() {
+        let bridge = Bridge::new().unwrap();
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mut resident = vec![0; ARENA_BYTES.div_ceil(page_size)];
+        assert_eq!(
+            unsafe {
+                libc::mincore(
+                    bridge.data.as_ptr().cast(),
+                    ARENA_BYTES,
+                    resident.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        assert_ne!(resident[0] & 1, 0);
+        assert!(
+            resident.iter().filter(|&&page| page & 1 != 0).count() <= HEADER.div_ceil(page_size)
+        );
+    }
 
     #[test]
     fn rejects_free_out_of_range_and_reserved_payload_leases() {

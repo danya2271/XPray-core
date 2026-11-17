@@ -1,6 +1,6 @@
 # Codex Handoff: Native Hysteria Memory and Capacity
 
-Date: 2026-11-17
+Date: 2026-11-18
 Workspace: `/home/danya2271/ProxVless/XPray-core`
 
 ## Request and Scope
@@ -720,3 +720,56 @@ drops zero. Achieved native background direct 247–254 and cascade 142–145
 MiB/s; Go direct 195–196, cascade 124–127. This is not equal-load WAN proof;
 the previous unrestricted-CPU 0–0.25% missed-reply result remains valid. The
 test still only fails on complete loss, so inspect actual counts, not PASS.
+
+## Latest: Arena Lifetime and Fragmented UDP Copies (2026-11-18)
+
+Shared arenas now use private anonymous mmap, with header-only initialization,
+supported-kernel MADV_NOHUGEPAGE and munmap after the final reference/lease.
+The 1,639,744-byte virtual arena, ABI 5, layout 6 and all budgets are unchanged.
+Arena mappings no longer appear in Rust allocator or mallinfo2 counters;
+measure whole-process RSS. Keep the existing Bytes/permit ownership: the
+generic Data experiment and blanket client GRO disable are not shipped.
+
+Direct Go vectors borrow the pointer array; only queued fallback snapshots it.
+Release/close/timeout ownership is race-tested. UDP TX iterates fragments and
+reserves wire buffers once. Fragmented RX publishes existing compact pieces
+directly, without the final joined payload allocation. Compact input-fragment
+copies and bridge publication copies remain intentionally; do not pin large
+GRO allocations to remove them. Publication remains serialized and no async
+wait is held under its lock. Probe/echo contiguous UDP APIs remain compatible.
+
+Rebuilt 16745cf2 baseline with the same updated benchmark sources, five rotating
+fresh-process fixed 512MiB uploads, GOMAXPROCS4 CPUs12–15: median peak RSS
+baseline 83916 KiB (81.95MiB), shipped 79068 (77.21MiB), Go 41644 (40.67MiB).
+Native improves 5.8% versus baseline but still uses 1.90x Go's peak RSS. Ranges
+overlap; no VPS OOM fix or universal result. Earlier before/mapping binaries
+have a different test binary layout and cannot establish ownership causality.
+
+ABBA native medians: upload 339.02→346.16 MB/s, download 301.04→298.41,
+UDP4KiB echo 41.96→43.35; Go upload bytes/count 1744/36→1609/31 per64KiB,
+download 1813/46→1713.5/42. Paced p99 697.65→670.15us at achieved background
+63.44→62.53MiB/s, so not equal-load WAN proof. Both-native/both-Go in the
+shipped binary: upload 343.93/172.71 MB/s (1.99x), download 284.04/173.03
+(1.64x), UDP echo 41.00/37.48 (1.09x). Native still loses latency: unloaded
+TCP p50/p99 150.9/239.1us vs Go124.9/199.8; paced157.1/777.7 vs135.3/486.7.
+The 2.5x-across-metrics target is not achieved; Go allocation savings are not
+total-memory savings. Full tables are in PERFORMANCE.md's latest section.
+
+Loaded loss: native cascade256 misses7/2000 (0.35%), all other seven scenarios
+receive2000/2000; sampled kernel drops0. Native direct279/cascade155–157MiB/s,
+Go direct201–207/cascade133: unequal achieved load. Subsequent cascade256 ABBA
+gets2000/2000 in all four baseline/shipped samples; does not erase the earlier
+loss or prove WAN reliability. Inspect counts, not just PASS.
+
+19 core/89 engine tests (also profile), Clippy warnings denied, fresh-linked Go
+race buffers/native/Hysteria/full FinalMask, 140 masks and wide interop race
+HTTP/hopping/pooling/short flows/UDP expiry/capacity/100ms RTT pass. Applicable
+Go-only packages pass. Linux amd64/Android arm64 rebuilt, not deployed.
+Shipped binaries: /tmp/xhys-memory-shipped.test and -shipped-race.test;
+same-harness baseline: /tmp/xhys-memory-fresh-base.test. Final logs use shipped
+or loss-abba; results-shipped.json and artifact-hashes-shipped.txt summarize
+ignored build_assets/memory-overhead-20261118/. Preserve failed setup logs:
+loss-shipped has an invalid mask name; go-only-shipped lacks the native tag.
+Corrected runs are loss-header-shipped, go-only-valid-shipped and
+go-race-fresh-shipped. Do not use experimental owner/lean/final RSS samples as
+the shipped comparison. No deployment, restart, push or neighboring-repo edit.

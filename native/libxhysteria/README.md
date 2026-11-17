@@ -396,7 +396,10 @@ XRAY_NET_DIAG=1 build_assets/xray-native-allocation-profile run -c /path/to/conf
 Server capacity diagnostics report live Rust allocations by power-of-two size
 class when a class holds at least 1 MiB. GNU/Linux also reports allocator-owned
 and retained free pages through `mallinfo2`. These are diagnostic counters, not
-RSS or Go heap measurements, and add overhead. Rebuild with `build-linux.sh`
+RSS or Go heap measurements, and add overhead. The anonymous shared-arena
+mappings are outside these allocator counters; include them when measuring
+whole-process RSS rather than interpreting smaller counters as freed memory.
+Rebuild with `build-linux.sh`
 without the optional feature before measuring or deploying a normal binary.
 
 ## Session pooling and shared memory
@@ -405,7 +408,13 @@ Linux/Android amd64 and arm64 use the shared-memory bridge by default. Each
 engine owns two bounded frame rings with eight slots each and three nonblocking
 `eventfd` notification descriptors. The arena is 1,639,744 bytes (about 1.56 MiB),
 aligned to 64 bytes; storage layout version 6 and engine ABI version 5 are
-checked during setup. Event publication is serialized with a short native
+checked during setup. Its zero-filled storage uses an anonymous private mapping,
+not the system allocator. Only the header is initialized eagerly; unused
+payload pages are not prefaulted. Linux huge-page advice prevents small arena
+writes from committing adjacent large pages when supported. The mapping is
+unmapped after the last arena reference or payload lease is released, rather
+than retained in malloc's free lists. Virtual arena size and payload limits are
+unchanged. Event publication is serialized with a short native
 mutex; command publication uses a short Go mutex and an ordered queue fallback.
 No lock is held over a blocked ring wait. Separate descriptors wake RX and
 blocked TX directly through Go netpoll; a third wakes Rust. Coalesced pending
@@ -424,6 +433,17 @@ immutable byte tables instead of per-message payload allocations.
 Rust handles wake descriptors and command dispatch in the same task. When a
 control queue is full, it continues handling notification readiness so that
 event-space backpressure cannot deadlock the engine.
+
+Direct Go vectored writes borrow the caller's pointer array until publication;
+only the ordered-queue fallback snapshots that array. Buffer ownership transfers
+on successful submission, with exactly one release on failures or shutdown.
+Fragmented UDP replies retain compact fragment allocations and publish the
+address and fragments directly into one bridge frame instead of first joining
+the payload in another allocation. Up to six fragments use stack-only slice
+references. UDP transmit iterates fragments without allocating a fragment plan
+and reserves each wire buffer once. The remaining compact-fragment and bridge
+publication copies are intentional: retaining slices of large GRO allocations
+would increase live memory, and the bridge needs independently owned storage.
 DATA, DATAGRAM and credit routing is synchronous. Control frames also publish
 without an async wait when their queue has capacity; only a full control queue
 uses the notification-aware wait. The dispatcher still services event-space
