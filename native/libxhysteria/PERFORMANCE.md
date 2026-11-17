@@ -1140,3 +1140,136 @@ cases. Application loss is **0–0.25%**, sampled kernel UDP drops are zero.
 This test only fails on complete application loss; PASS does not mean zero loss.
 The missed replies are not attributed yet. This is not a matched Go comparison
 or directly comparable with the previous CPU-14-pinned zero-loss run.
+
+## Opportunistic TCP writes and dispatch — November 18, 2026
+
+The native TCP send path now drains only immediately available commands into
+an eight-chunk / 128 KiB batch and submits the existing `Bytes` directly to
+Quinn. It does not coalesce payloads or wait for future commands. Additional
+local/process send reservations are acquired nonblockingly; a failed
+reservation preserves the pending frame and flushes the current batch before
+any blocking acquire. FIN/reset order and reference-lifetime reservations are
+preserved. TCP credits return after Quinn accepts the batch, combined into
+bounded messages. The writer yields after 64 KiB of progress instead of
+256 KiB. No larger arena, payload pool, QUIC window or memory budget is added.
+
+The bridge directly routes payload/credit commands and tries control publication
+synchronously. Only a full control queue constructs the async send/select;
+event-space servicing during that wait and the dispatch fairness boundary are
+preserved. Dispatcher-only measurements did not establish a latency gain.
+
+### Before/after experiments
+
+Baseline is `dbd34a8d`, not the older pre-lease binary. All runs are local release
+builds without concurrent compilation or tests. The final comparison alternates
+after/before/before/after, each with two two-second samples: four samples per
+variant, `GOMAXPROCS=4 taskset -c 12-15`, Salamander, native server,
+`shared_pool2`. These medians are exploratory, not confidence intervals:
+
+| Metric | Previous native | Current native |
+|---|---:|---:|
+| Continuous upload MB/s | 287.92 | 316.13 |
+| Upload process CPU ms / 64 KiB | 0.5953 | 0.5448 |
+| Upload Go bytes/op | 1,770 | 1,737 |
+| Upload Go allocations/op | 36 | 35 |
+| Paced TCP p50 / p99 µs | 186.40 / 838.90 | 183.85 / 839.75 |
+| Achieved background MiB/s | 61.78 | 61.62 |
+
+Upload increases about **9.8%**, process CPU per byte decreases **8.5%** and
+Go allocation bytes decrease **1.9%**. Paced p99 is effectively unchanged;
+there is no demonstrated latency improvement or whole-process memory reduction.
+Earlier repetitions show a smaller 4–7% upload gain, so 9.8% is not a universal
+throughput guarantee. Download and echo do not show a repeatable before/after
+gain. Keeping the 256 KiB writer yield threshold raised paced p99 about 7% in
+one alternating comparison and is not shipped. Four-chunk / 64 KiB batches
+were also tested; one comparison regressed download about 6%, so they are not
+shipped either. Raw experiment logs are retained, including these regressions.
+
+### Both-Go versus both-native
+
+The packet harness now includes continuous upload/download and both paced and
+saturated latency. It explicitly selects the same backend at both endpoints;
+the older `XHYS_BENCH_NATIVE_SERVER=1` harness does **not** provide a both-Go
+baseline. Packet masks are Salamander + WireGuard, pool size one, shared bridge.
+Continuous/load results use four Go CPUs pinned to 12–15, three two-second
+samples. Echo/idle use one Go CPU pinned to 14, three one-second samples. The
+tables cannot be combined into one generic speedup:
+
+| Continuous four-CPU metric | Both-Go | Both-native | Native / Go throughput |
+|---|---:|---:|---:|
+| Upload MB/s | 153.46 | 308.69 | **2.01×** |
+| Download MB/s | 156.05 | 276.57 | **1.77×** |
+| Upload process CPU ms / 64 KiB | 1.1414 | 0.5648 | — |
+| Download process CPU ms / 64 KiB | 1.1091 | 0.6026 | — |
+| Upload Go bytes / allocations per op | 14,577 / 380 | 1,735 / 35 | — |
+| Download Go bytes / allocations per op | 15,357 / 397 | 1,761 / 44 | — |
+
+These allocation reductions exclude Rust heap, arenas and kernel socket memory.
+Upload consumes about 50.5% less process CPU per byte; Go allocation bytes
+decrease 88.1% and allocation count decreases 90.8%. The **2.5× Go target is
+not met**, and continuous upload is not a small-message latency comparison.
+
+| Single-CPU echo/idle metric | Both-Go | Both-native |
+|---|---:|---:|
+| 64 KiB bidirectional echo MB/s | 79.77 | 94.85 |
+| Echo process CPU ms/op | 1.5007 | 1.1084 |
+| Echo Go bytes / allocations per op | 27,291 / 724 | 3,789 / 96 |
+| TCP p50 / p99 µs | 92.55 / 177.40 | 179.30 / 277.00 |
+| UDP p50 / p99 µs | 94.72 / 190.70 | 166.10 / 260.40 |
+
+Echo is about 1.19× Go. **Native idle latency still loses to Go**. Four-CPU
+matched offered-load TCP p50/p99 is 151.5/599.0 µs for Go versus
+189.1/843.1 µs native, at achieved background rates 63.97/63.43 MiB/s.
+Saturated p50/p99 is 489.1/1,225 versus 1,021/2,368 µs; achieved background
+rates differ, 192.0 versus 238.7 MiB/s, so this is not an equal-load comparison.
+
+### Whole-process memory and native locks
+
+Six fresh processes upload exactly 8,192 × 64 KiB (512 MiB), one packet backend
+per process, with the same four-CPU placement and final test executable. Order
+alternates Go/native and native/Go. Linux child `wait4` resource usage gives:
+
+| Backend | Individual peak RSS KiB | Median MiB |
+|---|---|---:|
+| Go | 39,676; 39,704; 39,608 | 38.75 |
+| Native | 82,848; 85,168; 84,704 | 82.72 |
+
+**Native peak RSS is about 2.14× Go in this isolated streaming test.** Fewer Go
+allocations do not prove lower total memory. This is process peak including
+setup and teardown, not steady-state live memory or a many-user VPS benchmark;
+it does not identify native allocator retention versus live QUIC allocations.
+No claim is made that the VPS OOM problem is fixed.
+
+Upload `perf cycles:u` profiles have about 11K baseline and 10K final samples,
+zero lost samples. Native `Mutex::lock_contended` CPU share is 0.26% → 0.18%;
+AES-GCM assembly is 11.27% → 12.26% and Go `runtime.memmove` is
+3.15% → 3.59%. These are sampled CPU shares, **not sleeping lock wait times**
+or proof of a corresponding contention percentage improvement. The batching
+mechanism reduces Quinn write calls only when multiple chunks are already ready.
+Do not infer a hot flow-map lock or remove remaining publication copies from
+these samples.
+
+Measurements, profiles and artifact hashes are in ignored
+`build_assets/shared-dispatch-20261118/`. `packet-fair.log`,
+`packet-load-fair.log`, `abba-fair-*.log` and `memory-fair.log` describe the
+shipped variant; `*-final.log`, `*-batch.log`, `*-credits.log` and small-batch
+logs are intermediate experiments, not final results.
+
+Validation: 83 Rust unit tests, including the allocation-profile feature;
+all-target Clippy with warnings denied; native transport/common-buffer/full
+FinalMask Go race tests; wide interoperability race coverage for traffic,
+Brutal, 140 mask cases, local/remote hopping, HTTP string/file/proxy/lifecycle,
+pooling, short flows, UDP expiry and 100ms RTT; Go-only tests pass. Half-close
+tests exercise both bridges with default and minimum allowed local send budgets.
+Linux and Android arm64 artifacts are rebuilt, not deployed.
+
+The final loaded UDP comparison runs eight both-native/both-Go scenarios
+(direct/cascade × 256/4096-byte payload), four saturated TCP flows,
+Salamander + WireGuard, `GOMAXPROCS=4 taskset -c 12-15`. Every scenario receives
+2,000/2,000 application replies and sampled kernel socket drops remain zero.
+Native background rates are 247–254 MiB/s direct and 142–145 cascade; Go
+195–196 and 124–127. This is neither equal achieved load nor WAN/VPS proof.
+It does not invalidate the previous unrestricted-CPU run with 0–0.25% missing
+replies. The test's pass condition still permits partial loss; actual counts,
+not PASS alone, establish this run's zero observed losses. See
+`loss-go-native.log` for per-scenario diagnostics.

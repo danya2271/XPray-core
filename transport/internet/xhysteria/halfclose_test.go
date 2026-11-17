@@ -18,14 +18,21 @@ import (
 )
 
 func TestNativeHalfClosePreservesRequestAndCompleteResponse(t *testing.T) {
-	for _, bridge := range []string{"shared", "socket"} {
-		t.Run(bridge, func(t *testing.T) {
-			t.Setenv("XRAY_HYSTERIA_BRIDGE", bridge)
+	for _, mode := range []struct {
+		name, bridge string
+		sendBudget   uint32
+	}{
+		{"shared", "shared", 0}, {"socket", "socket", 0},
+		{"shared_small_budget", "shared", maxFrame}, {"socket_small_budget", "socket", maxFrame},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Setenv("XRAY_HYSTERIA_BRIDGE", mode.bridge)
 			certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
 			ca := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate}))
 			key := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: certificate.PrivateKey}))
 			start := func(config Config, accept func(*Conn)) *Engine {
 				t.Helper()
+				config.SendBufferBytes = mode.sendBudget
 				udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 				if err != nil {
 					t.Fatal(err)

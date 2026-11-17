@@ -81,9 +81,33 @@ func BenchmarkNativePacketTransfer(b *testing.B) {
 	})
 }
 
+func BenchmarkNativePacketUpload(b *testing.B) {
+	benchmarkPacketModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
+		benchmarkStreaming(b, client, true)
+	})
+}
+
+func BenchmarkNativePacketDownload(b *testing.B) {
+	benchmarkPacketModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
+		benchmarkStreaming(b, client, false)
+	})
+}
+
 func BenchmarkNativePacketLatency(b *testing.B) {
 	benchmarkPacketModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
 		benchmarkLatency(b, client, target, false)
+	})
+}
+
+func BenchmarkNativePacketLoadedLatency(b *testing.B) {
+	benchmarkPacketModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
+		benchmarkLatency(b, client, target, true)
+	})
+}
+
+func BenchmarkNativePacketPacedLatency(b *testing.B) {
+	benchmarkPacketModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
+		benchmarkLatencyWithLoad(b, client, target, true, true)
 	})
 }
 

@@ -283,3 +283,22 @@ Go-only Hysteria tests, all eight loaded scenarios, and four idle cascade
 scenarios passed. Linux diagnostic Xray is built in
 `build_assets/packet-loss-20261117/xray-diagnostic`. The running desktop binary
 and remote servers were not replaced; Android was not rebuilt in this stage.
+
+## TCP batching validation — November 18, 2026
+
+After bounded opportunistic TCP writes and synchronous command dispatch,
+the both-native/both-Go loaded comparison was rerun with Salamander + WireGuard,
+four saturated TCP flows, `GOMAXPROCS=4 taskset -c 12-15`. All eight
+direct/cascade × 256/4096-byte UDP scenarios receive 2000/2000 replies each;
+sampled owned kernel UDP socket drops are zero. Native achieved TCP background
+is 247–254 MiB/s direct and 142–145 MiB/s cascade; Go is 195–196 and 124–127.
+These are local tests with different achieved load, not proof about live VPS
+paths. Raw counts and QUIC diagnostics are in ignored
+`build_assets/shared-dispatch-20261118/loss-go-native.log`.
+
+The previous unrestricted-CPU run observed 0–0.25% missing application replies;
+that result is not erased by this CPU-pinned run. `TestHysteriaPacketLossUnderLoad`
+still fails only on complete loss, so PASS alone is not a no-loss assertion.
+The new fixed-512MiB upload memory comparison measures native peak RSS at
+82.72 MiB versus Go 38.75 MiB. Fewer Go allocations do not mean lower total
+memory; this change does not establish that the original 1 GiB VPS OOM is fixed.

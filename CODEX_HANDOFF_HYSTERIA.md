@@ -660,3 +660,63 @@ Loopback timing does not model real RU paths, loss, high-bandwidth WAN links
 or Android battery/thermal behavior. Existing upstream startup timeouts still
 need remote path/configuration evidence. Avoid promising that every metric
 beats Go or that a 1 GiB host with all its other services is OOM-proof.
+
+## Opportunistic TCP writes and honest memory comparison — November 18, 2026
+
+Follow-up to `dbd34a8d` batches only already queued TCP `Bytes`, at most eight
+chunks / 128 KiB, directly into Quinn without coalescing or waiting for new
+frames. Extra send permits are acquired nonblockingly; a failure preserves the
+pending command and flushes the batch before any blocking acquire. FIN/reset
+order and last-reference send-budget lifetime are preserved. Credits return
+after Quinn accepts data, combined within the flow window. The writer yields
+after 64 KiB rather than 256 KiB. Shared payload/credit routing is synchronous;
+control sends only construct async/select waits when the queue is full. Event
+space notifications are still serviced while blocked and at batch boundaries.
+ABI and arena/pool/window sizes do not change.
+
+Final ABBA comparison against `dbd34a8d`, GOMAXPROCS4 CPUs12–15, native server,
+shared_pool2, 4×2s per variant: upload 287.92 → 316.13 MB/s (+9.8%), process
+CPU .5953 → .5448 ms/64KiB (−8.5%), Go bytes 1770 → 1737, allocations 36 → 35.
+Paced p50/p99 186.4/838.9 → 183.85/839.75 µs, background 61.78/61.62 MiB/s:
+no established latency improvement. Earlier larger-yield/smaller-batch
+experiments regressed p99/download; their logs are kept but are not shipped.
+
+Both-Go versus both-native packet benchmarks now include continuous
+upload/download and paced/saturated latency. Salamander + WireGuard, pool1,
+three two-second runs on four CPUs: upload 153.46/308.69 MB/s (2.01× Go),
+download 156.05/276.57 MB/s (1.77×). Upload process CPU 1.1414/.5648 ms,
+Go allocations 14577/1735 bytes and 380/35 counts per 64KiB. Single CPU14,
+3×1s: echo 79.77/94.85 MB/s (1.19×), native TCP p50/p99 179.3/277.0 µs,
+Go 92.55/177.4; native UDP 166.1/260.4, Go 94.72/190.7. Matched paced TCP
+Go/native p50/p99 151.5/599.0 vs 189.1/843.1 at background 63.97/63.43 MiB/s.
+Native latency still loses; 2.5× across metrics is not achieved.
+
+**New isolated memory measurement is unfavorable to native.** Same binary,
+one backend per fresh process, fixed 512MiB upload, three samples each,
+GOMAXPROCS4 CPUs12–15, alternating backend order, Linux wait4 peak RSS:
+Go median 39676 KiB (38.75MiB), native 84704 KiB (82.72MiB), native ~2.14×.
+Go allocation savings are not whole-process memory savings. This does not
+identify allocator retention versus live QUIC memory or fix the VPS OOM.
+Next useful memory investigation is live native allocations/RSS over time,
+not larger buffers or blanket glibc trimming. Existing publication/Read/socket
+copies remain. perf upload samples, zero lost: lock_contended CPU .26→.18%,
+AES-GCM 11.27→12.26%, Go memmove 3.15→3.59%; no sleeping lock-time claim.
+
+83 Rust tests (also allocation-profile), Clippy warnings denied, Go race
+buffers/native transport/full FinalMask; wide interop race traffic/Brutal,
+140 masks, local/remote hops, HTTP string/file/proxy/lifecycle, pooling,
+short flows/UDP expiry/100ms RTT pass. Go-only tests pass. Linux and Android
+arm64 masking artifacts rebuilt, not deployed. Archive hash is recorded in
+ignored `build_assets/shared-dispatch-20261118/artifact-hashes.txt`.
+Final benchmark logs use `fair` in their filenames. `final` filenames are
+intermediate pre-fairness experiments and must not be cited as shipped results.
+Current nonrace/race interop binaries: `/tmp/xhys-batch-fair.test` and
+`/tmp/xhys-batch-fair-race.test`; baseline `/tmp/xhys-dispatch-before.test`.
+
+Final loaded loss comparison uses Salamander + WireGuard, GOMAXPROCS4,
+CPUs12–15, four saturated TCP flows: all eight both-native/both-Go scenarios
+(direct/cascade × 256/4096-byte UDP) receive 2000/2000 each, sampled kernel
+drops zero. Achieved native background direct 247–254 and cascade 142–145
+MiB/s; Go direct 195–196, cascade 124–127. This is not equal-load WAN proof;
+the previous unrestricted-CPU 0–0.25% missed-reply result remains valid. The
+test still only fails on complete loss, so inspect actual counts, not PASS.

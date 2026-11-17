@@ -545,6 +545,53 @@ impl Bus {
             _process_permit: process_permit,
         }))
     }
+    fn try_buffered_chunk(&self, data: Bytes) -> std::result::Result<Bytes, Bytes> {
+        let Some(budget) = &self.send_budget else {
+            return Ok(data);
+        };
+        let Ok(permit) = budget.clone().try_acquire_many_owned(data.len() as u32) else {
+            return Err(data);
+        };
+        let process_permit = match &self.process_send_budget {
+            Some(budget) => {
+                let Ok(permit) = budget.clone().try_acquire_many_owned(data.len() as u32) else {
+                    return Err(data);
+                };
+                Some(permit)
+            }
+            None => None,
+        };
+        Ok(Bytes::from_owner(BufferedChunk {
+            data,
+            _permit: permit,
+            _process_permit: process_permit,
+        }))
+    }
+    fn fill_tcp_batch(
+        &self,
+        commands: &mut mpsc::Receiver<Frame>,
+        chunks: &mut [Bytes; 8],
+    ) -> (usize, Option<Frame>) {
+        let mut count = 1;
+        let mut bytes = chunks[0].len();
+        while count < chunks.len() && bytes < 128 * 1024 {
+            let Ok(command) = commands.try_recv() else {
+                break;
+            };
+            if command.kind != DATA || bytes + command.data.len() > 128 * 1024 {
+                return (count, Some(command));
+            }
+            match self.try_buffered_chunk(command.data) {
+                Ok(chunk) => {
+                    bytes += chunk.len();
+                    chunks[count] = chunk;
+                    count += 1;
+                }
+                Err(data) => return (count, Some(Frame::new(DATA, command.id, data))),
+            }
+        }
+        (count, None)
+    }
     async fn authenticate(&self, owner: u64, auth: &[u8]) -> Result<bool> {
         if auth.len() > MAX_FRAME - 8 {
             return Ok(false);
@@ -647,18 +694,22 @@ impl Bus {
         }
     }
     async fn writable(&self, id: u64, pending: &mut u8) -> Result<()> {
-        *pending += 1;
-        if *pending as usize >= self.flow_window / 2 {
-            let count = *pending;
-            *pending = 0;
+        self.writable_count(id, pending, 1).await
+    }
+    async fn writable_count(&self, id: u64, pending: &mut u8, count: usize) -> Result<()> {
+        let mut total = *pending as usize + count;
+        while total >= self.flow_window / 2 {
+            let count = total.min(self.flow_window);
+            total -= count;
             static CREDITS: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
             self.send(Frame::new(
                 WRITABLE,
                 id,
-                Bytes::from_static(&CREDITS[count as usize..count as usize + 1]),
+                Bytes::from_static(&CREDITS[count..count + 1]),
             ))
             .await?;
         }
+        *pending = total as u8;
         Ok(())
     }
     async fn done(&self, id: u64, result: Result<()>) {
@@ -682,7 +733,7 @@ impl Bus {
             self.done(id, Err("native connection closed".into())).await;
         }
     }
-    async fn route(&self, frame: Frame) {
+    fn route(&self, frame: Frame) {
         let id = frame.id;
         let mut flows = self.flows.lock().unwrap();
         if let Some(flow) = flows.get(&id) {
@@ -707,15 +758,18 @@ impl Bus {
         }
     }
 
-    async fn command(&self, incoming: &mpsc::Sender<Frame>, frame: Frame) -> Result<()> {
+    fn try_command(&self, incoming: &mpsc::Sender<Frame>, frame: Frame) -> Result<Option<Frame>> {
         match frame.kind {
-            OPEN_TCP | OPEN_UDP | CLOSE | AUTH_RESPONSE | UPDATE_TLS => incoming
-                .send(frame)
-                .await
-                .map_err(|_| "Go bridge closed".into()),
+            OPEN_TCP | OPEN_UDP | CLOSE | AUTH_RESPONSE | UPDATE_TLS => {
+                match incoming.try_send(frame) {
+                    Ok(()) => Ok(None),
+                    Err(mpsc::error::TrySendError::Full(frame)) => Ok(Some(frame)),
+                    Err(mpsc::error::TrySendError::Closed(_)) => Err("Go bridge closed".into()),
+                }
+            }
             _ => {
-                self.route(frame).await;
-                Ok(())
+                self.route(frame);
+                Ok(None)
             }
         }
     }
@@ -1120,6 +1174,52 @@ async fn client_auth(
     Ok((udp, requests, task))
 }
 
+async fn relay_tcp_upload(
+    tx: &mut quinn::SendStream,
+    commands: &mut mpsc::Receiver<Frame>,
+    bus: &Bus,
+    id: u64,
+) -> Result<()> {
+    let mut chunks = std::array::from_fn(|_| Bytes::new());
+    let mut pending = None;
+    let mut credit = 0;
+    let mut budget = 0;
+    loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match commands.recv().await {
+                Some(command) => command,
+                None => {
+                    let _ = tx.reset(0u32.into());
+                    return Err("Go flow closed".into());
+                }
+            },
+        };
+        match command.kind {
+            DATA => {
+                chunks[0] = bus.buffered_chunk(command.data).await?;
+                let (count, next) = bus.fill_tcp_batch(commands, &mut chunks);
+                pending = next;
+                budget += chunks[..count].iter().map(Bytes::len).sum::<usize>();
+                tx.write_all_chunks(&mut chunks[..count]).await?;
+                bus.writable_count(id, &mut credit, count).await?;
+                if budget >= 64 * 1024 {
+                    budget = 0;
+                    tokio::task::yield_now().await;
+                }
+            }
+            FIN => {
+                tx.finish()?;
+                return Ok(());
+            }
+            _ => {
+                let _ = tx.reset(0u32.into());
+                return Ok(());
+            }
+        }
+    }
+}
+
 async fn relay_client_tcp(
     connection: quinn::Connection,
     frame: Frame,
@@ -1160,34 +1260,7 @@ async fn relay_client_tcp(
         }
     }
     drop(response);
-    let up = async {
-        let mut credit = 0;
-        let mut budget = 0;
-        while let Some(command) = commands.recv().await {
-            match command.kind {
-                DATA => {
-                    bus.writable(id, &mut credit).await?;
-                    budget += command.data.len();
-                    tx.write_chunk(bus.buffered_chunk(command.data).await?)
-                        .await?;
-                    if budget >= 256 * 1024 {
-                        budget = 0;
-                        tokio::task::yield_now().await;
-                    }
-                }
-                FIN => {
-                    tx.finish()?;
-                    return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
-                }
-                _ => {
-                    let _ = tx.reset(0u32.into());
-                    return Ok(());
-                }
-            }
-        }
-        let _ = tx.reset(0u32.into());
-        Err("Go flow closed".into())
-    };
+    let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
     let down = async {
         let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
         let mut budget = 0;
@@ -1268,34 +1341,7 @@ async fn relay_server_tcp(
         }
         drop(header);
         let (mut tx, mut rx) = stream.split()?;
-        let up = async {
-            let mut credit = 0;
-            let mut budget = 0;
-            while let Some(command) = commands.recv().await {
-                match command.kind {
-                    DATA => {
-                        bus.writable(id, &mut credit).await?;
-                        budget += command.data.len();
-                        tx.write_chunk(bus.buffered_chunk(command.data).await?)
-                            .await?;
-                        if budget >= 256 * 1024 {
-                            budget = 0;
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                    FIN => {
-                        tx.finish()?;
-                        return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(());
-                    }
-                    _ => {
-                        let _ = tx.reset(0u32.into());
-                        return Ok(());
-                    }
-                }
-            }
-            let _ = tx.reset(0u32.into());
-            Err("Go flow closed".into())
-        };
+        let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
         let down = async {
             let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
             let mut budget = 0;
@@ -1795,8 +1841,14 @@ fn bridge_tasks(
             });
             tasks.spawn(async move {
                 while let Ok(frame) = read_frame(&mut reader).await {
-                    if bus.command(&incoming, frame).await.is_err() {
-                        break;
+                    match bus.try_command(&incoming, frame) {
+                        Ok(Some(frame)) => {
+                            if incoming.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => (),
+                        Err(_) => break,
                     }
                 }
                 Ok(())
@@ -1818,10 +1870,13 @@ fn bridge_tasks(
                         };
                         drained += 1;
                         bytes += data.len();
-                        if incoming.capacity() == 0 {
-                            bridge.notify_space();
-                        }
-                        let command = bus.command(&incoming, Frame::new(kind, id, data));
+                        let frame = match bus.try_command(&incoming, Frame::new(kind, id, data)) {
+                            Ok(Some(frame)) => frame,
+                            Ok(None) => continue,
+                            Err(_) => return Ok(()),
+                        };
+                        bridge.notify_space();
+                        let command = incoming.send(frame);
                         tokio::pin!(command);
                         loop {
                             tokio::select! {
@@ -2008,7 +2063,7 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
                         continue;
                     }
                 }
-                bus.route(frame).await;
+                bus.route(frame);
             }
             incoming = ep.accept(), if config.server => {
                 let Some(incoming) = incoming else { break Ok(()) };
@@ -2328,6 +2383,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_commands_bypass_a_full_control_queue_without_reordering_fin() {
+        let bus = capacity_bus();
+        let (incoming, mut controls) = mpsc::channel(1);
+        let (mut commands, credit) = bus.register(1, 0).await.unwrap();
+        incoming
+            .send(Frame::new(OPEN_TCP, 2, "target"))
+            .await
+            .unwrap();
+        for (kind, data) in [(DATA, "first"), (DATA, "second"), (FIN, "")] {
+            assert!(
+                bus.try_command(&incoming, Frame::new(kind, 1, data))
+                    .unwrap()
+                    .is_none()
+            );
+            let command = commands.try_recv().unwrap();
+            assert_eq!(command.kind, kind);
+            assert_eq!(command.data.as_ref(), data.as_bytes());
+        }
+        credit.acquire().await.unwrap().forget();
+        assert!(
+            bus.try_command(&incoming, Frame::new(CREDIT, 1, Bytes::from_static(&[1])))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(credit.available_permits(), bus.flow_window);
+        assert_eq!(controls.try_recv().unwrap().id, 2);
+        assert!(controls.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_control_queue_preserves_ownership_and_close_order() {
+        let bus = capacity_bus();
+        let (incoming, mut controls) = mpsc::channel(1);
+        let (_commands, credit) = bus.register(1, 0).await.unwrap();
+        for kind in [OPEN_TCP, OPEN_UDP, CLOSE, AUTH_RESPONSE, UPDATE_TLS] {
+            assert!(
+                bus.try_command(&incoming, Frame::new(OPEN_TCP, 2, "first"))
+                    .unwrap()
+                    .is_none()
+            );
+            let frame = Frame::new(kind, 1, Bytes::from_static(b"retained"));
+            let payload = frame.data.as_ptr();
+            let pending = bus.try_command(&incoming, frame).unwrap().unwrap();
+            assert_eq!(pending.kind, kind);
+            assert_eq!(pending.id, 1);
+            assert_eq!(pending.data.as_ptr(), payload);
+            assert!(!credit.is_closed());
+            assert_eq!(controls.try_recv().unwrap().id, 2);
+            assert!(bus.try_command(&incoming, pending).unwrap().is_none());
+            assert_eq!(controls.try_recv().unwrap().kind, kind);
+        }
+        drop(controls);
+        assert!(
+            bus.try_command(&incoming, Frame::new(CLOSE, 1, Bytes::new()))
+                .is_err()
+        );
+        assert!(!credit.is_closed());
+        bus.route(Frame::new(CLOSE, 1, Bytes::new()));
+        assert!(credit.is_closed());
+    }
+
+    #[tokio::test]
+    async fn full_flow_queue_closes_the_flow_instead_of_discarding_tcp() {
+        let bus = capacity_bus();
+        let (incoming, _controls) = mpsc::channel(1);
+        let (mut commands, credit) = bus.register(1, 0).await.unwrap();
+        for _ in 0..bus.flow_window {
+            assert!(
+                bus.try_command(&incoming, Frame::new(DATA, 1, "queued"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        bus.try_command(&incoming, Frame::new(DATA, 1, "overflow"))
+            .unwrap();
+        assert!(credit.is_closed());
+        assert!(!bus.flows.lock().unwrap().contains_key(&1));
+        for _ in 0..bus.flow_window {
+            assert_eq!(commands.try_recv().unwrap().data.as_ref(), b"queued");
+        }
+        assert!(commands.recv().await.is_none());
+        assert!(bus.register(1, 0).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn unread_udp_flow_counts_credit_drops_without_blocking_other_flows() {
         let mut bus = capacity_bus();
         let (events, mut receiver) = mpsc::channel(1);
@@ -2349,8 +2489,7 @@ mod tests {
         assert_eq!(readable.available_permits(), window - 1);
         assert_eq!(blocked.available_permits(), 0);
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
-        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])))
-            .await;
+        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])));
         bus.udp_payload(1, b"target", b"resumed").await.unwrap();
         assert_eq!(
             parse_address(&receiver.try_recv().unwrap().data).unwrap().1,
@@ -2373,7 +2512,7 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
-        bus.route(Frame::new(CLOSE, 1, Bytes::new())).await;
+        bus.route(Frame::new(CLOSE, 1, Bytes::new()));
         assert!(bus.register(3, 2).await.is_ok());
         assert_eq!(bus.flows.lock().unwrap().len(), 2);
     }
@@ -2406,6 +2545,137 @@ mod tests {
         assert_eq!(data.as_ref(), b"reused");
         drop(data);
         assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn tcp_batch_flushes_before_waiting_for_local_or_process_budget() {
+        for process_limit in [false, true] {
+            let mut bus = capacity_bus();
+            bus.send_budget = Some(Arc::new(Semaphore::new(12)));
+            if process_limit {
+                bus.process_send_budget = Some(Arc::new(Semaphore::new(4)));
+            } else {
+                bus.send_budget = Some(Arc::new(Semaphore::new(4)));
+            }
+            let (sender, mut commands) = mpsc::channel(2);
+            sender.send(Frame::new(DATA, 1, "next")).await.unwrap();
+            sender.send(Frame::new(FIN, 1, Bytes::new())).await.unwrap();
+            let mut chunks = std::array::from_fn(|_| Bytes::new());
+            chunks[0] = bus
+                .buffered_chunk(Bytes::from_static(b"held"))
+                .await
+                .unwrap();
+            let (count, pending) = bus.fill_tcp_batch(&mut commands, &mut chunks);
+            assert_eq!(count, 1);
+            let pending = pending.unwrap();
+            assert_eq!(pending.kind, DATA);
+            assert_eq!(pending.data.as_ref(), b"next");
+            assert_eq!(commands.try_recv().unwrap().kind, FIN);
+            assert_eq!(
+                bus.send_budget.as_ref().unwrap().available_permits(),
+                if process_limit { 8 } else { 0 }
+            );
+            drop(chunks);
+            let chunk =
+                tokio::time::timeout(Duration::from_secs(1), bus.buffered_chunk(pending.data))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            drop(chunk);
+            assert_eq!(
+                bus.send_budget.as_ref().unwrap().available_permits(),
+                if process_limit { 12 } else { 4 }
+            );
+            if let Some(budget) = &bus.process_send_budget {
+                assert_eq!(budget.available_permits(), 4);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_batch_preserves_fin_and_reset_order_without_waiting_for_frames() {
+        let mut bus = capacity_bus();
+        bus.send_budget = None;
+        let (sender, mut commands) = mpsc::channel(8);
+        for kind in [FIN, CLOSE] {
+            sender.send(Frame::new(DATA, 1, "second")).await.unwrap();
+            sender
+                .send(Frame::new(kind, 1, Bytes::new()))
+                .await
+                .unwrap();
+            sender.send(Frame::new(DATA, 1, "later")).await.unwrap();
+            let mut chunks = std::array::from_fn(|_| Bytes::new());
+            chunks[0] = Bytes::from_static(b"first");
+            let (count, pending) = bus.fill_tcp_batch(&mut commands, &mut chunks);
+            assert_eq!(count, 2);
+            assert_eq!(chunks[0].as_ref(), b"first");
+            assert_eq!(chunks[1].as_ref(), b"second");
+            assert_eq!(pending.unwrap().kind, kind);
+            assert_eq!(commands.try_recv().unwrap().data.as_ref(), b"later");
+        }
+        let mut chunks = std::array::from_fn(|_| Bytes::new());
+        chunks[0] = Bytes::from_static(b"single");
+        let (count, pending) = bus.fill_tcp_batch(&mut commands, &mut chunks);
+        assert_eq!(count, 1);
+        assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_batches_bound_chunks_and_bytes_for_fairness() {
+        let mut bus = capacity_bus();
+        bus.send_budget = None;
+        for size in [1, 49152, 65536] {
+            let (sender, mut commands) = mpsc::channel(16);
+            let payload = Bytes::from(vec![1; size]);
+            for _ in 0..9 {
+                sender
+                    .send(Frame::new(DATA, 1, payload.clone()))
+                    .await
+                    .unwrap();
+            }
+            let mut chunks = std::array::from_fn(|_| Bytes::new());
+            chunks[0] = payload;
+            let (count, pending) = bus.fill_tcp_batch(&mut commands, &mut chunks);
+            assert_eq!(count, if size == 1 { 8 } else { 2 });
+            if size == 49152 {
+                assert_eq!(pending.unwrap().data.len(), size);
+                assert_eq!(commands.len(), 9 - count);
+            } else {
+                assert!(pending.is_none());
+                assert_eq!(commands.len(), 10 - count);
+            }
+            assert!(chunks[count..].iter().all(Bytes::is_empty));
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_writable_credits_are_exact_and_bounded_by_the_flow_window() {
+        for window in [4, 8] {
+            let mut bus = capacity_bus();
+            bus.flow_window = window;
+            let (events, mut receiver) = mpsc::channel(16);
+            bus.events = events;
+            let mut pending = 0;
+            let mut consumed = 0;
+            let mut returned = 0;
+            for count in [1, 3, 2, 8, 1, 7, 0, 4] {
+                bus.writable_count(42, &mut pending, count).await.unwrap();
+                consumed += count;
+                while let Ok(frame) = receiver.try_recv() {
+                    assert_eq!(frame.kind, WRITABLE);
+                    assert_eq!(frame.id, 42);
+                    assert_eq!(frame.data.len(), 1);
+                    let credits = frame.data[0] as usize;
+                    assert!((1..=window).contains(&credits));
+                    returned += credits;
+                }
+                assert!((pending as usize) < window / 2);
+                assert_eq!(consumed, returned + pending as usize);
+            }
+            bus.writable_count(42, &mut pending, window).await.unwrap();
+            assert_eq!(receiver.try_recv().unwrap().data.as_ref(), &[window as u8]);
+            assert!(receiver.try_recv().is_err());
+        }
     }
 
     #[tokio::test]
@@ -2487,7 +2757,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        bus.route(Frame::new(CLOSE, 1, Bytes::new())).await;
+        bus.route(Frame::new(CLOSE, 1, Bytes::new()));
         assert!(
             tokio::time::timeout(Duration::from_secs(1), &mut pending)
                 .await
@@ -2495,8 +2765,7 @@ mod tests {
                 .is_err()
         );
         let (_replacement_commands, replacement_credit) = bus.register(1, 2).await.unwrap();
-        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])))
-            .await;
+        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])));
         assert!(bus.payload_bytes(1, &credit, b"stale").await.is_err());
         assert!(bridge.pop(false).unwrap().is_none());
         bus.payload_bytes(1, &replacement_credit, b"replacement")

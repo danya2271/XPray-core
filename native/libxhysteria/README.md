@@ -424,6 +424,10 @@ immutable byte tables instead of per-message payload allocations.
 Rust handles wake descriptors and command dispatch in the same task. When a
 control queue is full, it continues handling notification readiness so that
 event-space backpressure cannot deadlock the engine.
+DATA, DATAGRAM and credit routing is synchronous. Control frames also publish
+without an async wait when their queue has capacity; only a full control queue
+uses the notification-aware wait. The dispatcher still services event-space
+notifications and yields after 32 commands or 256 KiB.
 
 DATA and DATAGRAM payloads up to 16 KiB use independent leased storage: each
 direction has sixteen 16 KiB slots and an atomic free bitmap. Publication copies
@@ -453,8 +457,15 @@ headers and payloads publish as separate slices in both runtimes, avoiding a
 temporary combined payload. Eventfd notification happens after the command
 publication lock is released. Rust writes owned chunks directly into Quinn and reads server TCP through
 the underlying Quinn stream after parsing the Hysteria header. Data arriving
-with that header is preserved. Clients use eight frame credits and return them
-in groups of four. Servers use four and return two at a time, bounding their
+with that header is preserved. TCP uploads opportunistically write up to eight
+already queued chunks / 128 KiB per Quinn call, with no payload coalescing or
+wait for future frames. Extra chunks acquire local/process send reservations
+nonblockingly; an unavailable reservation flushes the current batch before
+waiting, avoiding a batch-induced budget deadlock. FIN/reset ordering is
+preserved. A writer yields after 64 KiB of progress for other ready tasks.
+Clients use eight frame credits with a return threshold of four; servers use
+four with a threshold of two. A TCP batch returns credits after Quinn accepts
+its data, combining returns up to the flow window, bounding their
 TCP queues at 128 KiB and 64 KiB respectively. Payload publication never waits
 to fill such a group. Power-of-two byte-pool classes avoid rounding 16 KiB frames
 to 32 KiB and 64 KiB frames to 128 KiB. Nonstandard capacities are not retained
@@ -551,6 +562,14 @@ for methodology, measured results, and limitations. Profiling also identified
 and fixed an exact-size mismatch in Xray's regular buffer pool that had prevented
 buffer reuse in both Go and native traffic paths.
 Set `XHYS_BENCH_NATIVE_SERVER=1` to measure the native server; the default is Go.
+
+The `BenchmarkNativePacket*` family compares both-Go against both-native
+endpoints with Salamander + WireGuard masks, shared bridge and pool size one.
+It includes echo transfer, continuous upload/download, idle TCP/UDP latency,
+saturated TCP latency and paced TCP latency. Unlike the older mixed-endpoint
+harness, its Go mode cannot accidentally retain a native server. Go allocation
+metrics exclude native heap, arenas and kernel memory; use isolated processes
+with fixed transferred byte counts for RSS comparisons.
 
 For server comparisons with the same client, in isolated processes:
 
