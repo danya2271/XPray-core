@@ -8,9 +8,10 @@ packet-loss rates on deployed servers or a before/after WAN improvement.
 The initial sections are historical measurements from earlier implementations.
 The November 17 delivery, latency follow-up and allocation follow-up sections
 describe successive implementations and their comparison boundaries. The
-allocation follow-up describes the latest direct-path comparison. The hybrid
-UDP-mask adapter follow-up at the end measures a different path; do not combine
-different stages or compare its figures with the direct-path tables.
+allocation follow-up describes the earlier direct Salamander comparison. The
+November 18 direct header/Salamander chain section is the latest paired result;
+its pinned before/after run is distinct from the unpinned historical adapter
+tables. Do not combine different stages or benchmark setups.
 
 Measurements were taken on November 15, 2026 on Linux amd64, an Intel Xeon
 E5-2698 v3 at 2.30 GHz, with Go 1.27.1-X:nodwarf5 and Rust 1.99.0. The host
@@ -924,7 +925,7 @@ No remote deployment, running application restart or Android-device change was
 performed. `XPRAY_SOURCE_DIR` can build a local Xray checkout without modifying
 its Git state; no unpublished revision is pinned as a remote build default.
 
-## Hybrid UDP-mask adapter follow-up — November 17, 2026
+## Hybrid UDP-mask adapter follow-up — November 17, 2026 (historical)
 
 This measures Salamander plus a WireGuard appearance header, which selects the
 Go PacketConn mask chain with native Rust QUIC rather than direct Rust UDP I/O.
@@ -1003,3 +1004,53 @@ GOMAXPROCS=1 /tmp/xhys-packet-bench.test -test.run '^$' \
   -test.bench '^BenchmarkNativePacket(Transfer|Latency|UDPLatency)$' \
   -test.benchtime=1s -test.count=3 -test.benchmem
 ```
+
+## Direct header/Salamander mask chains — November 18, 2026
+
+The same Salamander + WireGuard harness now selects a combined direct Rust
+mask socket instead of the Go PacketConn/Unix datagram adapter. Chains preserve
+mask order, sequence fields and per-datagram salts while keeping a single bounded
+send buffer. Six appearance headers and repeated Salamander layers can be mixed;
+unknown masks, local hopping and excessive chains still use the adapter.
+
+Before/after runs use `GOMAXPROCS=1 taskset -c 14`, release Rust, shared flow
+bridges, pool size one, three one-second repetitions, and no concurrent load
+tests. The 64 KiB bidirectional echo counts both directions. CPU includes Rust
+threads; allocation metrics include only Go, not Rust/kernel allocations or RSS.
+Median samples, not confidence intervals:
+
+| Path | Transfer MB/s | Process CPU ms/op | Go bytes/op | Go allocations/op |
+|---|---:|---:|---:|---:|
+| Go before | 81.77 | 1.467 | 27,257 | 724 |
+| Native adapter before | 40.79 | 2.966 | 13,187 | 428 |
+| Go after | 79.23 | 1.519 | 27,262 | 724 |
+| Native direct chain after | 95.71 | 1.116 | 4,318 | 115 |
+
+Native throughput is about **2.35× its previous adapter** and **1.21× the paired
+Go path**, not 2.5× Go. Process CPU per exchange falls about 62% from the native
+adapter and is about 27% below the paired Go value. Go allocation bytes are
+about 67% below the adapter / 84% below Go. These data do not prove a total-RSS
+advantage, WAN throughput, or a universal multiplier.
+
+| Path | TCP ns/op | TCP p50 µs | TCP p99 µs | UDP ns/op | UDP p50 µs | UDP p99 µs |
+|---|---:|---:|---:|---:|---:|---:|
+| Go before | 97,404 | 90.25 | 172.8 | 92,636 | 89.55 | 181.4 |
+| Native adapter before | 222,651 | 215.9 | 334.4 | 219,868 | 212.4 | 333.4 |
+| Go after | 103,619 | 97.54 | 172.2 | 97,419 | 94.18 | 175.2 |
+| Native direct chain after | 193,999 | 187.3 | 294.0 | 172,739 | 166.7 | 246.2 |
+
+Native TCP p50/p99 decrease about 13%/12%, UDP about 22%/26%. Idle native latency
+is **still slower than Go**. CPU affinity places both runtimes on one CPU; do
+not combine these results with earlier unpinned tables. Go timing also shifts
+across runs. There is no busy-spin loop or arbitrary delay reduction. Next
+latency work should measure shared-flow notification/task scheduling separately.
+
+Validation: 71 Rust unit tests, engine/probe all-target Clippy with warnings
+denied, 140 mixed Go/native mask cases, 12 local-hopping cases, and two direct
+header remote-hopping cases with TCP/fragmented UDP surviving two hops. Four
+native saturated loss scenarios deliver 2000/2000 replies each with zero sampled
+kernel or credit drops; see `PACKET_LOSS.md`. Raw logs/binaries are retained in
+ignored `build_assets/direct-masks-20261118/`.
+The final race rerun also passes traffic/concurrency, Brutal, HTTP string/file/
+proxy/lifecycle and pooling tests (about 107 seconds). Go-only transport tests
+pass. Linux and Android arm64 masking binaries are rebuilt, not deployed.

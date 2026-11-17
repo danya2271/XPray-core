@@ -3,13 +3,18 @@
 package hysteria
 
 import (
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
+	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/header"
+	"github.com/xtls/xray-core/transport/internet/finalmask/noise"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -231,8 +236,8 @@ func TestNativeHoppingMaskOrder(t *testing.T) {
 				t.Fatalf("nativeConfig error: %v, wantError=%t", err, test.wantError)
 			}
 			if err == nil && test.name == "duplicate_salamander" {
-				if !config.PacketBridge || config.PortHopping != nil || config.Salamander != "" {
-					t.Fatal("combined masks did not select the packet adapter")
+				if config.PacketBridge || config.PortHopping != nil || config.Salamander != "" || len(config.UDPMasks) != 2 {
+					t.Fatal("combined Salamander masks did not select direct UDP")
 				}
 				return
 			}
@@ -241,6 +246,74 @@ func TestNativeHoppingMaskOrder(t *testing.T) {
 			}
 			if err == nil && len(test.masks) == 2 && config.Salamander != mask.Password {
 				t.Fatal("Salamander configuration missing")
+			}
+		})
+	}
+}
+
+func TestNativeDirectHeaderMaskChains(t *testing.T) {
+	mask := &salamander.Config{Password: "test-password"}
+	for _, test := range []struct {
+		name   string
+		masks  []finalmask.UDPMask
+		kinds  []string
+		bridge bool
+		err    bool
+	}{
+		{"dns", []finalmask.UDPMask{mask, &header.Config{ID: 0, Domain: `example\.name.com`}}, []string{"dns", "salamander"}, false, false},
+		{"dtls", []finalmask.UDPMask{mask, &header.Config{ID: 1}}, []string{"dtls", "salamander"}, false, false},
+		{"srtp", []finalmask.UDPMask{mask, &header.Config{ID: 2}}, []string{"srtp", "salamander"}, false, false},
+		{"utp", []finalmask.UDPMask{mask, &header.Config{ID: 3}}, []string{"utp", "salamander"}, false, false},
+		{"wechat", []finalmask.UDPMask{mask, &header.Config{ID: 4}}, []string{"wechat", "salamander"}, false, false},
+		{"wireguard", []finalmask.UDPMask{mask, &header.Config{ID: 5}}, []string{"wireguard", "salamander"}, false, false},
+		{"inner_header", []finalmask.UDPMask{&header.Config{ID: 5}, mask}, []string{"salamander", "wireguard"}, false, false},
+		{"header_only", []finalmask.UDPMask{&header.Config{ID: 5}}, []string{"wireguard"}, false, false},
+		{"stacked", []finalmask.UDPMask{&header.Config{ID: 1}, mask, &header.Config{ID: 4}, mask}, []string{"salamander", "wechat", "salamander", "dtls"}, false, false},
+		{"remote_hop", []finalmask.UDPMask{mask, &header.Config{ID: 5}, &udphop.Config{Remote: true, IntervalMin: 5, IntervalMax: 5, RemotePorts: []uint32{443}}}, []string{"wireguard", "salamander"}, false, false},
+		{"local_hop", []finalmask.UDPMask{mask, &header.Config{ID: 5}, &udphop.Config{Local: true, IntervalMin: 5, IntervalMax: 5}}, nil, true, false},
+		{"noise", []finalmask.UDPMask{&noise.Config{}, mask, &header.Config{ID: 5}}, nil, true, false},
+		{"too_many", slices.Repeat([]finalmask.UDPMask{&header.Config{ID: 5}}, 17), nil, true, false},
+		{"mtu_budget", slices.Repeat([]finalmask.UDPMask{&header.Config{ID: 0, Domain: "example.com"}}, 10), nil, true, false},
+		{"bad_id", []finalmask.UDPMask{&header.Config{ID: 6}}, nil, false, true},
+		{"bad_domain", []finalmask.UDPMask{&header.Config{ID: 0, Domain: strings.Repeat("x", 64)}}, nil, false, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			original := slices.Clone(test.masks)
+			config, err := nativeConfig(&internet.MemoryStreamConfig{
+				SecuritySettings: &tls.Config{},
+				QuicParams:       &internet.QuicParams{DisableChromeParrot: true},
+				FinalMask:        finalmask.NewFinalMask(nil, slices.Clone(test.masks), nil, nil, nil, nil),
+			})
+			if (err != nil) != test.err {
+				t.Fatalf("error=%v wantError=%t", err, test.err)
+			}
+			if err != nil {
+				return
+			}
+			if config.PacketBridge != test.bridge || config.Salamander != "" {
+				t.Fatalf("incorrect packet path: %+v", config)
+			}
+			var kinds []string
+			for _, layer := range config.UDPMasks {
+				kinds = append(kinds, layer.Kind)
+				if layer.Kind == "dns" {
+					template, err := header.NewHeaderDNS(original[len(original)-1].(*header.Config).Domain)
+					if err != nil {
+						t.Fatal(err)
+					}
+					prefix := make([]byte, template.Size())
+					template.Serialize(prefix)
+					prefix[0], prefix[1] = 0, 0
+					if layer.Prefix != hex.EncodeToString(prefix) {
+						t.Fatal("DNS template differs from Go header")
+					}
+				}
+			}
+			if !slices.Equal(kinds, test.kinds) {
+				t.Fatalf("wire mask order=%v want=%v", kinds, test.kinds)
+			}
+			if (config.PortHopping != nil) != (test.name == "remote_hop") {
+				t.Fatal("incorrect remote hopping path")
 			}
 		})
 	}

@@ -4,6 +4,7 @@ use crate::{
     congestion,
     h3_transport::{self, Dispatch, Replay, Result},
     hopping::{self, HoppingSocket},
+    mask_socket::{self, MaskSocket},
     masquerade,
     packet_socket::PacketSocket,
     protocol, shared,
@@ -75,6 +76,8 @@ pub struct Config {
     pub certificate_pem: String,
     pub key_pem: String,
     pub salamander: String,
+    #[serde(default)]
+    pub udp_masks: Vec<mask_socket::Config>,
     pub system_roots: bool,
     pub tx_bps: u64,
     pub rx_bps: u64,
@@ -774,12 +777,20 @@ fn transport(config: &Config) -> Result<quinn::TransportConfig> {
     }));
     // Hybrid restricts Brutal to individual sends after rate negotiation.
     t.enable_segmentation_offload(!config.disable_gso);
+    let mask_overhead = mask_socket::overhead(&config.udp_masks)?;
+    if mask_overhead != 0 && !config.salamander.is_empty() {
+        return Err("UDP mask chain and legacy Salamander cannot be combined".into());
+    }
     if config.disable_pmtud {
         t.initial_mtu(1200).min_mtu(1200).mtu_discovery_config(None);
-    } else if !config.salamander.is_empty() {
+    } else if !config.salamander.is_empty() || mask_overhead != 0 {
         let mut discovery = quinn::MtuDiscoveryConfig::default();
-        // Reserve Salamander's salt even on an IPv6 1500-byte path.
-        discovery.upper_bound(1500 - 40 - 8 - crate::salamander::SALT_LEN as u16);
+        let overhead = if mask_overhead == 0 {
+            crate::salamander::SALT_LEN
+        } else {
+            mask_overhead
+        };
+        discovery.upper_bound(1500 - 40 - 8 - overhead as u16);
         t.mtu_discovery_config(Some(discovery));
     }
     Ok(t)
@@ -914,7 +925,10 @@ fn endpoint(config: &Config, socket: NetworkSocket) -> Result<quinn::Endpoint> {
     let runtime = Arc::new(quinn::TokioRuntime);
     let udp: Arc<dyn AsyncUdpSocket> = match socket {
         NetworkSocket::Packet(socket) => {
-            if !config.salamander.is_empty() || config.port_hopping.is_some() {
+            if !config.salamander.is_empty()
+                || !config.udp_masks.is_empty()
+                || config.port_hopping.is_some()
+            {
                 return Err("packet bridge masks must be applied by Go".into());
             }
             Arc::new(PacketSocket::new(
@@ -934,7 +948,9 @@ fn endpoint(config: &Config, socket: NetworkSocket) -> Result<quinn::Endpoint> {
                 }
             }
             let descriptor = socket.as_raw_fd();
-            let udp: Arc<dyn AsyncUdpSocket> = if config.salamander.is_empty() {
+            let udp: Arc<dyn AsyncUdpSocket> = if !config.udp_masks.is_empty() {
+                Arc::new(MaskSocket::new(socket, &config.udp_masks)?)
+            } else if config.salamander.is_empty() {
                 runtime.wrap_udp_socket(socket)?
             } else {
                 Arc::new(MaskedSocket::new(socket, config.salamander.as_bytes())?)
@@ -2236,6 +2252,28 @@ pub unsafe extern "C" fn xhys_engine_join(engine: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_mask_chain_mtu_validation_and_legacy_exclusion() {
+        let mask = mask_socket::Config {
+            kind: "salamander".into(),
+            password: "test-password".into(),
+            prefix: String::new(),
+        };
+        for disable_pmtud in [false, true] {
+            let mut config = Config {
+                disable_pmtud,
+                udp_masks: vec![mask.clone(); 16],
+                ..Config::default()
+            };
+            assert!(transport(&config).is_ok());
+            config.salamander = "legacy-password".into();
+            assert!(transport(&config).is_err());
+            config.salamander.clear();
+            config.udp_masks.push(mask.clone());
+            assert!(transport(&config).is_err());
+        }
+    }
 
     #[test]
     fn network_socket_validates_packet_bridge_descriptor_type_and_family() {

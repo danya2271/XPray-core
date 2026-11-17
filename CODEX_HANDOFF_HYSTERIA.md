@@ -569,6 +569,37 @@ benchmarks: `PERFORMANCE.md`, `PACKET_LOSS.md`, ignored
 `build_assets/hybrid-packet-20261117/`. Linux/Android masking binaries at the
 existing paths are rebuilt together, not deployed. No commit or sibling edits.
 
+## Direct mask follow-up — November 18, 2026
+
+Previous accumulated masking, local hopping, masquerade and loss fixes are
+committed as `bab0b214`. This follow-up moves DNS/DTLS/SRTP/UTP/WeChat/WireGuard
+appearance headers and repeated Salamander layers to a combined Rust UDP socket.
+One bounded, lazily allocated send buffer is used regardless of mask count;
+receive decoding compacts Quinn buffers in place with GSO/GRO metadata retained.
+DNS templates use Go's encoder at setup, avoiding a divergent domain parser.
+Direct chains allow 16 layers / 252 bytes expansion and reserve that overhead
+in PMTUD; excessive or unsupported combinations still use Go FinalMask, never
+silently remove masks. Local hopping remains hybrid. A single Salamander keeps
+its specialized fast path. Engine diagnostics include `packet_io`/`mask_layers`.
+
+Pinned one-CPU before/after medians: native transfer 40.79→95.71 MB/s (~2.35×),
+process CPU 2.966→1.116 ms/op, Go allocations 13,187→4,318 B/op and 428→115.
+Paired Go transfer is 79.23 MB/s (~1.21× advantage, not 2.5×). Native TCP p50/p99
+215.9/334.4→187.3/294.0 µs; UDP 212.4/333.4→166.7/246.2. Go idle latency still
+wins. This uses GOMAXPROCS=1, CPU14, 3×1s, and cannot be combined with prior
+unpinned tables or establish RSS/WAN improvements. See `PERFORMANCE.md`.
+
+71 Rust tests, engine/probe all-target Clippy pass. Mixed masks now cover 140
+cases, plus 12 local hops and two direct-header remote hops under race checking.
+Four loaded native header loss scenarios deliver 2000/2000 each, with zero
+sampled kernel and credit drops; not VPS proof. New logs/test binaries are in
+ignored `build_assets/direct-masks-20261118/`. Linux/Android masking binaries
+are rebuilt from the final code at their existing paths; no deployment or
+sibling changes.
+The final wider race rerun passes traffic/concurrency, Brutal, cover handlers/
+lifecycle and pooling alongside the full mask/hopping matrix (about 107 seconds).
+Native transport/finalmask race tests and Go-only transport tests also pass.
+
 ## Remaining Limits
 
 This work does not bound every allocation in the Xray process or the whole

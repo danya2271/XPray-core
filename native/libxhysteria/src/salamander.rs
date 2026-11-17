@@ -30,6 +30,13 @@ impl Salamander {
         Self::xor_key(key.as_bytes(), payload);
     }
 
+    #[cfg(feature = "engine")]
+    pub(crate) fn seal_in_place(&self, packet: &mut [u8], salt: &[u8; SALT_LEN]) {
+        let (prefix, payload) = packet.split_at_mut(SALT_LEN);
+        prefix.copy_from_slice(salt);
+        self.xor(prefix, payload);
+    }
+
     fn xor_key(key: &[u8], payload: &mut [u8]) {
         let mask: [u64; 4] = std::array::from_fn(|index| {
             u64::from_ne_bytes(key[index * 8..index * 8 + 8].try_into().unwrap())

@@ -19,6 +19,8 @@ mod h3_transport;
 #[cfg(feature = "engine")]
 pub mod hopping;
 #[cfg(feature = "engine")]
+mod mask_socket;
+#[cfg(feature = "engine")]
 mod masquerade;
 #[cfg(all(feature = "engine", unix))]
 mod packet_socket;

@@ -57,6 +57,14 @@ func packetMasks(t testing.TB, kind string) []*serial.TypedMessage {
 		return []*serial.TypedMessage{serial.ToTypedMessage(&noise.Config{Script: path}), mask}
 	case "multiple":
 		return []*serial.TypedMessage{mask, serial.ToTypedMessage(&salamander.Config{Password: psk + "-outer"})}
+	case "header_inside":
+		return []*serial.TypedMessage{serial.ToTypedMessage(&header.Config{ID: 5}), mask}
+	case "header_only":
+		return []*serial.TypedMessage{serial.ToTypedMessage(&header.Config{ID: 5})}
+	case "headers_stacked":
+		return []*serial.TypedMessage{mask, serial.ToTypedMessage(&header.Config{ID: 1}), serial.ToTypedMessage(&header.Config{ID: 4}), serial.ToTypedMessage(&header.Config{ID: 2})}
+	case "mixed_stacked":
+		return []*serial.TypedMessage{serial.ToTypedMessage(&header.Config{ID: 0, Domain: `example\.name.com`}), mask, serial.ToTypedMessage(&header.Config{ID: 4}), serial.ToTypedMessage(&salamander.Config{Password: psk + "-outer"})}
 	default:
 		t.Fatalf("unknown packet mask %s", kind)
 		return nil
@@ -64,7 +72,7 @@ func packetMasks(t testing.TB, kind string) []*serial.TypedMessage {
 }
 
 func TestNativePacketMasks(t *testing.T) {
-	for _, kind := range []string{"header", "header_no_batch", "dns", "dtls", "srtp", "utp", "wechat", "mkcp_original", "mkcp_aes", "sudoku", "custom", "stateful", "standalone", "noise", "lua", "multiple"} {
+	for _, kind := range []string{"header", "header_no_batch", "dns", "dtls", "srtp", "utp", "wechat", "mkcp_original", "mkcp_aes", "sudoku", "custom", "stateful", "standalone", "noise", "lua", "multiple", "header_inside", "header_only", "headers_stacked", "mixed_stacked"} {
 		for _, serverNative := range []bool{false, true} {
 			for _, clientNative := range []bool{false, true} {
 				for _, bridge := range []string{"shared", "socket"} {

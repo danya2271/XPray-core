@@ -100,10 +100,23 @@ The app logs `Hysteria backend: native (Rust), UDP port hopping`. With
 
 ### UDP mask compatibility adapter
 
-Plain UDP, a single Salamander mask, and supported remote hopping retain direct
-Rust socket I/O. Additional masks use the existing Go `FinalMask` PacketConn chain
-with Rust QUIC/HTTP/3/authentication. This is hybrid support, not a Rust rewrite of
-the masks and not fallback to quic-go.
+Plain UDP, Salamander, all six MKCP appearance headers (DNS, DTLS, SRTP, UTP,
+WeChat, WireGuard), their ordered stacks, and supported remote hopping use direct
+Rust socket I/O. A combined mask socket copies each QUIC datagram once into a
+single lazily allocated send buffer, then masks it in place. It preserves separate
+GSO salts/sequence numbers, GRO packet boundaries, and receive ECN/destination
+metadata; it adds no batching timer or per-packet CGO call. DNS templates come
+from the existing Go domain encoder at setup; Rust randomizes transaction IDs.
+Header receive behavior matches Go's fixed-length stripping without enforcing
+appearance bytes. A single Salamander retains its existing specialized path.
+
+Direct chains are limited to 16 masks and 252 bytes of total expansion. PMTUD
+reserves all mask overhead within an IPv6 1500-byte path, and `disableGSO` is
+honored. Oversized chains and other masks use the existing Go `FinalMask`
+PacketConn chain with Rust QUIC/HTTP/3/authentication; masks are never omitted.
+That compatibility path is hybrid support, not fallback to quic-go. The direct
+send buffer is capped at 64 KiB rather than retaining one scratch buffer per
+mask. These are storage bounds, not a whole-process peak-RSS guarantee.
 
 Mixed Go/native client/server tests cover all six MKCP appearance headers
 (DNS, DTLS, SRTP, UTP, WeChat, WireGuard), MKCP original/AES-GCM, Sudoku,
@@ -144,7 +157,10 @@ logged with `XRAY_NET_DIAG=1`. No sysctls are changed. Queue memory is allocated
 as needed, is separate from Go allocations/RSS, and is not a whole-node memory
 cap. Masks that create private sockets outside those callbacks are not covered.
 
-Startup diagnostics distinguish `network_gso=false` from `ipc_batch=true`.
+Engine diagnostics report `packet_io=direct` with the native `mask_layers` count
+or `packet_io=go_finalmask`; the latter reports zero native mask layers because
+Go applies them. Adapter startup distinguishes `network_gso=false` from
+`ipc_batch=true`.
 Ten-second send-drop diagnostics distinguish reported `EMSGSIZE` from
 `ENOBUFS`/`ENOMEM` and suppressed/short mask writes. An independent
 `event=udp_bridge` counter reports drops due to exhausted Rust→Go flow credits
@@ -172,7 +188,7 @@ Focused compatibility checks (rebuild the release archive first):
 native_hash=$(sha256sum native/libxhysteria/target/release/libxhysteria.a)
 CGO_ENABLED=1 go test -race -tags 'xhysteria_native xhysteria_interop' \
   -ldflags="-buildid=xhysteria-${native_hash%% *}" ./native/libxhysteria/interop \
-  -run '^TestNativePacket(Masks|LocalHopping)$' -count=1 -timeout=150s
+  -run '^TestNative(PacketMasks|PacketLocalHopping|HeaderRemoteHopping)$' -count=1 -timeout=300s
 ```
 
 ### HTTP masquerading
@@ -610,9 +626,10 @@ then Rust duplicates the descriptor and owns packet I/O. This preserves socket
 controllers during setup, including Android protection where the embedding app
 provides it; network handover and replacement sockets still need validation.
 
-Salamander, client-only remote IP/port hopping, and once-per-session remote
-selection have direct Rust support; additional UDP masks and local socket hopping
-use the bounded hybrid adapter above. HTTP masquerading supports 404/string
+Salamander, the six MKCP appearance headers and their stacks, client-only remote
+IP/port hopping, and once-per-session remote selection have direct Rust support;
+other UDP masks and local socket hopping use the bounded hybrid adapter above.
+HTTP masquerading supports 404/string
 directly in Rust and streaming file/proxy through bounded Go cover handlers.
 Unsupported mask/socket combinations, advanced TLS
 options, verification-CA reload, and custom QUIC windows/stream limits are

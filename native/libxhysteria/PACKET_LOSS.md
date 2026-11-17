@@ -1,5 +1,30 @@
 # Hysteria packet-loss diagnosis
 
+## Direct mask regression — November 18, 2026
+
+Salamander + WireGuard now uses direct Rust UDP masking instead of the packet
+adapter. With release Rust, `GOMAXPROCS=1 taskset -c 14`, shared flow bridges and
+pool size one, saturated TCP background plus UDP replies gives:
+
+| Native path | UDP payload | Delivered | Missing | Background MiB/s | Sampled kernel UDP drops |
+|---|---:|---:|---:|---:|---:|
+| One Hysteria leg | 256 B | 2000/2000 | 0 | 123.82 | 0 |
+| One Hysteria leg | 4096 B | 2000/2000 | 0 | 119.71 | 0 |
+| Two Hysteria legs | 256 B | 2000/2000 | 0 | 55.58 | 0 |
+| Two Hysteria legs | 4096 B | 2000/2000 | 0 | 55.32 | 0 |
+
+Sampled `credit_dropped_delta` and QUIC UDP receive/send/MTU-drop counters remain
+zero. This is local regression coverage, **not evidence of zero loss on VPS
+paths**. The process/socket sampler has the exclusions documented below; QUIC
+loss detection and application reply loss are distinct metrics. Raw diagnostics
+are in ignored `build_assets/direct-masks-20261118/`.
+
+Run with `XRAY_NET_DIAG=1 XHYS_LOSS_PACKET_MASK=header GOMAXPROCS=1 taskset -c 14`
+and `-test.run '^TestHysteriaPacketLossUnderLoad/native/'` on a rebuilt interop
+test binary. Engine startup now labels direct versus Go FinalMask packet I/O,
+making the selected network path inspectable without mistaking the flow bridge
+(`shared`/`socket`) for the packet adapter.
+
 ## What was measured on 2026-11-17
 
 The running desktop Xray was sampled without restarting the VPN or changing its

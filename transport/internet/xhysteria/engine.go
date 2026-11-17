@@ -75,6 +75,7 @@ type Config struct {
 	CertificatePEM            string                                    `json:"certificate_pem"`
 	KeyPEM                    string                                    `json:"key_pem"`
 	Salamander                string                                    `json:"salamander"`
+	UDPMasks                  []UDPMaskConfig                           `json:"udp_masks,omitempty"`
 	SystemRoots               bool                                      `json:"system_roots"`
 	TxBPS                     uint64                                    `json:"tx_bps"`
 	RxBPS                     uint64                                    `json:"rx_bps"`
@@ -111,6 +112,12 @@ type PortHoppingConfig struct {
 	Once        bool     `json:"once,omitempty"`
 	IntervalMin uint64   `json:"interval_min"`
 	IntervalMax uint64   `json:"interval_max"`
+}
+
+type UDPMaskConfig struct {
+	Kind     string `json:"kind"`
+	Password string `json:"password,omitempty"`
+	Prefix   string `json:"prefix,omitempty"`
 }
 
 type MasqueradeConfig struct {
@@ -319,8 +326,16 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 		if config.Server && maxConnections == 0 {
 			maxConnections = 32
 		}
-		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] engine started bridge=%s arena_bytes=%d role=%s peer=%s max_flows=%d max_connections=%d\n",
-			mode, arenaBytes, e.role, e.peer, maxFlows, maxConnections)
+		packetIO := "direct"
+		if config.PacketBridge {
+			packetIO = "go_finalmask"
+		}
+		maskLayers := len(config.UDPMasks)
+		if config.Salamander != "" {
+			maskLayers++
+		}
+		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] engine started bridge=%s arena_bytes=%d role=%s peer=%s max_flows=%d max_connections=%d packet_io=%s mask_layers=%d\n",
+			mode, arenaBytes, e.role, e.peer, maxFlows, maxConnections, packetIO, maskLayers)
 	}
 	e.wg.Add(2)
 	go e.readLoop()

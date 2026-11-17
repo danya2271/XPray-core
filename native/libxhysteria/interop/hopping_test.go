@@ -218,6 +218,110 @@ func TestEmbeddedNativePortHopping(t *testing.T) {
 	}
 }
 
+func TestNativeHeaderRemoteHopping(t *testing.T) {
+	for _, serverNative := range []bool{false, true} {
+		t.Run(fmt.Sprintf("server_%t", serverNative), func(t *testing.T) {
+			t.Setenv("XRAY_HYSTERIA_NATIVE", "0")
+			if serverNative {
+				t.Setenv("XRAY_HYSTERIA_NATIVE", "1")
+			}
+			t.Setenv("XRAY_HYSTERIA_POOL_SIZE", "1")
+			masks := packetMasks(t, "header")
+			before := native.Stats().StartedEngines
+			server, caPath, _ := xrayServerWithConfig(t, false, func(config *core.Config) {
+				message, err := config.Inbound[0].ReceiverSettings.GetInstance()
+				if err != nil {
+					t.Fatal(err)
+				}
+				receiver := message.(*proxyman.ReceiverConfig)
+				receiver.StreamSettings.Udpmasks = masks
+				config.Inbound[0].ReceiverSettings = serial.ToTypedMessage(receiver)
+			})
+			relay := newHoppingRelay(t, server)
+			ca, err := os.ReadFile(caPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("XRAY_HYSTERIA_NATIVE", "1")
+			config := embeddedClientConfig(t, "127.0.0.1:1", ca, false, auth)
+			message, err := config.Outbound[0].SenderSettings.GetInstance()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sender := message.(*proxyman.SenderConfig)
+			sender.StreamSettings.Udpmasks = append(append([]*serial.TypedMessage(nil), masks...), serial.ToTypedMessage(&udphop.Config{
+				Remote: true, IntervalMin: 5, IntervalMax: 5, RemotePorts: relay.ports(),
+			}))
+			config.Outbound[0].SenderSettings = serial.ToTypedMessage(sender)
+			client, err := core.New(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { client.Close() })
+			if err := client.Start(); err != nil {
+				t.Fatal(err)
+			}
+			tcp, udp := echoTargets(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			var connections []net.Conn
+			for _, address := range []string{"tcp:" + tcp, "udp:" + udp} {
+				target, err := xnet.ParseDestination(address)
+				if err != nil {
+					t.Fatal(err)
+				}
+				connection, err := core.Dial(ctx, client, target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer connection.Close()
+				stop := context.AfterFunc(ctx, func() { connection.Close() })
+				defer stop()
+				connections = append(connections, connection)
+			}
+			for sample := 0; ctx.Err() == nil; sample++ {
+				for index, connection := range connections {
+					size := 32768
+					if index == 1 {
+						size = 4096
+					}
+					payload := bytes.Repeat([]byte{byte(sample)}, size)
+					if _, err := connection.Write(payload); err != nil {
+						t.Fatal(err)
+					}
+					received := make([]byte, size)
+					if _, err := io.ReadFull(connection, received); err != nil || !bytes.Equal(received, payload) {
+						t.Fatalf("header hopping transfer: %v", err)
+					}
+				}
+				relay.mu.Lock()
+				complete := len(relay.peers) == 1
+				for _, peer := range relay.peers {
+					complete = complete && peer.changes >= 2
+				}
+				relay.mu.Unlock()
+				if complete {
+					expected := int64(1)
+					if serverNative {
+						expected++
+					}
+					if native.Stats().StartedEngines-before != expected {
+						t.Fatal("header hopping fell back or opened extra engines")
+					}
+					return
+				}
+				select {
+				case err := <-relay.errors:
+					t.Fatal(err)
+				case <-time.After(250 * time.Millisecond):
+				case <-ctx.Done():
+				}
+			}
+			t.Fatal("header masked flow did not survive two remote hops")
+		})
+	}
+}
+
 func TestEmbeddedNativeRemoteAddressHopping(t *testing.T) {
 	for _, mode := range []string{"ip_only", "ip_and_ports", "ipv6_ports", "once_ip_and_port", "once_ports"} {
 		for _, serverNative := range []bool{false, true} {

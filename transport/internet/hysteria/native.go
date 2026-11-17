@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	cryptotls "crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	stdnet "net"
@@ -25,6 +26,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/header"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -123,16 +125,47 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 		}
 		masks := settings.FinalMask.UDPMasks()
 		direct := true
+		overhead := 0
 		for index, mask := range masks {
 			switch s := mask.(type) {
 			case *salamander.Config:
 				if len(s.Password) < 4 {
 					return c, fmt.Errorf("native Salamander requires a password of at least four bytes")
 				}
-				if c.Salamander != "" {
-					direct = false
+				c.UDPMasks = append(c.UDPMasks, native.UDPMaskConfig{Kind: "salamander", Password: s.Password})
+				overhead += 8
+			case *header.Config:
+				layer := native.UDPMaskConfig{}
+				switch header.HeaderID(s.ID) {
+				case header.DNS:
+					template, err := header.NewHeaderDNS(s.Domain)
+					if err != nil {
+						return c, fmt.Errorf("invalid native DNS mask: %w", err)
+					}
+					prefix := make([]byte, template.Size())
+					template.Serialize(prefix)
+					prefix[0], prefix[1] = 0, 0
+					layer.Kind, layer.Prefix = "dns", hex.EncodeToString(prefix)
+					overhead += len(prefix)
+				case header.DTLS:
+					layer.Kind = "dtls"
+					overhead += 13
+				case header.SRTP:
+					layer.Kind = "srtp"
+					overhead += 4
+				case header.UTP:
+					layer.Kind = "utp"
+					overhead += 4
+				case header.WECHAT:
+					layer.Kind = "wechat"
+					overhead += 13
+				case header.WIREGUARD:
+					layer.Kind = "wireguard"
+					overhead += 4
+				default:
+					return c, fmt.Errorf("invalid native header mask ID %d", s.ID)
 				}
-				c.Salamander = s.Password
+				c.UDPMasks = append(c.UDPMasks, layer)
 			case *udphop.Config:
 				if index != 0 || c.PortHopping != nil {
 					return c, fmt.Errorf("native UDP hopping must be the outermost network mask")
@@ -153,10 +186,13 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 				direct = false
 			}
 		}
-		if !direct {
+		if !direct || len(c.UDPMasks) > 16 || overhead > 252 {
 			c.PacketBridge = true
-			c.Salamander = ""
+			c.UDPMasks = nil
 			c.PortHopping = nil
+		} else if len(c.UDPMasks) == 1 && c.UDPMasks[0].Kind == "salamander" {
+			c.Salamander = c.UDPMasks[0].Password
+			c.UDPMasks = nil
 		}
 	}
 	return c, nil
