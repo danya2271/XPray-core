@@ -4,9 +4,14 @@
 package buf_test
 
 import (
+	"bytes"
 	"crypto/rand"
+	"errors"
+	"io"
 	"net"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/xtls/xray-core/common"
@@ -68,5 +73,73 @@ func TestReadvReader(t *testing.T) {
 
 	if r := cmp.Diff(data, rdata); r != "" {
 		t.Fatal(r)
+	}
+}
+
+func TestReadvReaderRecoversFromDeadlineAndRepeatedReads(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	client, err := net.Dial("tcp4", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	raw, err := client.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := NewReadVReader(client, raw, nil)
+	exchange := func(payload []byte) {
+		t.Helper()
+		if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		written := make(chan error, 1)
+		go func() {
+			_, err := server.Write(payload)
+			written <- err
+		}()
+		var received []byte
+		for len(received) < len(payload) {
+			buffers, err := reader.ReadMultiBuffer()
+			if err != nil {
+				ReleaseMulti(buffers)
+				t.Fatal(err)
+			}
+			for _, buffer := range buffers {
+				received = append(received, buffer.Bytes()...)
+			}
+			ReleaseMulti(buffers)
+		}
+		if err := <-written; err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(received, payload) {
+			t.Fatal("repeated readv changed payload")
+		}
+	}
+	exchange(bytes.Repeat([]byte{0x71}, 8*Size))
+	if err := client.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	buffers, err := reader.ReadMultiBuffer()
+	ReleaseMulti(buffers)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("empty readv ignored deadline: %v", err)
+	}
+	exchange(bytes.Repeat([]byte{0xa7}, 3*Size+17))
+	server.Close()
+	buffers, err = reader.ReadMultiBuffer()
+	ReleaseMulti(buffers)
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("readv retained previous read size after EOF: %v", err)
 	}
 }

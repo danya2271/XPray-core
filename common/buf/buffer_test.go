@@ -56,6 +56,17 @@ func BenchmarkRegularBufferReuse(b *testing.B) {
 	}
 }
 
+func TestRegularBufferReuseDoesNotAllocate(t *testing.T) {
+	allocations := testing.AllocsPerRun(1000, func() {
+		buffer := New()
+		buffer.Extend(32)
+		buffer.Release()
+	})
+	if allocations != 0 {
+		t.Fatalf("regular buffer reuse allocated %.1f objects", allocations)
+	}
+}
+
 func TestBufferIsEmpty(t *testing.T) {
 	buffer := New()
 	defer buffer.Release()

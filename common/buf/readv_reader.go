@@ -57,11 +57,13 @@ type ReadVReader struct {
 	mr      multiReader
 	alloc   allocStrategy
 	counter stats.Counter
+	nBytes  int32
+	read    func(uintptr) bool
 }
 
 // NewReadVReader creates a new ReadVReader.
 func NewReadVReader(reader io.Reader, rawConn syscall.RawConn, counter stats.Counter) *ReadVReader {
-	return &ReadVReader{
+	result := &ReadVReader{
 		Reader:  reader,
 		rawConn: rawConn,
 		alloc: allocStrategy{
@@ -70,23 +72,27 @@ func NewReadVReader(reader io.Reader, rawConn syscall.RawConn, counter stats.Cou
 		mr:      newMultiReader(),
 		counter: counter,
 	}
+	result.read = result.readReady
+	return result
+}
+
+func (r *ReadVReader) readReady(fd uintptr) bool {
+	n := r.mr.Read(fd)
+	if n < 0 {
+		return false
+	}
+	r.nBytes = n
+	return true
 }
 
 func (r *ReadVReader) readMulti() (MultiBuffer, error) {
 	bs := r.alloc.Alloc()
 
 	r.mr.Init(bs)
-	var nBytes int32
-	err := r.rawConn.Read(func(fd uintptr) bool {
-		n := r.mr.Read(fd)
-		if n < 0 {
-			return false
-		}
-
-		nBytes = n
-		return true
-	})
+	r.nBytes = 0
+	err := r.rawConn.Read(r.read)
 	r.mr.Clear()
+	nBytes := r.nBytes
 
 	if err != nil {
 		ReleaseMulti(MultiBuffer(bs))

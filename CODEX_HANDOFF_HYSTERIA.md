@@ -250,6 +250,40 @@ and higher priority for small TCP writes were tested and removed because they
 did not consistently improve latency. Per-wait raw-read closures were replaced
 with reusable per-reader storage to remove their allocation overhead.
 
+## Latest Allocation Follow-up
+
+The final implementation additionally changes the regular Go buffer pool to
+store `*[4096]byte`, avoiding boxed slice-header allocations at `Put`, and reuses
+one callback/byte-count field per `ReadVReader`. Public buffer APIs and ownership
+rules stay intact. Focused tests verify zero-allocation regular reuse and readv
+recovery after deadlines, repeated reads and EOF. These fixes apply to Go too.
+
+`build_assets/native-max-20261117/summary.json` records three fresh two-second
+samples per before/current/Go case, CPU affinity 14, GOMAXPROCS=1, Salamander.
+Native Transfer: 110.06 -> 113.02 MB/s; Go current 84.87. Native Transfer Go
+allocation bytes 5436 -> 4260; allocation count 167.3 -> 115.0. Upload/download
+decrease about 1%; latency is effectively unchanged. Against Go, current native
+Transfer/upload/download ratios are 1.33x/1.83x/1.70x. Go remains faster idle.
+Paced p99 is 1137us native vs 1233us Go at achieved 31.85/31.95 MiB/s.
+
+Latest capacity pair (one fresh sample each with current buffers): native
+89.96 MiB/s, 254.7 MiB cgroup peak, 272.5 MiB final RSS, 7.782 CPU seconds;
+Go 24.24 MiB/s, 280.6 MiB peak, 269.7 MiB final RSS, 16.607 CPU seconds.
+Observed throughput ratio 3.71x, but native heartbeat p99 4182.5us is higher
+than Go 3923.5us. Do not claim lower tail latency from this capacity pair.
+
+TCP command batching and caller-slice shared publication were measured and
+removed: no consistent win across the routing/latency workloads. Final changes
+contain neither prototype.
+
+kettuRay integration is complete in its commit `dde0370`. Its Linux build
+embeds Rust-enabled Xray, defaulting to published Xray revision `9bef1a20`.
+Compatible direct hy2 profiles and HTTP probes select Rust; sing-box supplies
+TUN. Windows/insecure/unsupported settings and chained exits keep compatibility
+backends. Actual local TLS/Salamander HTTP traffic verifies Rust startup without
+Go fallback. Core race tests and the Linux Wails app build pass. Preserve its
+user-owned `cores/slipstream-client` change outside commits.
+
 ## Remaining Limits
 
 This work does not bound every allocation in the Xray process or the whole

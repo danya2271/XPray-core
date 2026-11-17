@@ -1,9 +1,9 @@
 # Native Hysteria performance checks
 
 The initial sections are historical measurements from earlier implementations.
-The final November 17 delivery and subsequent latency follow-up sections contain
-the implementation and its comparison boundaries. The latency follow-up is the
-latest state; do not combine results from different stages.
+The November 17 delivery, latency follow-up and allocation follow-up sections
+describe successive implementations and their comparison boundaries. The
+allocation follow-up is the latest state; do not combine different stages.
 
 Measurements were taken on November 15, 2026 on Linux amd64, an Intel Xeon
 E5-2698 v3 at 2.30 GHz, with Go 1.27.1-X:nodwarf5 and Rust 1.99.0. The host
@@ -721,3 +721,118 @@ publication, close wakeups, read deadlines and recovery, and credit bytes after
 slot reuse. Full native interop and the NodeX-generated configuration pass.
 Linux amd64 and Android arm64/API 26 CLI builds succeed. The vendored BBR code
 is unchanged from its 314-test validation. No remote or device test is included.
+
+## November 17, 2026: allocation follow-up (latest)
+
+CPU and allocation profiles of the latency-follow-up binary are recorded in
+`build_assets/native-max-20261117`. Native-inclusive `perf` sampling of a
+five-second Salamander Transfer case attributes about 13% of user-space cycles
+to the main AES-GCM assembly routine, 4% to Go `memmove`, and 4% to BLAKE2b
+compression. These are sampled user-space proportions, not wall-time fractions
+or a precise end-to-end attribution. Go allocation profiles show regular buffer
+constructors, buffer returns and the readv callback among recurring allocations.
+
+Two changes are retained:
+
+- The regular 4096-byte buffer pool stores `*[4096]byte` rather than `[]byte`.
+  Returning a slice through `sync.Pool` used to allocate a boxed slice header;
+  returning an array pointer avoids that allocation. `New`, `StackNew`,
+  `NewExisted` and `Release` keep their existing ownership rules and public API.
+- Each `ReadVReader` retains one callback and its byte-count result instead of
+  allocating a capturing closure/result on every vector read. Each operation
+  resets its count before waiting; timeout/EOF recovery is regression-tested.
+
+The regular-buffer reuse benchmark reports 0 B/op and 0 allocs/op over three
+one-second samples. A focused allocation regression checks this property.
+These shared Go changes benefit both Go and native Hysteria.
+
+### Paired throughput and latency
+
+Three fresh two-second processes per cell, alternating before/current/Go order,
+Salamander, `GOMAXPROCS=1`, and all threads/endpoints pinned to CPU 14. The
+before column is the latency-follow-up native build; current is native with the
+two buffer changes. The Go column uses the same new buffer changes. No build
+runs concurrently with measurement. Results are arithmetic means;
+`delivery-*.txt` and `summary.json` contain raw samples and aggregation under
+`build_assets/native-max-20261117`.
+
+Rates are decimal MB/s; Transfer counts 64 KiB each way. The CPU/allocation rows
+describe one Transfer operation and include both endpoints. Go allocation
+metrics exclude Rust allocations and arena storage.
+
+| Metric | Native before | Native current | Go current |
+| --- | ---: | ---: | ---: |
+| Transfer MB/s | 110.06 | 113.02 | 84.87 |
+| Upload MB/s | 145.40 | 143.46 | 78.57 |
+| Download MB/s | 141.75 | 140.17 | 82.26 |
+| Transfer CPU ms/op | 1.077 | 1.055 | 1.429 |
+| Transfer Go B/op | 5,436 | 4,260 | 27,187 |
+| Transfer Go allocs/op | 167.3 | 115.0 | 723.0 |
+| Idle TCP p50/p99 microseconds | 172.1 / 242.3 | 173.6 / 244.4 | 96.1 / 154.7 |
+| Idle UDP p50/p99 microseconds | 158.7 / 228.1 | 159.9 / 228.2 | 97.5 / 166.4 |
+| Paced TCP p99 microseconds | 1,130 | 1,137 | 1,233 |
+| Paced achieved background MiB/s | 31.97 | 31.85 | 31.95 |
+| Saturated TCP p99 microseconds | 5,029 | 5,033 | 7,521 |
+| Saturated achieved background MiB/s | 124.10 | 123.67 | 77.15 |
+
+Native Transfer allocations fall about 31%, allocation bytes 22%, and CPU work
+2%; rate rises about 3% in this short series. Upload/download rates fall about
+1%, and idle/tail latency does not improve. The result is an allocation
+improvement, not a universal speed or latency increase. Against current Go,
+native Transfer is 1.33x, upload 1.83x and download 1.70x. Go still wins idle
+latency. Native paced p99 is 7.8% below Go at approximately equal delivered load;
+saturated delivered rates differ and must not be treated as equal-load latency.
+Three runs do not establish statistical significance or a universal factor.
+
+Two additional prototypes were measured and removed. Combining up to four
+already available TCP commands into a Quinn write improved upload/download
+about 2%, but regressed request/response throughput and CPU work. Borrowing the
+caller's slice for synchronous shared publication avoided a potential copy but
+did not consistently improve the real routing path, which already supplies
+owned MultiBuffers. Neither experiment is present in the final code.
+
+### Capacity after common-buffer changes
+
+One fresh sample per backend, native then Go, with both using the current
+common-buffer changes. The established fixture uses 500 identities, 1000
+authenticated QUIC sessions and open TCP flows, eight cascade routes, sixteen
+native or eight Go upstream sessions, 500 MiB duplex, two-second delayed readers,
+twelve seconds of heartbeats, and only the entry inside a 1 GiB/100%-CPU cgroup.
+Both set `GOMAXPROCS=1` and `GOMEMLIMIT=256MiB`, with Salamander.
+
+| Metric | Native | Go |
+| --- | ---: | ---: |
+| Duplex MiB/s | 89.96 | 24.24 |
+| Idle entry RSS MiB | 139.3 | 172.6 |
+| Buffered entry RSS MiB | 230.9 | 257.1 |
+| Peak entry RSS MiB | 272.5 | 295.6 |
+| Peak entry cgroup MiB | 254.7 | 280.6 |
+| Final entry RSS MiB | 272.5 | 269.7 |
+| Entry RSS two seconds after close MiB | 271.2 | 269.8 |
+| Entry cgroup CPU seconds | 7.782 | 16.607 |
+| Heartbeat p50/p99 microseconds | 1,105.7 / 4,182.5 | 2,227.9 / 3,923.5 |
+
+Both pass. The observed rate ratio is 3.71x, entry cgroup peak about 9% lower
+and entry CPU work 53% lower. Native final RSS is about 1% higher and heartbeat
+p99 about 7% higher. This single pair is not evidence of improved capacity-tail
+latency or a repeated measurement of the earlier 4.25x result. Whole-node OOM
+guarantees and allocator page-retention limits remain unchanged.
+
+Focused Go race checks and full native interop pass, including readv deadline
+recovery/repeated reads/EOF, both bridges and the packaged NodeX configuration.
+Linux amd64 and Android arm64/API 26 CLI builds succeed. Rust, shared ABI and
+vendored Quinn are unchanged from the latency follow-up.
+
+### Desktop integration
+
+The sibling kettuRay commit `dde0370` builds and embeds native Rust Hysteria on
+Linux, using published Xray commit `9bef1a20` by default. Compatible direct
+Hysteria 2 profiles and their HTTP checks/probes select Xray's Rust transport;
+sing-box remains the TUN frontend. Windows, insecure TLS, unsupported
+ALPN/obfuscation and chained Hysteria exits retain their compatibility paths.
+The real local TLS/Salamander traffic test confirms shared Rust startup without
+Go fallback. Its core race tests and Linux Wails build pass.
+
+No remote deployment, running application restart or Android-device change was
+performed. `XPRAY_SOURCE_DIR` can build a local Xray checkout without modifying
+its Git state; no unpublished revision is pinned as a remote build default.

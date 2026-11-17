@@ -16,9 +16,7 @@ const (
 
 var ErrBufferFull = errors.New("buffer is full")
 
-// bytespool rounds 4096 up to 8192, while managed Release accepts only Size.
-// Keep an exact-sized pool so regular buffers are actually reused.
-var pool = &sync.Pool{New: func() any { return make([]byte, Size) }}
+var pool = &sync.Pool{New: func() any { return new([Size]byte) }}
 
 // ownership represents the data owner of the buffer.
 type ownership uint8
@@ -42,15 +40,8 @@ type Buffer struct {
 
 // New creates a managed Buffer with zero length and Size capacity.
 func New() *Buffer {
-	buf := pool.Get().([]byte)
-	if cap(buf) >= Size {
-		buf = buf[:Size]
-	} else {
-		buf = make([]byte, Size)
-	}
-
 	return &Buffer{
-		v: buf,
+		v: pool.Get().(*[Size]byte)[:],
 	}
 }
 
@@ -83,15 +74,8 @@ func FromBytes(b []byte) *Buffer {
 // StackNew creates a new Buffer object on stack, managed.
 // This method is for buffers that is released in the same function.
 func StackNew() Buffer {
-	buf := pool.Get().([]byte)
-	if cap(buf) >= Size {
-		buf = buf[:Size]
-	} else {
-		buf = make([]byte, Size)
-	}
-
 	return Buffer{
-		v: buf,
+		v: pool.Get().(*[Size]byte)[:],
 	}
 }
 
@@ -116,7 +100,7 @@ func (b *Buffer) Release() {
 	switch b.ownership {
 	case managed:
 		if cap(p) == Size {
-			pool.Put(p)
+			pool.Put((*[Size]byte)(p))
 		}
 	case bytespools:
 		bytespool.Free(p)
