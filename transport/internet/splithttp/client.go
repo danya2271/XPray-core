@@ -2,11 +2,14 @@ package splithttp
 
 import (
 	"context"
+	stdErrors "errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +33,18 @@ func nextNetworkDiagSample() uint64 {
 		return 0
 	}
 	return sequence
+}
+
+func networkDiagError(err error) string {
+	var requestErr *url.Error
+	if stdErrors.As(err, &requestErr) {
+		err = requestErr.Err
+	}
+	message := strings.ReplaceAll(err.Error(), "\n", " ")
+	if len(message) > 160 {
+		message = message[:160]
+	}
+	return message
 }
 
 // interface to abstract between use of browser dialer, vs net/http
@@ -139,13 +154,19 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	diagID := nextNetworkDiagSample()
 	startedAt := time.Now()
 	payloadBytes := payload.Len()
+	diagStatusCode := 0
+	diagRequestError := false
+	diagError := ""
 	if diagID != 0 {
 		defer func() {
 			fmt.Printf(
-				"[XRAY_NET_DIAG][XHTTP] id=%d event=upload version=%s bytes=%d duration_ms=%d\n",
+				"[XRAY_NET_DIAG][XHTTP] id=%d event=upload version=%s bytes=%d status_code=%d request_error=%t error=%q duration_ms=%d\n",
 				diagID,
 				c.httpVersion,
 				payloadBytes,
+				diagStatusCode,
+				diagRequestError,
+				diagError,
 				time.Since(startedAt).Milliseconds(),
 			)
 		}()
@@ -154,6 +175,8 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	method := c.transportConfig.GetNormalizedUplinkHTTPMethod()
 	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, nil)
 	if err != nil {
+		diagRequestError = true
+		diagError = networkDiagError(err)
 		buf.ReleaseMulti(payload)
 		return err
 	}
@@ -162,15 +185,19 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 		c.transportConfig.FillPacketRequest(req, sessionId, seqStr, payload)
 		resp, err := c.client.Do(req)
 		if err != nil {
+			diagRequestError = true
+			diagError = networkDiagError(err)
 			c.closed.Store(true)
 			common.Close(req.Body)
 			return err
 		}
+		diagStatusCode = resp.StatusCode
 
 		io.Copy(io.Discard, resp.Body)
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
+			diagRequestError = true
 			return errors.New("bad status code:", resp.Status)
 		}
 	} else {
