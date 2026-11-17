@@ -18,8 +18,8 @@ use std::{
 use tokio::{io::unix::AsyncFd, sync::Notify};
 
 pub const MAGIC: u64 = 0x5848595353484d32;
-pub const VERSION: u32 = 3;
-pub const CAPACITY: u32 = 32;
+pub const VERSION: u32 = 5;
+pub const CAPACITY: u32 = 8;
 pub const MAX_FRAME: usize = 65536 + 4096;
 pub const STRIDE: usize = (16 + MAX_FRAME + 63) & !63;
 pub const HEADER: usize = 320;
@@ -43,7 +43,9 @@ struct Header {
     go_pending: AtomicU32,
     native_pending: AtomicU32,
     space_pending: AtomicU32,
-    pad: [u8; 16],
+    event_waiting: AtomicU32,
+    command_waiting: AtomicU32,
+    pad: [u8; 8],
     command_head: Line,
     command_tail: Line,
     event_head: Line,
@@ -113,7 +115,9 @@ impl Bridge {
                 go_pending: AtomicU32::new(0),
                 native_pending: AtomicU32::new(0),
                 space_pending: AtomicU32::new(0),
-                pad: [0; 16],
+                event_waiting: AtomicU32::new(0),
+                command_waiting: AtomicU32::new(0),
+                pad: [0; 8],
                 command_head: Line {
                     value: AtomicU32::new(0),
                     pad: [0; 60],
@@ -186,16 +190,22 @@ impl Bridge {
     }
 
     pub fn notify_space(&self) {
-        if self.header().space_pending.swap(1, Ordering::AcqRel) == 0 {
+        if self.header().command_waiting.load(Ordering::SeqCst) != 0
+            && self.header().command_waiting.swap(0, Ordering::SeqCst) != 0
+            && self.header().space_pending.swap(1, Ordering::AcqRel) == 0
+        {
             signal(self.space.as_raw_fd());
         }
     }
 
     pub async fn send(&self, kind: u8, id: u64, data: &[u8]) -> Result<()> {
+        self.send_vectored(kind, id, &[data]).await
+    }
+
+    pub async fn send_vectored(&self, kind: u8, id: u64, parts: &[&[u8]]) -> Result<()> {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
-            changed.as_mut().enable();
             let published = {
                 // Serialize only the ring publication, never an async wait.
                 // This keeps one producer without an extra task/queue hop.
@@ -203,7 +213,7 @@ impl Bridge {
                 if self.closed() {
                     return Err("Go bridge closed".into());
                 }
-                self.push(false, kind, id, data)?
+                self.push_vectored(false, kind, id, parts)?
             };
             self.notify_go();
             if published {
@@ -283,12 +293,21 @@ impl Bridge {
             return Err("invalid shared frame descriptor".into());
         }
         let data = Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(slot.add(16), len) });
-        tail.store(index.wrapping_add(1), Ordering::Release);
+        tail.store(index.wrapping_add(1), Ordering::SeqCst);
         Ok(Some((kind as u8, id, data)))
     }
 
     pub fn push(&self, commands: bool, kind: u8, id: u64, data: &[u8]) -> Result<bool> {
-        if data.len() > MAX_FRAME {
+        let _writer = self.event_writer.lock().unwrap();
+        if self.closed() {
+            return Err("Go bridge closed".into());
+        }
+        self.push_vectored(commands, kind, id, &[data])
+    }
+
+    fn push_vectored(&self, commands: bool, kind: u8, id: u64, parts: &[&[u8]]) -> Result<bool> {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        if len > MAX_FRAME {
             return Err("oversized shared frame".into());
         }
         let header = self.header();
@@ -298,19 +317,29 @@ impl Bridge {
             (&header.event_head.value, &header.event_tail.value)
         };
         let index = head.load(Ordering::Relaxed);
-        let count = index.wrapping_sub(tail.load(Ordering::Acquire));
+        let mut count = index.wrapping_sub(tail.load(Ordering::Acquire));
         if count > CAPACITY {
             return Err("corrupt shared ring indices".into());
         }
         if count == CAPACITY {
-            return Ok(false);
+            if !commands {
+                header.event_waiting.store(1, Ordering::SeqCst);
+                count = index.wrapping_sub(tail.load(Ordering::SeqCst));
+            }
+            if count == CAPACITY {
+                return Ok(false);
+            }
         }
         let slot = self.slot(commands, index);
         unsafe {
             slot.cast::<u32>().write(kind as u32);
-            slot.add(4).cast::<u32>().write(data.len() as u32);
+            slot.add(4).cast::<u32>().write(len as u32);
             slot.add(8).cast::<u64>().write(id);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), slot.add(16), data.len());
+            let mut offset = 16;
+            for part in parts {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), slot.add(offset), part.len());
+                offset += part.len();
+            }
         }
         head.store(index.wrapping_add(1), Ordering::Release);
         Ok(true)
@@ -333,12 +362,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_space_notification_requires_a_waiting_writer() {
+        let bridge = Bridge::new().unwrap();
+        let read = || {
+            let mut value = 0u64;
+            let count =
+                unsafe { libc::read(bridge.space.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
+            (count, value)
+        };
+        bridge.notify_space();
+        assert_eq!(read().0, -1);
+        bridge.header().command_waiting.store(1, Ordering::SeqCst);
+        bridge.notify_space();
+        assert_eq!(read(), (8, 1));
+        assert_eq!(bridge.header().command_waiting.load(Ordering::SeqCst), 0);
+        bridge.notify_space();
+        assert_eq!(read().0, -1);
+    }
+
+    #[test]
+    fn full_event_ring_arms_its_writer_before_waiting() {
+        let bridge = Bridge::new().unwrap();
+        for id in 0..CAPACITY {
+            assert!(bridge.push(false, 3, u64::from(id), b"payload").unwrap());
+        }
+        assert_eq!(bridge.header().event_waiting.load(Ordering::SeqCst), 0);
+        assert!(!bridge.push(false, 3, 99, b"blocked").unwrap());
+        assert_eq!(bridge.header().event_waiting.load(Ordering::SeqCst), 1);
+        bridge.pop(false).unwrap().unwrap();
+        assert!(bridge.push(false, 3, 99, b"unblocked").unwrap());
+    }
+
+    #[tokio::test]
+    async fn vectored_payload_publishes_one_frame_without_changing_bytes() {
+        let bridge = Bridge::new().unwrap();
+        let parts = [b"prefix".as_slice(), b"", b"payload", b"suffix"];
+        bridge.send_vectored(3, 17, &parts).await.unwrap();
+        let (kind, id, data) = bridge.pop(false).unwrap().unwrap();
+        assert_eq!(
+            (kind, id, data.as_ref()),
+            (3, 17, b"prefixpayloadsuffix".as_slice())
+        );
+        assert!(bridge.pop(false).unwrap().is_none());
+        let oversized = vec![0; MAX_FRAME];
+        assert!(
+            bridge
+                .send_vectored(3, 18, &[&oversized, b"x"])
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
     fn layout_wraparound_and_full_rings() {
         assert_eq!(std::mem::size_of::<Header>(), HEADER);
         assert_eq!(std::mem::offset_of!(Header, closed), 32);
         assert_eq!(std::mem::offset_of!(Header, go_pending), 36);
         assert_eq!(std::mem::offset_of!(Header, native_pending), 40);
         assert_eq!(std::mem::offset_of!(Header, space_pending), 44);
+        assert_eq!(std::mem::offset_of!(Header, event_waiting), 48);
+        assert_eq!(std::mem::offset_of!(Header, command_waiting), 52);
         assert_eq!(std::mem::offset_of!(Header, command_head), 64);
         assert_eq!(std::mem::offset_of!(Header, command_tail), 128);
         assert_eq!(std::mem::offset_of!(Header, event_head), 192);

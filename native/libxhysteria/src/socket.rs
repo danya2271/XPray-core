@@ -11,6 +11,74 @@ use std::{
     task::{Context, Poll},
 };
 
+#[derive(Debug)]
+pub struct ReceiveSocket {
+    socket: Arc<dyn AsyncUdpSocket>,
+    segments: usize,
+}
+
+impl ReceiveSocket {
+    pub fn new(
+        socket: Arc<dyn AsyncUdpSocket>,
+        descriptor: std::os::fd::RawFd,
+        compact: bool,
+    ) -> Self {
+        let mut segments = socket.max_receive_segments();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if compact && segments > 1 {
+            let disabled = 0i32;
+            let result = unsafe {
+                libc::setsockopt(
+                    descriptor,
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    (&disabled as *const i32).cast(),
+                    std::mem::size_of_val(&disabled) as libc::socklen_t,
+                )
+            };
+            if result == 0 {
+                segments = 1;
+            }
+        }
+        Self { socket, segments }
+    }
+}
+
+impl AsyncUdpSocket for ReceiveSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.socket.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+        self.socket.try_send(transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        self.socket.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.socket.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.segments
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.socket.may_fragment()
+    }
+}
+
 pub struct MaskedSocket {
     socket: Arc<dyn AsyncUdpSocket>,
     mask: Salamander,
@@ -171,6 +239,55 @@ mod tests {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         socket.set_nonblocking(true).unwrap();
         MaskedSocket::new(socket, b"test-password").unwrap()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn compact_receive_socket_preserves_datagrams() {
+        use std::os::fd::AsRawFd;
+        let raw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let descriptor = raw.as_raw_fd();
+        let wrapped = quinn::TokioRuntime.wrap_udp_socket(raw).unwrap();
+        let socket = ReceiveSocket::new(wrapped, descriptor, true);
+        let mut gro = 1i32;
+        let mut length = std::mem::size_of_val(&gro) as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_UDP,
+                libc::UDP_GRO,
+                (&mut gro as *mut i32).cast(),
+                &mut length,
+            )
+        };
+        if result == 0 {
+            assert_eq!(gro, 0);
+            assert_eq!(socket.max_receive_segments(), 1);
+        }
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for payload in [b"first".as_slice(), b"second", b"third"] {
+            sender
+                .send_to(payload, socket.local_addr().unwrap())
+                .unwrap();
+        }
+        let mut storage = [[0; 1472]; 4];
+        let mut bufs: Vec<_> = storage
+            .iter_mut()
+            .map(|data| IoSliceMut::new(data))
+            .collect();
+        let mut meta = [udp::RecvMeta::default(); 4];
+        let count = poll_fn(|cx| socket.poll_recv(cx, &mut bufs, &mut meta))
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        for (index, payload) in [b"first".as_slice(), b"second", b"third"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(&bufs[index][..meta[index].len], *payload);
+            assert_eq!(meta[index].addr, sender.local_addr().unwrap());
+        }
     }
 
     #[tokio::test]

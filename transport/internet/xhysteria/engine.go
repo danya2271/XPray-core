@@ -62,32 +62,37 @@ const (
 
 // Config is copied by Rust during setup. No Go pointers survive the CGO call.
 type Config struct {
-	Server           bool                                      `json:"server"`
-	Peer             string                                    `json:"peer"`
-	ServerName       string                                    `json:"server_name"`
-	Auth             string                                    `json:"auth"`
-	Users            []string                                  `json:"users"`
-	CAPEM            string                                    `json:"ca_pem"`
-	CertificatePEM   string                                    `json:"certificate_pem"`
-	KeyPEM           string                                    `json:"key_pem"`
-	Salamander       string                                    `json:"salamander"`
-	SystemRoots      bool                                      `json:"system_roots"`
-	TxBPS            uint64                                    `json:"tx_bps"`
-	RxBPS            uint64                                    `json:"rx_bps"`
-	LossCompensation bool                                      `json:"loss_compensation"`
-	Congestion       string                                    `json:"congestion"`
-	DisablePMTUD     bool                                      `json:"disable_pmtud"`
-	DisableGSO       bool                                      `json:"disable_gso"`
-	MaxIdleTimeout   uint64                                    `json:"max_idle_timeout"`
-	KeepAlivePeriod  uint64                                    `json:"keep_alive_period"`
-	PortHopping      *PortHoppingConfig                        `json:"port_hopping,omitempty"`
-	Diagnostic       bool                                      `json:"diagnostic"`
-	ExternalAuth     bool                                      `json:"external_auth"`
-	UDPIdleTimeout   uint64                                    `json:"udp_idle_timeout"`
-	MaxFlows         uint32                                    `json:"max_flows"`
-	MaxConnections   uint32                                    `json:"max_connections"`
-	ServerWorkers    uint8                                     `json:"server_workers"`
-	Authenticate     func(string) (*protocol.MemoryUser, bool) `json:"-"`
+	Server                    bool                                      `json:"server"`
+	Peer                      string                                    `json:"peer"`
+	ServerName                string                                    `json:"server_name"`
+	Auth                      string                                    `json:"auth"`
+	Users                     []string                                  `json:"users"`
+	CAPEM                     string                                    `json:"ca_pem"`
+	CertificatePEM            string                                    `json:"certificate_pem"`
+	KeyPEM                    string                                    `json:"key_pem"`
+	Salamander                string                                    `json:"salamander"`
+	SystemRoots               bool                                      `json:"system_roots"`
+	TxBPS                     uint64                                    `json:"tx_bps"`
+	RxBPS                     uint64                                    `json:"rx_bps"`
+	LossCompensation          bool                                      `json:"loss_compensation"`
+	Congestion                string                                    `json:"congestion"`
+	DisablePMTUD              bool                                      `json:"disable_pmtud"`
+	DisableGSO                bool                                      `json:"disable_gso"`
+	MaxIdleTimeout            uint64                                    `json:"max_idle_timeout"`
+	KeepAlivePeriod           uint64                                    `json:"keep_alive_period"`
+	PortHopping               *PortHoppingConfig                        `json:"port_hopping,omitempty"`
+	Diagnostic                bool                                      `json:"diagnostic"`
+	ExternalAuth              bool                                      `json:"external_auth"`
+	UDPIdleTimeout            uint64                                    `json:"udp_idle_timeout"`
+	MaxFlows                  uint32                                    `json:"max_flows"`
+	MaxConnections            uint32                                    `json:"max_connections"`
+	ServerWorkers             uint8                                     `json:"server_workers"`
+	ProcessWorkers            uint8                                     `json:"process_workers"`
+	SendBufferBytes           uint32                                    `json:"send_buffer_bytes"`
+	ReceiveBufferBytes        uint32                                    `json:"receive_buffer_bytes"`
+	ProcessSendBufferBytes    uint32                                    `json:"process_send_buffer_bytes"`
+	ProcessReceiveBufferBytes uint32                                    `json:"process_receive_buffer_bytes"`
+	Authenticate              func(string) (*protocol.MemoryUser, bool) `json:"-"`
 }
 
 type PortHoppingConfig struct {
@@ -190,8 +195,13 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 			config.ServerWorkers = uint8(n)
 		}
 	}
-	if config.MaxFlows > 65536 || config.MaxConnections > 4096 || config.ServerWorkers > 16 || (config.ExternalAuth && config.Authenticate == nil) {
+	if config.MaxFlows > 65536 || config.MaxConnections > 4096 || config.ServerWorkers > 16 || config.ProcessWorkers > 16 || (config.SendBufferBytes != 0 && (config.SendBufferBytes < maxFrame || config.SendBufferBytes > 1<<30)) || (config.ExternalAuth && config.Authenticate == nil) {
 		return nil, errors.New("invalid native engine limits or authenticator")
+	}
+	for _, limit := range []uint32{config.ReceiveBufferBytes, config.ProcessSendBufferBytes, config.ProcessReceiveBufferBytes} {
+		if limit != 0 && (limit < maxFrame || limit > 1<<30) {
+			return nil, errors.New("invalid native buffer budget")
+		}
 	}
 	if uint32(C.xhys_abi_version()) != C.XHYS_ABI_VERSION {
 		return nil, errors.New("native ABI version mismatch")
@@ -264,7 +274,7 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 	if maxFlows == 0 {
 		maxFlows = 128
 		if config.Server {
-			maxFlows = 1024
+			maxFlows = 64
 		}
 	}
 	e := &Engine{handle: handle, bridge: bridge, arenaBytes: arenaBytes, local: local, remote: remote, flows: make(map[uint64]*Conn), out: make(chan frame, 128), done: make(chan struct{}), accept: accept,
@@ -769,14 +779,22 @@ type Conn struct {
 }
 
 func newConn(e *Engine, id uint64, target xnet.Destination, remote net.Addr) *Conn {
-	c := &Conn{engine: e, id: id, target: target, remote: remote, in: make(chan frame, 18), closed: make(chan struct{}), changed: make(chan struct{}), writeCredit: make(chan struct{}, 16)}
+	window := 8
+	if e.role == "server" {
+		window = 4
+	}
+	c := &Conn{engine: e, id: id, target: target, remote: remote, in: make(chan frame, window+2), closed: make(chan struct{}), changed: make(chan struct{}), writeCredit: make(chan struct{}, window)}
 	if target.IsValid() && target.Address != nil {
 		c.targetAddress = target.NetAddr()
 	}
-	for range 16 {
+	for range window {
 		c.writeCredit <- struct{}{}
 	}
 	return c
+}
+
+func (c *Conn) chunkSize() int32 {
+	return 16384
 }
 
 func (c *Conn) NativeHysteriaTarget() xnet.Destination { return c.target }
@@ -882,9 +900,10 @@ func (c *Conn) nextFrame() (frame, error) {
 func (c *Conn) received(f frame) (frame, error) {
 	if f.kind == dataFrame || f.kind == datagramFrame {
 		c.readCredits++
-		if c.readCredits >= 8 {
+		if c.readCredits >= uint8(cap(c.writeCredit)/2) {
+			count := c.readCredits
 			c.readCredits = 0
-			if err := c.engine.send(frame{kind: creditFrame, id: c.id, data: []byte{8}}, time.Now().Add(10*time.Second)); err != nil {
+			if err := c.engine.send(frame{kind: creditFrame, id: c.id, data: creditCounts[count : count+1]}, time.Now().Add(10*time.Second)); err != nil {
 				select {
 				case <-c.engine.done:
 					// Published payload remains readable after engine shutdown.
@@ -1036,7 +1055,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 	n := 0
 	for len(p) > 0 {
-		chunk := min(len(p), 65536)
+		chunk := min(len(p), int(c.chunkSize()))
 		if err := c.awaitWriteCredit(); err != nil {
 			return n, err
 		}
@@ -1151,7 +1170,7 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			if err := c.awaitWriteCredit(); err != nil {
 				return err
 			}
-			if len(mb) == 1 && mb[0].Len() <= 65536 {
+			if len(mb) == 1 && mb[0].Len() <= c.chunkSize() {
 				storage := mb[0]
 				if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: storage.Bytes(), storage: storage}); err != nil {
 					return err
@@ -1160,10 +1179,10 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				mb[0] = nil
 				return nil
 			}
-			storage := buf.NewWithSize(65536)
-			for len(mb) != 0 && storage.Len() < 65536 {
+			storage := buf.NewWithSize(c.chunkSize())
+			for len(mb) != 0 && storage.Len() < c.chunkSize() {
 				b := mb[0]
-				n := min(b.Len(), 65536-storage.Len())
+				n := min(b.Len(), c.chunkSize()-storage.Len())
 				storage.Write(b.BytesTo(n))
 				b.Advance(n)
 				if b.IsEmpty() {

@@ -16,6 +16,31 @@ use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
 mod bw_estimation;
 mod min_max;
 
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn app_limited_acknowledgments_do_not_grow_window_without_bound() {
+        let now = Instant::now();
+        let mut controller = Arc::new(BbrConfig::default()).build(now, 1200);
+        let initial = controller.window();
+        let rtt = RttEstimator::new(Duration::from_millis(1));
+        for packet in 1..=10000 {
+            let sent = now + Duration::from_millis(packet * 10);
+            let acknowledged = sent + Duration::from_millis(1);
+            controller.on_sent(sent, 1200, packet);
+            controller.on_ack(acknowledged, sent, 1200, true, &rtt);
+            controller.on_end_acks(acknowledged, 0, true, Some(packet));
+        }
+        assert!(
+            controller.window() <= 2 * initial + 1200,
+            "application-limited cwnd grew from {initial} to {} bytes",
+            controller.window()
+        );
+    }
+}
+
 /// Experimental! Use at your own risk.
 ///
 /// Aims for reduced buffer bloat and improved performance over high bandwidth-delay product networks.
@@ -324,7 +349,7 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd + bytes_acked);
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+        } else if (self.cwnd < target_window) || (self.acked_bytes < self.init_cwnd) {
             // If the connection is not yet out of startup phase, do not decrease
             // the window.
             self.cwnd += bytes_acked;
@@ -557,6 +582,11 @@ impl AckAggregationState {
         round: u64,
         max_bandwidth: u64,
     ) -> u64 {
+        if max_bandwidth == 0 {
+            self.aggregation_epoch_start_time = Some(now);
+            self.aggregation_epoch_bytes = 0;
+            return 0;
+        }
         // Compute how many bytes are expected to be delivered, assuming max
         // bandwidth is correct.
         let expected_bytes_acked = max_bandwidth

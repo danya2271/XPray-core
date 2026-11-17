@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -95,7 +96,7 @@ func benchmarkExchange(b *testing.B, conn net.Conn, data, received []byte) {
 
 func BenchmarkNativeOpenClose(b *testing.B) {
 	benchmarkModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
-		if os.Getenv("XRAY_HYSTERIA_NATIVE") == "0" {
+		if os.Getenv("XRAY_HYSTERIA_NATIVE") == "0" && os.Getenv("XHYS_BENCH_GO_OPENCLOSE") != "1" {
 			b.Skip("Go baseline returns closed pipe under sustained rapid open/close; no valid result")
 		}
 		data, received := []byte("ping"), make([]byte, 4)
@@ -104,13 +105,29 @@ func BenchmarkNativeOpenClose(b *testing.B) {
 		benchmarkExchange(b, conn, data, received)
 		conn.Close()
 		before := native.Stats().StartedEngines
+		trace := os.Getenv("XHYS_BENCH_TRACE") == "1"
 		b.ReportAllocs()
 		b.ResetTimer()
 		cpu := processCPU()
+		iteration := 0
 		for b.Loop() {
+			iteration++
+			var started, opened, exchanged time.Time
+			if trace {
+				started = time.Now()
+			}
 			conn := benchmarkDial(b, client, target)
+			if trace {
+				opened = time.Now()
+			}
 			benchmarkExchange(b, conn, data, received)
+			if trace {
+				exchanged = time.Now()
+			}
 			conn.Close()
+			if trace && time.Since(started) > 100*time.Millisecond {
+				b.Logf("slow short flow %d: open=%s exchange=%s close=%s", iteration, opened.Sub(started), exchanged.Sub(opened), time.Since(exchanged))
+			}
 		}
 		b.StopTimer()
 		b.ReportMetric(float64(processCPU()-cpu)/float64(b.N), "process-cpu-ns/op")
@@ -275,6 +292,14 @@ func benchmarkLatency(b *testing.B, client *core.Instance, target xnet.Destinati
 func benchmarkLatencyWithLoad(b *testing.B, client *core.Instance, target xnet.Destination, loaded, paced bool) {
 	b.Helper()
 	var backgroundBytes atomic.Int64
+	pacedMiBPS := 64
+	if value := os.Getenv("XHYS_BENCH_PACED_MIBPS"); paced && value != "" {
+		var err error
+		pacedMiBPS, err = strconv.Atoi(value)
+		if err != nil || pacedMiBPS < 1 || pacedMiBPS > 4096 {
+			b.Fatal("XHYS_BENCH_PACED_MIBPS must be 1..4096")
+		}
+	}
 	if loaded {
 		var workers sync.WaitGroup
 		var load []net.Conn
@@ -294,9 +319,7 @@ func benchmarkLatencyWithLoad(b *testing.B, client *core.Instance, target xnet.D
 			workers.Go(func() {
 				var ticks <-chan time.Time
 				if paced {
-					// Four workers, 128 exchanges/s, 64 KiB each way:
-					// 64 MiB/s offered load for either server backend.
-					ticker := time.NewTicker(time.Second / 128)
+					ticker := time.NewTicker(time.Second / time.Duration(2*pacedMiBPS))
 					defer ticker.Stop()
 					ticks = ticker.C
 				}

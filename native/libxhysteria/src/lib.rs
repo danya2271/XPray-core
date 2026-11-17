@@ -7,6 +7,9 @@ pub mod protocol;
 pub mod salamander;
 pub mod udp;
 
+#[cfg(feature = "allocation-profile")]
+mod allocation_profile;
+
 #[cfg(feature = "engine")]
 mod congestion;
 #[cfg(all(feature = "engine", unix))]

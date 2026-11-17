@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -40,11 +42,19 @@ const (
 	psk  = "native-interop-salamander"
 )
 
+func fixtureBinary(name string) (string, error) {
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", errors.New("cannot locate interop test source")
+	}
+	return filepath.Join(filepath.Dir(source), "..", "target", "debug", name), nil
+}
+
 func TestNativeClientAgainstXray(t *testing.T) {
 	binary := os.Getenv("XHYS_PROBE")
 	if binary == "" {
 		var err error
-		binary, err = filepath.Abs("../target/debug/xhys-probe")
+		binary, err = fixtureBinary("xhys-probe")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,7 +125,7 @@ func TestXrayClientAgainstNative(t *testing.T) {
 	binary := os.Getenv("XHYS_ECHO")
 	if binary == "" {
 		var err error
-		binary, err = filepath.Abs("../target/debug/xhys-echo")
+		binary, err = fixtureBinary("xhys-echo")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -361,6 +371,10 @@ func prototypeQuicParams() *internet.QuicParams {
 }
 
 func echoTargets(t testing.TB) (string, string) {
+	return echoTargetsWithTimeout(t, 20*time.Second)
+}
+
+func echoTargetsWithTimeout(t testing.TB, timeout time.Duration) (string, string) {
 	t.Helper()
 	tcp, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -375,7 +389,7 @@ func echoTargets(t testing.TB) (string, string) {
 			}
 			go func() {
 				defer conn.Close()
-				_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+				_ = conn.SetDeadline(time.Now().Add(timeout))
 				_, _ = io.Copy(conn, conn)
 			}()
 		}

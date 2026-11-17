@@ -78,6 +78,12 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	c.KeepAlivePeriod = uint64(q.KeepAlivePeriod)
 	c.LossCompensation = !q.BrutalDisableLossCompensation
 	c.Diagnostic = os.Getenv("XRAY_NET_DIAG") == "1"
+	c.ProcessWorkers = uint8(min(4, max(1, runtime.GOMAXPROCS(0))))
+	memoryBytes, _ := nativeServerMemory()
+	c.SendBufferBytes = 8 << 20
+	c.ReceiveBufferBytes = uint32(min(uint64(8<<20), max(uint64(2<<20), memoryBytes/512)))
+	c.ProcessSendBufferBytes = uint32(min(uint64(128<<20), max(uint64(8<<20), memoryBytes/16)))
+	c.ProcessReceiveBufferBytes = c.ProcessSendBufferBytes
 	for _, entry := range t.Certificate {
 		certificate, key := entry.Certificate, entry.Key
 		if (entry.CertificatePath != "" || entry.KeyPath != "") && !entry.OneTimeLoading && entry.Usage != tls.Certificate_ENCIPHERMENT {
@@ -148,27 +154,24 @@ func nativeServerLimit(name string, fallback, maximum uint32) (uint32, error) {
 	return uint32(parsed), nil
 }
 
-func tuneNativeServerLimits(memoryBytes uint64, cpus int) (uint32, uint32) {
+func tuneNativeServerLimits(memoryBytes uint64) (uint32, uint32) {
 	const (
-		minConnections = uint64(8)
-		minFlows       = uint64(16)
-		maxConnections = uint64(256)
-		maxFlows       = uint64(1024)
-		connectionMiB  = uint64(12)
-		flowMiB        = uint64(4)
+		minConnections = uint64(32)
+		minFlows       = uint64(64)
+		maxConnections = uint64(4096)
+		maxFlows       = uint64(16384)
+		connectionKiB  = uint64(128)
+		flowKiB        = uint64(128)
 	)
-	if cpus < 1 {
-		cpus = 1
-	}
 	reserve := max(uint64(256<<20), memoryBytes*60/100)
 	if memoryBytes <= reserve {
 		return uint32(minConnections), uint32(minFlows)
 	}
-	budgetMiB := (memoryBytes - reserve) >> 20
-	connectionBudgetMiB := budgetMiB * 60 / 100
-	flowBudgetMiB := budgetMiB - connectionBudgetMiB
-	connections := min(maxConnections, min(uint64(cpus)*16, connectionBudgetMiB/connectionMiB))
-	flows := min(maxFlows, min(uint64(cpus)*32, flowBudgetMiB/flowMiB))
+	budgetKiB := (memoryBytes - reserve) >> 10
+	connectionBudgetKiB := budgetKiB * 40 / 100
+	flowBudgetKiB := budgetKiB - connectionBudgetKiB
+	connections := min(maxConnections, connectionBudgetKiB/connectionKiB)
+	flows := min(maxFlows, flowBudgetKiB/flowKiB)
 	connections = max(minConnections, connections)
 	flows = max(minFlows, flows)
 	return uint32(connections), uint32(flows)
@@ -212,37 +215,45 @@ func nativeHostMemory() uint64 {
 	return 0
 }
 
+func nativeHierarchyMemory(root, group, name string) uint64 {
+	var minimum uint64
+	for directory := filepath.Join(root, group); ; directory = filepath.Dir(directory) {
+		if limit := nativeMemoryLimit(filepath.Join(directory, name), 1<<60); limit != 0 && (minimum == 0 || limit < minimum) {
+			minimum = limit
+		}
+		if directory == root {
+			return minimum
+		}
+	}
+}
+
 func nativeCgroupMemory() uint64 {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		return 0
 	}
-	const unlimited = uint64(1) << 60
-	var paths []string
+	var minimum uint64
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.SplitN(line, ":", 3)
 		if len(fields) != 3 {
 			continue
 		}
 		group := strings.TrimLeft(filepath.Clean("/"+fields[2]), string(filepath.Separator))
+		var limit uint64
 		switch {
 		case fields[0] == "0" && fields[1] == "":
-			paths = append(paths,
-				filepath.Join("/sys/fs/cgroup", group, "memory.max"),
-				"/sys/fs/cgroup/memory.max")
-		case strings.Contains(":"+fields[1]+":", ":memory:"):
-			paths = append(paths,
-				filepath.Join("/sys/fs/cgroup/memory", group, "memory.limit_in_bytes"),
-				"/sys/fs/cgroup/memory/memory.limit_in_bytes",
-				filepath.Join("/sys/fs/cgroup", group, "memory.limit_in_bytes"))
+			limit = nativeHierarchyMemory("/sys/fs/cgroup", group, "memory.max")
+		case strings.Contains(","+fields[1]+",", ",memory,"):
+			limit = nativeHierarchyMemory("/sys/fs/cgroup/memory", group, "memory.limit_in_bytes")
+			if limit == 0 {
+				limit = nativeHierarchyMemory("/sys/fs/cgroup", group, "memory.limit_in_bytes")
+			}
+		}
+		if limit != 0 && (minimum == 0 || limit < minimum) {
+			minimum = limit
 		}
 	}
-	for _, path := range paths {
-		if limit := nativeMemoryLimit(path, unlimited); limit != 0 {
-			return limit
-		}
-	}
-	return 0
+	return minimum
 }
 
 func nativeServerMemory() (uint64, string) {
@@ -398,18 +409,22 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	config.Server = true
 	memoryBytes, memorySource := nativeServerMemory()
 	cpus := runtime.GOMAXPROCS(0)
-	autoConnections, autoFlows := tuneNativeServerLimits(memoryBytes, cpus)
-	config.MaxConnections, err = nativeServerLimit("XRAY_HYSTERIA_SERVER_CONNECTIONS", autoConnections, 256)
+	autoConnections, autoFlows := tuneNativeServerLimits(memoryBytes)
+	config.ServerWorkers = uint8(min(4, max(1, cpus)))
+	config.SendBufferBytes = uint32(min(uint64(64<<20), max(uint64(8<<20), memoryBytes/32)))
+	config.ReceiveBufferBytes = config.SendBufferBytes
+	config.ProcessReceiveBufferBytes = config.ProcessSendBufferBytes
+	config.MaxConnections, err = nativeServerLimit("XRAY_HYSTERIA_SERVER_CONNECTIONS", autoConnections, 4096)
 	if err != nil {
 		return nil, err
 	}
-	config.MaxFlows, err = nativeServerLimit("XRAY_HYSTERIA_SERVER_FLOWS", autoFlows, 1024)
+	config.MaxFlows, err = nativeServerLimit("XRAY_HYSTERIA_SERVER_FLOWS", autoFlows, 16384)
 	if err != nil {
 		return nil, err
 	}
 	if config.Diagnostic {
-		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] server resource limits memory_bytes=%d memory_source=%s gomaxprocs=%d max_connections=%d max_flows=%d\n",
-			memoryBytes, memorySource, cpus, config.MaxConnections, config.MaxFlows)
+		fmt.Fprintf(os.Stderr, "[XRAY_NET_DIAG][XHYSTERIA] server resource limits memory_bytes=%d memory_source=%s gomaxprocs=%d workers=%d max_connections=%d max_flows=%d send_buffer_bytes=%d\n",
+			memoryBytes, memorySource, cpus, config.ServerWorkers, config.MaxConnections, config.MaxFlows, config.SendBufferBytes)
 	}
 	config.UDPIdleTimeout = uint64(hy.UdpIdleTimeout)
 	validator := ValidatorFromContext(ctx)

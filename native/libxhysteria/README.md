@@ -154,7 +154,43 @@ closed flows, corrupted payloads and stalled TCP transfers fail the test.
 Startup tests distinguish native setup failures, handshake timeouts and caller
 cancellation on both bridges.
 Server tests also cover live user updates, UUID aliases, more than 1024 configured
-users, 160 concurrent flows, and TLS certificate replacement with active streams.
+users, 160 concurrent flows, prompt capacity rejection and recovery on both bridges,
+300 sequential short flows without exhausting QUIC stream credit, and TLS
+certificate replacement with active streams. UDP idle-expiry tests verify that
+ongoing traffic refreshes the deadline and that idle sessions return flow slots.
+The Linux capacity test opens
+1000 QUIC sessions for 500 distinct users in a separate server process, keeps 1000
+TCP flows open, transfers 500 MiB in both directions with delayed readers, then
+checks every flow for twelve seconds. Salamander is enabled by default. Run it
+under an actual 1 GiB memory limit and one CPU quota with:
+
+```sh
+XHYS_CAPACITY_SYSTEMD=1 XHYS_CAPACITY_CASCADE=1 \
+XHYS_CAPACITY_GOMEMLIMIT=256MiB CGO_ENABLED=1 go test \
+  -tags 'xhysteria_native xhysteria_interop' ./native/libxhysteria/interop \
+  -run '^TestNativeServer500Users$' -count=1 -v
+```
+
+The optional cgroup wrapper requires a user systemd session. The default test
+still isolates server RSS without that wrapper. Cascade mode adds eight outbound
+routes with two pooled native QUIC sessions each, then forwards every flow through
+a separate exit server. Only the entry server is inside the measured cgroup;
+the load generator and exit run outside it. The fixture defaults to `GOMEMLIMIT=128MiB`
+and rejects entry-server RSS or cgroup peaks above 512 MiB. Go's limit does not
+cover Rust allocations or kernel buffers. Readers start after two seconds while
+uploads are still running, allowing flow control to apply backpressure.
+`XHYS_CAPACITY_PROFILE=/absolute/directory` writes Go heap profiles and phase
+counters from the entry process. `XHYS_CAPACITY_BACKEND=go` selects the Go
+backend for both entry and exit with the same traffic and cgroup limits.
+The native case uses sixteen pooled upstream sessions; Go uses its normal
+single session per route (eight routes). `XHYS_CAPACITY_GOMEMLIMIT=256MiB`
+overrides the fixture's Go runtime limit to measure the GC/memory tradeoff.
+`XHYS_CAPACITY_MASK=0` disables Salamander on the client-facing entry leg
+(cascade upstream links still use it), and
+`XHYS_CAPACITY_SESSIONS=1..1310` selects a smaller debug workload.
+`TestNativeServerBulkTransferWith100msRTT` checks that a 16 MiB upload and echo
+can expand the initial receive window on a simulated 100 ms path.
+`XHYS_WAN_BACKEND=go` repeats it using Go on both endpoints.
 To test a separately built NodeX server using DanVlessBot's actual config generator:
 
 ```sh
@@ -164,12 +200,34 @@ CGO_ENABLED=1 go test -tags 'xhysteria_native xhysteria_interop' \
   ./native/libxhysteria/interop -run '^TestNodeXNativeServerBinary$' -count=1 -v
 ```
 
+## Optional native allocation diagnostics
+
+Normal builds retain Rust's system allocator without allocation counters.
+For a diagnostic Linux build, enable the optional feature and relink Go with
+the resulting archive hash so its linker cache cannot reuse the normal build:
+
+```sh
+cargo build --locked --release --features 'engine allocation-profile' --lib \
+  --manifest-path native/libxhysteria/Cargo.toml
+native_hash=$(sha256sum native/libxhysteria/target/release/libxhysteria.a)
+CGO_ENABLED=1 go build -tags 'xhysteria_native xray_server' \
+  -ldflags="-buildid=xhysteria-${native_hash%% *}" \
+  -o build_assets/xray-native-allocation-profile ./main
+XRAY_NET_DIAG=1 build_assets/xray-native-allocation-profile run -c /path/to/config.json
+```
+
+Server capacity diagnostics report live Rust allocations by power-of-two size
+class when a class holds at least 1 MiB. GNU/Linux also reports allocator-owned
+and retained free pages through `mallinfo2`. These are diagnostic counters, not
+RSS or Go heap measurements, and add overhead. Rebuild with `build-linux.sh`
+without the optional feature before measuring or deploying a normal binary.
+
 ## Session pooling and shared memory
 
 Linux/Android amd64 and arm64 use the shared-memory bridge by default. Each
-engine owns two bounded frame rings with 32 slots each and three nonblocking
-`eventfd` notification descriptors. The arena is 4,460,864 bytes (about 4.25 MiB),
-aligned to 64 bytes; storage layout version 3 and engine ABI version 4 are
+engine owns two bounded frame rings with eight slots each and three nonblocking
+`eventfd` notification descriptors. The arena is 1,115,456 bytes (about 1.06 MiB),
+aligned to 64 bytes; storage layout version 5 and engine ABI version 4 are
 checked during setup. Event publication is serialized with a short native
 mutex; command publication uses a short Go mutex and an ordered queue fallback.
 No lock is held over a blocked ring wait. Separate descriptors wake RX and
@@ -177,6 +235,13 @@ blocked TX directly through Go netpoll; a third wakes Rust. Coalesced pending
 flags reduce redundant notification syscalls without delaying data. No CGO
 call is made to transfer traffic. The socket bridge remains available for
 comparison and rollback, and is the default on other supported architectures.
+Space notifications are armed only by writers that observe a full ring, then
+recheck it before waiting. A consumer publishes the freed slot before checking
+that flag, so concurrent draining cannot lose its wakeup. The Go eventfd paths
+use nonblocking raw syscalls under `RawConn` descriptor lifetime protection;
+`RawConn.Read` still waits through Go netpoll on EAGAIN and preserves deadlines.
+Each event reader owns one reusable buffer and callback. Credit messages use
+immutable byte tables instead of per-message payload allocations.
 Rust handles wake descriptors and command dispatch in the same task. When a
 control queue is full, it continues handling notification readiness so that
 event-space backpressure cannot deadlock the engine.
@@ -185,14 +250,24 @@ Payloads are copied across the ownership boundary: Rust copies commands out of
 the ring, and Go copies events into pooled Xray buffers before releasing slots.
 Those buffers then pass directly to `ReadMultiBuffer`; native arena pointers
 never escape into Xray's forwarding buffers. This is not end-to-end zero-copy.
-TCP writes are coalesced up to 64 KiB; client and server reads aggregate available
-QUIC bytes without waiting to fill an entire chunk. Engine shutdown stops submissions,
+TCP writes are coalesced up to 16 KiB on both client and server;
+reads aggregate available QUIC chunks directly into bridge frames, without a
+per-flow scratch buffer or waiting to fill a frame. Each read batch holds at most
+eight chunks. Engine shutdown stops submissions,
 wakes blocked operations, joins dispatchers and Rust, then releases the arena.
 Single Xray buffers are transferred to the bridge without an extra coalescing
 copy. Rust writes owned chunks directly into Quinn and reads server TCP through
 the underlying Quinn stream after parsing the Hysteria header. Data arriving
-with that header is preserved. Credits are returned in groups of eight out of
-a sixteen-frame window; payload publication never waits to fill such a group.
+with that header is preserved. Clients use eight frame credits and return them
+in groups of four. Servers use four and return two at a time, bounding their
+TCP queues at 128 KiB and 64 KiB respectively. Payload publication never waits
+to fill such a group. Power-of-two byte-pool classes avoid rounding 16 KiB frames
+to 32 KiB and 64 KiB frames to 128 KiB. Nonstandard capacities are not retained
+in those pools.
+An explicit flow close resets its QUIC sending half so the peer releases stream
+credit promptly. `CloseWrite` still sends FIN and allows the response to finish.
+The server classifies bidirectional streams before passing HTTP requests to
+HTTP/3; TCP streams do not accumulate in HTTP/3's request-completion table.
 
 Each outbound lazily opens up to two QUIC sessions, sharing them across TCP and
 UDP flows with the same Xray instance, transport settings, and peer. Closing a
@@ -212,17 +287,37 @@ also covers an advertised RX limit when the local controller is BBR or Reno.
 | `XRAY_HYSTERIA_BRIDGE` | shared on amd64/arm64 | `socket` restores socket IPC |
 | `XRAY_HYSTERIA_POOL_SIZE` | `2` | `1..8` sessions per outbound; `0` restores per-flow engines |
 | `XRAY_HYSTERIA_SERVER_WORKERS` | `0` | `0`: automatic (up to four); `1..16`: explicit server runtime threads |
-| `XRAY_HYSTERIA_SERVER_CONNECTIONS` | auto | Override native server QUIC connection cap (`1..256`) |
-| `XRAY_HYSTERIA_SERVER_FLOWS` | auto | Override native server TCP/UDP flow cap (`1..1024`) |
+| `XRAY_HYSTERIA_SERVER_CONNECTIONS` | auto | Override native server QUIC connection cap (`1..4096`) |
+| `XRAY_HYSTERIA_SERVER_FLOWS` | auto | Override native server TCP/UDP flow cap (`1..16384`) |
 | `XRAY_NET_DIAG` | unset | `1` logs roles, peers, authentication, QUIC counters, buffers and failure reasons |
 
-Server limits use the lower of host RAM and the process cgroup memory limit,
-plus `GOMAXPROCS`. The estimate reserves at least 60% of detected RAM (and at
-least 256 MiB), then budgets about 12 MiB per QUIC connection and 4 MiB per
-active flow. Unknown memory data uses a conservative 8-connection/16-flow
-profile. Set either server environment variable to override that limit
-independently. Startup diagnostics report the memory source and selected
-limits.
+Server limits use the lower of host RAM and the process cgroup memory limit.
+`GOMAXPROCS` selects up to four server workers and does not cap session counts.
+The concurrency estimate reserves at least 60% of detected RAM (and at least
+256 MiB), then splits the rest 40/60 between connection and flow allowances of
+128 KiB each. A 1 GiB host selects 1310 connections and 1966 TCP/UDP flows; the
+929,935,360-byte VPS selects 1135 and 1702. Unknown memory uses a 1 GiB estimate;
+hosts with no remaining budget use 32 connections and 64 flows. These are admission
+estimates, not preallocated buffers or a process RSS guarantee. Limits apply per
+listener, so several listeners and other node services share the same host RAM.
+Set either environment variable to override its cap independently.
+
+Server receive windows start at 64 KiB per connection. After 64 KiB of TCP
+traffic, a connection can reserve an expansion to 8 MiB from a shared receive
+budget. Expanded credit remains reserved until that session closes. Each listener
+has separate receive-expansion and send budgets of 1/32 of detected RAM, clamped
+to 8..64 MiB (32 MiB each on a 1 GiB host). A process-wide send budget covers
+retained TCP data from inbound and outbound engines together; a separate
+process-wide receive budget covers inbound window expansions across listeners.
+Each process budget is 1/16 of RAM, clamped to 8..128 MiB (64 MiB on 1 GiB).
+The first engine using each process budget fixes its size until process exit.
+Send reservations follow the lifetime of Quinn's retained byte buffers, including
+retransmissions and shared slices; writers wait when a budget is full.
+Outbound engines also have an 8 MiB local send budget and QUIC send window.
+Server QUIC DATAGRAM send/receive queues are 32 KiB each and reassembly retains
+at most eight incomplete packets per connection. These budgets cover their
+respective buffers; kernel sockets, Go forwarding, and other allocations remain
+part of the node's overall memory usage.
 
 With diagnostics enabled, `engine started ... role=server` confirms listener
 startup; `authenticated role=server` confirms successful client authentication.
@@ -231,10 +326,17 @@ congestion window every ten seconds. Increasing counters confirm traffic on
 that peer. Startup errors identify the peer and phase (QUIC or HTTP/3 auth);
 caller cancellation is reported separately from a native timeout. Error frames
 survive shared-bridge shutdown instead of becoming a generic closed connection.
+`event=capacity` reports active/maximum connections and flows, rejected counts,
+and listener/process receive-window reservations and process send usage every
+ten seconds. Saturated connections are
+explicitly refused while established sessions continue; rejection diagnostics
+are limited to one per five seconds. TCP flow overflow resets only the new
+stream. Unauthenticated connections and incomplete handshakes have ten-second
+deadlines.
 
 The existing Android native-backend preference still switches the entire backend
 to Go. Pool and bridge overrides are process environment settings; no additional
-Android preferences are required. Two active pooled sessions use about 8.5 MiB
+Android preferences are required. Two active pooled sessions use about 2.13 MiB
 of ring storage. These figures exclude QUIC buffers, per-flow queues, native
 allocations, and Go heap usage, and the session limit does not include inbound
 listeners or explicitly selected per-flow engines.
@@ -266,16 +368,36 @@ parallel request/response traffic, continuous upload/download, TCP latency in
 idle and under four background transfers, and UDP latency. `PacedLatency`
 offers the same 64 MiB/s background traffic to each backend and reports the
 achieved rate; `LoadedLatency` saturates each backend. Latency output
-includes p50/p95/p99. Environment overrides `XHYS_BENCH_TIME`,
+includes p50/p95/p99. `XHYS_BENCH_PACED_MIBPS=32` selects a lower common offered
+load; accepted values are 1..4096. Environment overrides `XHYS_BENCH_TIME`,
 `XHYS_BENCH_COUNT`, `XHYS_BENCH_SCENARIOS`, `XHYS_BENCH_CLIENTS` and
 `XHYS_BENCH_MASKS` select a smaller matrix. Native archive hashes and the tracked
-source diff are recorded beside the raw results. CPU includes both endpoints;
+source diff against HEAD, including staged changes, are recorded beside the raw
+results. Untracked source files must be staged before recording that diff.
+`XHYS_BENCH_AFFINITY=0` pins
+all Go and Rust threads in each sample to CPU 0. This differs from
+`XHYS_BENCH_CPUS=1`, which only sets Go parallelism. The CPU must be in the
+process's allowed affinity set. `XHYS_BENCH_GO_OPENCLOSE=1` retries the Go
+short-flow case that is otherwise explicitly skipped after previous failures.
+`XHYS_BENCH_TRACE=1` logs short-flow exchanges taking over 100 ms.
+CPU includes both endpoints;
 Go allocations exclude Rust allocations and the shared arena.
 
-The native transport now uses the same 8 MiB stream and 20 MiB connection receive
-windows as Go Hysteria. Kernel UDP buffers request up to 8 MiB, subject to OS
-limits, preserving larger existing buffers. Salamander and port hopping retain
-batched receives and GRO segment metadata. Salamander delegates UDP send-error
+The native client uses an 8 MiB stream receive window. Its connection window is
+1/512 of detected RAM, clamped to 2..8 MiB (2 MiB on a 1 GiB node).
+Direct C ABI clients default to 8 MiB unless `receive_buffer_bytes` is set.
+Server connections use the smaller initial window and shared expansion budget
+described above; their stream limit remains 8 MiB. Kernel UDP buffer targets are
+4 MiB RX / 1 MiB TX per server socket and 1 MiB RX / 256 KiB TX per client
+socket, subject to OS limits. These replace larger existing settings; Linux
+reports twice the requested value. They are limits, not immediate allocations.
+Salamander and port hopping retain
+batched receives. Upstream sockets whose configured connection receive window
+is at most 2 MiB disable kernel UDP GRO and report one receive segment to Quinn,
+reducing each endpoint receive workspace from about 2.88 MiB to 46 KiB. This is
+done after wrapping the socket; failure to disable GRO preserves the original
+segment count and workspace. Other sockets preserve GRO segment metadata.
+Salamander delegates UDP send-error
 handling and source-address selection to Quinn's socket adapter; transient send
 failures no longer directly terminate a QUIC connection. BBR/Reno can use GSO.
 Each Salamander segment receives its own system-random salt and BLAKE2b-256
@@ -288,10 +410,30 @@ to one datagram so batching cannot bypass its pacer. See
 
 ## Prototype boundaries
 
-The server uses one native engine per inbound listener, with up to four Rust
-runtime worker threads (limited by available parallelism); clients retain one.
-Server connection and flow caps are selected from host/cgroup memory and CPU,
-up to 256 connections and 1024 active TCP/UDP flows per listener. The Go client engine limit
+The server uses one native engine per inbound listener, with a dedicated
+runtime and its explicit worker setting. Outbound engines share a process Rust
+runtime instead of each retaining a separate OS thread and reactor.
+Go configures up to four shared runtime workers from GOMAXPROCS; the first
+shared engine fixes that count. The low-level `process_workers` field accepts
+0..16; zero selects one worker.
+Each engine has an independently joined task and owns its own UDP socket and
+bridge arena. The process runtime remains alive between engine lifetimes.
+Endpoint ownership closes connections on early failure; authentication-driver
+tasks abort when startup is cancelled or their engine stops.
+TLS configuration prefers TLS 1.3 AES-128-GCM while retaining the other
+provider-supported cipher suites; this is not a compatibility restriction or
+a claim of equal acceleration on every CPU.
+Incoming bidirectional stream credit starts at eight on the server and rises
+to 64 after the second TCP stream. Native clients accept no server-initiated
+bidirectional streams; both sides allow eight unidirectional HTTP/3 streams.
+These stream counts reduce idle bookkeeping without reducing the pooled
+64-flow allowance.
+TCP header scratch storage is released after parsing. Server UDP dispatch
+starts only when the first authenticated datagram arrives. Fragment cleanup
+timers run only while reassembly is pending, and each UDP session sleeps until
+its activity-based expiry instead of waking every second.
+Server connection and flow caps are selected from host/cgroup memory,
+up to 4096 connections and 16384 active TCP/UDP flows per listener. The Go client engine limit
 remains 128; the outbound pool
 reserves at most 64 per session. Per-flow credits bound
 queued TCP data and apply backpressure; unread UDP datagrams are dropped when

@@ -35,6 +35,27 @@ impl Replay {
     }
 }
 
+impl ReplayRecv {
+    pub async fn read_chunks(
+        &mut self,
+        chunks: &mut [Bytes],
+    ) -> std::result::Result<Option<usize>, quinn::ReadError> {
+        let mut count = 0;
+        for chunk in chunks.iter_mut() {
+            let Some(data) = self.prefix.pop_front() else {
+                break;
+            };
+            *chunk = data;
+            count += 1;
+        }
+        if count != 0 {
+            Ok(Some(count))
+        } else {
+            self.raw.read_chunks(chunks).await
+        }
+    }
+}
+
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ReplayRecv<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -118,7 +139,10 @@ impl quic::SendStreamUnframed<Bytes> for Replay {
     }
 }
 
-pub struct Dispatch(pub h3_quinn::Connection);
+pub struct Dispatch(
+    pub h3_quinn::Connection,
+    pub tokio::sync::mpsc::Receiver<Replay>,
+);
 pub struct Opener(h3_quinn::OpenStreams);
 
 macro_rules! open_streams {
@@ -163,18 +187,28 @@ impl quic::Connection<Bytes> for Dispatch {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<Replay, quic::ConnectionErrorIncoming>> {
-        <h3_quinn::Connection as quic::Connection<Bytes>>::poll_accept_bidi(&mut self.0, cx).map_ok(
-            |raw| Replay {
-                raw,
-                prefix: VecDeque::new(),
-            },
-        )
+        self.1.poll_recv(cx).map(|stream| {
+            stream.ok_or_else(|| {
+                quic::ConnectionErrorIncoming::InternalError("stream dispatcher closed".into())
+            })
+        })
     }
     fn opener(&self) -> Opener {
         Opener(<h3_quinn::Connection as quic::Connection<Bytes>>::opener(
             &self.0,
         ))
     }
+}
+
+pub async fn accept(connection: &mut h3_quinn::Connection) -> Result<Replay> {
+    let raw = poll_fn(|cx| {
+        <h3_quinn::Connection as quic::Connection<Bytes>>::poll_accept_bidi(connection, cx)
+    })
+    .await?;
+    Ok(Replay {
+        raw,
+        prefix: VecDeque::new(),
+    })
 }
 
 pub async fn classify(mut stream: Replay) -> Result<(Replay, bool)> {

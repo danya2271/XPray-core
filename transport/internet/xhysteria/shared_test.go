@@ -5,6 +5,7 @@ package xhysteria
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -32,6 +33,19 @@ func testSharedBridge(t *testing.T) *sharedBridge {
 	}
 	b := &sharedBridge{data: make([]byte, sharedBytes), notify: efd(), wake: efd(), space: efd()}
 	t.Cleanup(func() { b.close() })
+	var err error
+	b.notifyReader, err = newEventReader(b.notify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.spaceReader, err = newEventReader(b.space)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.wakeRaw, err = b.wake.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
 	return b
 }
 
@@ -65,9 +79,11 @@ func TestSharedBridgeBatchWraparoundAndWakeups(t *testing.T) {
 				return
 			}
 			atomic.StoreUint32(b.word(128), tail+1)
-			if _, err := b.space.Write(eventfdSignal[:]); err != nil {
-				result <- err
-				return
+			if atomic.SwapUint32(b.word(52), 0) != 0 && atomic.SwapUint32(b.word(44), 1) == 0 {
+				if _, err := b.space.Write(eventfdSignal[:]); err != nil {
+					result <- err
+					return
+				}
 			}
 			// Mirror the frame into the RX ring, respecting consumer ownership.
 			for {
@@ -81,6 +97,10 @@ func TestSharedBridgeBatchWraparoundAndWakeups(t *testing.T) {
 					copy(d[16:], payload)
 					atomic.StoreUint32(b.word(192), head+1)
 					break
+				}
+				atomic.StoreUint32(b.word(48), 1)
+				if atomic.LoadUint32(b.word(192))-atomic.LoadUint32(b.word(256)) < sharedCapacity {
+					continue
 				}
 				var value [8]byte
 				if _, err := io.ReadFull(b.wake, value[:]); err != nil {
@@ -129,6 +149,88 @@ func TestSharedBridgeBatchWraparoundAndWakeups(t *testing.T) {
 	}
 	if err := <-result; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSharedBridgeEventSpaceWakesOnlyAWaitingWriter(t *testing.T) {
+	bridge := testSharedBridge(t)
+	publish := func(index uint32) {
+		offset := sharedHeader + sharedCapacity*sharedStride + int(index&(sharedCapacity-1))*sharedStride
+		binary.LittleEndian.PutUint32(bridge.data[offset:], uint32(dataFrame))
+		binary.LittleEndian.PutUint64(bridge.data[offset+8:], uint64(index))
+		atomic.StoreUint32(bridge.word(192), index+1)
+	}
+	publish(0)
+	first, err := bridge.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.release()
+	if atomic.LoadUint32(bridge.word(40)) != 0 {
+		t.Fatal("uncontended event read woke the native worker")
+	}
+	atomic.StoreUint32(bridge.word(48), 1)
+	publish(1)
+	second, err := bridge.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.release()
+	if atomic.LoadUint32(bridge.word(48)) != 0 || atomic.LoadUint32(bridge.word(40)) != 1 {
+		t.Fatal("event read failed to wake its waiting writer")
+	}
+}
+
+func TestSharedBridgeFullCommandRingArmsWriter(t *testing.T) {
+	bridge := testSharedBridge(t)
+	atomic.StoreUint32(bridge.word(64), sharedCapacity)
+	count, err := bridge.tryWriteBatch([]frame{{kind: dataFrame, id: 7}})
+	if err != nil || count != 0 || atomic.LoadUint32(bridge.word(52)) != 1 {
+		t.Fatalf("full command ring did not arm its writer: count=%d err=%v", count, err)
+	}
+	atomic.StoreUint32(bridge.word(128), 1)
+	count, err = bridge.tryWriteBatch([]frame{{kind: dataFrame, id: 7}})
+	if err != nil || count != 1 {
+		t.Fatalf("writer did not observe newly freed space: count=%d err=%v", count, err)
+	}
+}
+
+func TestSharedBridgeCreditPayloadSurvivesSlotReuse(t *testing.T) {
+	bridge := testSharedBridge(t)
+	offset := sharedHeader + sharedCapacity*sharedStride
+	binary.LittleEndian.PutUint32(bridge.data[offset:], uint32(writableFrame))
+	binary.LittleEndian.PutUint32(bridge.data[offset+4:], 1)
+	bridge.data[offset+16] = 4
+	atomic.StoreUint32(bridge.word(192), 1)
+	value, err := bridge.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer value.release()
+	bridge.data[offset+16] = 7
+	if value.storage != nil || !bytes.Equal(value.data, []byte{4}) {
+		t.Fatal("credit payload retained ring storage or allocated a forwarding buffer")
+	}
+}
+
+func TestSharedBridgeRawReadHonorsDeadlineAndRecovers(t *testing.T) {
+	bridge := testSharedBridge(t)
+	if err := bridge.setReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.read(); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("empty event ring ignored its read deadline: %v", err)
+	}
+	if err := bridge.setReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	offset := sharedHeader + sharedCapacity*sharedStride
+	binary.LittleEndian.PutUint32(bridge.data[offset:], uint32(dataFrame))
+	atomic.StoreUint32(bridge.word(192), 1)
+	value, err := bridge.read()
+	value.release()
+	if err != nil {
+		t.Fatalf("deadline change did not restore reads: %v", err)
 	}
 }
 

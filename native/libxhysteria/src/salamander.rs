@@ -27,13 +27,20 @@ impl Salamander {
 
     fn xor(&self, salt: &[u8], payload: &mut [u8]) {
         let key = self.key(salt);
+        Self::xor_key(key.as_bytes(), payload);
+    }
+
+    fn xor_key(key: &[u8], payload: &mut [u8]) {
+        let mask: [u64; 4] = std::array::from_fn(|index| {
+            u64::from_ne_bytes(key[index * 8..index * 8 + 8].try_into().unwrap())
+        });
         let (chunks, tail) = payload.as_chunks_mut::<32>();
         for chunk in chunks {
-            for (byte, mask) in chunk.iter_mut().zip(key.as_bytes()) {
-                *byte ^= mask;
+            for (word, mask) in chunk.as_chunks_mut::<8>().0.iter_mut().zip(mask) {
+                *word = (u64::from_ne_bytes(*word) ^ mask).to_ne_bytes();
             }
         }
-        for (byte, mask) in tail.iter_mut().zip(key.as_bytes()) {
+        for (byte, mask) in tail.iter_mut().zip(key) {
             *byte ^= mask;
         }
     }
@@ -74,19 +81,9 @@ impl Salamander {
 
     fn append_masked(&self, salt: &[u8], data: &[u8], output: &mut Vec<u8>) {
         let key = self.key(salt);
-        let (chunks, tail) = data.as_chunks::<32>();
-        for chunk in chunks {
-            let mut encoded = *chunk;
-            for (byte, mask) in encoded.iter_mut().zip(key.as_bytes()) {
-                *byte ^= mask;
-            }
-            output.extend_from_slice(&encoded);
-        }
-        let mut encoded = [0u8; 32];
-        for ((dest, byte), mask) in encoded.iter_mut().zip(tail).zip(key.as_bytes()) {
-            *dest = byte ^ mask;
-        }
-        output.extend_from_slice(&encoded[..tail.len()]);
+        let start = output.len();
+        output.extend_from_slice(data);
+        Self::xor_key(key.as_bytes(), &mut output[start..]);
     }
 
     /// Returns the decoded payload without moving it over the salt prefix.

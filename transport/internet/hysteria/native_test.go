@@ -4,6 +4,7 @@ package hysteria
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -51,18 +52,17 @@ func TestTuneNativeServerLimits(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		memoryBytes uint64
-		cpus        int
 		connections uint32
 		flows       uint32
 	}{
-		{"one_gib_one_cpu", 1 << 30, 1, 16, 32},
-		{"one_gib_two_cpus", 1 << 30, 2, 20, 41},
-		{"512_mib_two_cpus", 512 << 20, 2, 10, 20},
-		{"large_host_eight_cpus", 8 << 30, 8, 128, 256},
-		{"very_small_host", 128 << 20, 4, 8, 16},
+		{"one_gib", 1 << 30, 1310, 1966},
+		{"ru_vps", 929935360, 1135, 1702},
+		{"512_mib", 512 << 20, 655, 983},
+		{"large_host", 8 << 30, 4096, 15728},
+		{"very_small_host", 128 << 20, 32, 64},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			connections, flows := tuneNativeServerLimits(test.memoryBytes, test.cpus)
+			connections, flows := tuneNativeServerLimits(test.memoryBytes)
 			if connections != test.connections || flows != test.flows {
 				t.Fatalf("got connections=%d flows=%d, want %d and %d",
 					connections, flows, test.connections, test.flows)
@@ -91,6 +91,27 @@ func TestNativeMemoryLimitParsing(t *testing.T) {
 				t.Fatalf("got %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestNativeMemoryLimitIncludesParentSlices(t *testing.T) {
+	root := t.TempDir()
+	group := filepath.Join("danvless.slice", "dataplane.slice", "xray.service")
+	if err := os.MkdirAll(filepath.Join(root, group), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct{ path, value string }{
+		{"memory.max", "2147483648"},
+		{"danvless.slice/memory.max", "536870912"},
+		{"danvless.slice/dataplane.slice/memory.max", "805306368"},
+		{group + "/memory.max", "max"},
+	} {
+		if err := os.WriteFile(filepath.Join(root, entry.path), []byte(entry.value), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if limit := nativeHierarchyMemory(root, group, "memory.max"); limit != 512<<20 {
+		t.Fatalf("hierarchical limit=%d, want 512 MiB", limit)
 	}
 }
 

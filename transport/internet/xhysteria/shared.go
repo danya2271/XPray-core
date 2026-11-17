@@ -25,14 +25,15 @@ import (
 
 const (
 	sharedMagic    = 0x5848595353484d32
-	sharedVersion  = 3
+	sharedVersion  = 5
 	sharedHeader   = 320
-	sharedCapacity = 32
+	sharedCapacity = 8
 	sharedStride   = (16 + maxFrame + 63) &^ 63
 	sharedBytes    = sharedHeader + 2*sharedCapacity*sharedStride
 )
 
 var eventfdSignal = [8]byte{1}
+var creditCounts = [9]byte{0, 1, 2, 3, 4, 5, 6, 7, 8}
 
 type frameBridge interface {
 	read() (frame, error)
@@ -65,8 +66,53 @@ type sharedBridge struct {
 	notify, wake *os.File
 	space        *os.File
 	once         sync.Once
-	released     uint32
 	wakeRaw      syscall.RawConn
+	notifyReader *eventReader
+	spaceReader  *eventReader
+}
+
+type eventReader struct {
+	raw      syscall.RawConn
+	value    [8]byte
+	err      error
+	callback func(uintptr) bool
+}
+
+func newEventReader(file *os.File) (*eventReader, error) {
+	raw, err := file.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	reader := &eventReader{raw: raw}
+	reader.callback = reader.consume
+	return reader, nil
+}
+
+func (r *eventReader) consume(fd uintptr) bool {
+	for {
+		length, _, errno := syscall.RawSyscall(syscall.SYS_READ, fd, uintptr(unsafe.Pointer(&r.value[0])), uintptr(len(r.value)))
+		switch errno {
+		case unix.EINTR:
+			continue
+		case unix.EAGAIN:
+			return false
+		case 0:
+			if length != uintptr(len(r.value)) {
+				r.err = io.ErrUnexpectedEOF
+			}
+		default:
+			r.err = errno
+		}
+		return true
+	}
+}
+
+func (r *eventReader) wait() error {
+	r.err = nil
+	if err := r.raw.Read(r.callback); err != nil {
+		return err
+	}
+	return r.err
 }
 
 func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
@@ -85,6 +131,16 @@ func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
 	}
 	var err error
 	b.wakeRaw, err = wake.SyscallConn()
+	if err != nil {
+		b.close()
+		return nil, err
+	}
+	b.notifyReader, err = newEventReader(notify)
+	if err != nil {
+		b.close()
+		return nil, err
+	}
+	b.spaceReader, err = newEventReader(space)
 	if err != nil {
 		b.close()
 		return nil, err
@@ -108,8 +164,16 @@ func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
 }
 
 func (b *sharedBridge) wait(file *os.File, pending int) error {
-	var value [8]byte
-	if _, err := io.ReadFull(file, value[:]); err != nil {
+	reader := b.notifyReader
+	if file == b.space {
+		reader = b.spaceReader
+	}
+	if reader == nil {
+		var value [8]byte
+		if _, err := io.ReadFull(file, value[:]); err != nil {
+			return err
+		}
+	} else if err := reader.wait(); err != nil {
 		return err
 	}
 	// Rearm before observing published ring state; a later producer must
@@ -136,12 +200,12 @@ func (b *sharedBridge) notifyRust() error {
 	var writeErr error
 	err := b.wakeRaw.Control(func(fd uintptr) {
 		for {
-			_, writeErr = unix.Write(int(fd), eventfdSignal[:])
-			if writeErr == unix.EINTR {
+			_, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, fd, uintptr(unsafe.Pointer(&eventfdSignal[0])), uintptr(len(eventfdSignal)))
+			if errno == unix.EINTR {
 				continue
 			}
-			if writeErr == unix.EAGAIN {
-				writeErr = nil
+			if errno != 0 && errno != unix.EAGAIN {
+				writeErr = errno
 			}
 			break
 		}
@@ -184,22 +248,18 @@ func (b *sharedBridge) read() (frame, error) {
 				return frame{}, errors.New("invalid native shared event")
 			}
 			f := frame{kind: byte(kind), id: binary.LittleEndian.Uint64(d[8:])}
-			if n != 0 {
+			if f.kind == writableFrame && n == 1 && d[16] < byte(len(creditCounts)) {
+				f.data = creditCounts[d[16] : int(d[16])+1]
+			} else if n != 0 {
 				f.storage = buf.NewWithSize(int32(n))
 				f.storage.Write(d[16 : 16+int(n)])
 				f.data = f.storage.Bytes()
 			}
 			atomic.StoreUint32(b.word(256), tail+1)
-			b.released++
-			if count == sharedCapacity || b.released >= sharedCapacity {
-				b.released = 0
+			if atomic.LoadUint32(b.word(48)) != 0 && atomic.SwapUint32(b.word(48), 0) != 0 {
 				b.notifyRust()
 			}
 			return f, nil
-		}
-		if b.released != 0 {
-			b.released = 0
-			b.notifyRust()
 		}
 		if atomic.LoadUint32(b.word(32)) != 0 {
 			return frame{}, net.ErrClosed
@@ -236,6 +296,10 @@ func (b *sharedBridge) tryWriteBatch(batch []frame) (int, error) {
 	count := head - atomic.LoadUint32(b.word(128))
 	if count > sharedCapacity {
 		return 0, errors.New("corrupt native command ring")
+	}
+	if count == sharedCapacity {
+		atomic.StoreUint32(b.word(52), 1)
+		count = head - atomic.LoadUint32(b.word(128))
 	}
 	n := min(len(batch), sharedCapacity-int(count))
 	for i := range n {

@@ -1,5 +1,10 @@
 # Native Hysteria performance checks
 
+The initial sections are historical measurements from earlier implementations.
+The final November 17 delivery and subsequent latency follow-up sections contain
+the implementation and its comparison boundaries. The latency follow-up is the
+latest state; do not combine results from different stages.
+
 Measurements were taken on November 15, 2026 on Linux amd64, an Intel Xeon
 E5-2698 v3 at 2.30 GHz, with Go 1.27.1-X:nodwarf5 and Rust 1.99.0. The host
 exposes 32 logical CPUs; the benchmark uses `GOMAXPROCS=4`. Rust uses the release
@@ -217,3 +222,502 @@ With the same native client, equal-load TCP p99 improved about 15%; idle TCP
 p99 remained similar. UDP median remained slightly higher, while UDP p99
 improved in this run. Go-client results still regress, and these measurements
 do not demonstrate universally lower latency or a universal 2x server speedup.
+
+## November 17, 2026: initial bounded-memory milestone (historical)
+
+The memory/capacity work adds smaller shared arenas and frame queues, byte-pool
+size classes without 2x over-allocation, bounded retained QUIC send data across
+engines, bounded server receive-window expansion, smaller client receive windows
+on small nodes, and role-specific kernel UDP buffer targets. Admission limits
+now use memory rather than CPU count. See the README for exact budgets.
+
+Two other defects surfaced during verification. Application-limited BBR could
+increase its congestion window with cumulative acknowledged traffic despite a
+zero bandwidth estimate. The startup comparison and ACK excess accounting are
+fixed, with a vendored regression test. Explicit bridge flow closure also used
+to leave a QUIC sending half to finish gracefully. Sequential short flows then
+waited approximately 0.9 seconds for stream credit around each exhausted stream
+window. Explicit closure now resets the sending half; intentional half-close
+still sends FIN. A 300-flow test covers both shared and socket bridges.
+TCP streams are classified before HTTP/3 request admission, preventing their IDs
+from accumulating in HTTP/3's request-completion bookkeeping.
+
+The milestone backend matrix uses three fresh processes per combination, alternating
+server order, with and without Salamander. Both native and Go use the current
+common buffer fixes. `GOMAXPROCS=1` is combined with CPU affinity 0 so all native
+and Go threads, both endpoints and the echo target share one logical
+CPU. This differs from the earlier runs that limited only Go parallelism.
+The capacity fixture instead constrains only the entry server to one CPU quota
+and 1 GiB; its load generator and exit run outside the measured cgroup.
+
+```sh
+XHYS_BENCH_AFFINITY=0 XHYS_BENCH_CPUS=1 \
+XHYS_BENCH_TIME=1s XHYS_BENCH_COUNT=3 \
+XHYS_BENCH_SCENARIOS='OpenClose Transfer Parallel Upload Download Latency LoadedLatency PacedLatency UDPLatency' \
+XHYS_BENCH_CLIENTS='go shared_pool2' XHYS_BENCH_MASKS='0 1' \
+bash native/libxhysteria/bench-server.sh build_assets/native-go-release-20261117
+```
+
+The host is the same Xeon E5-2698 v3. Each throughput sample lasts one second.
+The native client uses its normal two-session pool and shared bridge; Go uses
+its existing session reuse. Transfer/Parallel count bytes in both directions;
+Upload/Download count one direction, all in decimal MB/s. CPU work includes
+both endpoints and Rust. Go allocation metrics exclude Rust allocations and
+shared arena storage. `LoadedLatency` saturates each backend with different
+achieved traffic rates; `PacedLatency` attempts a common 64 MiB/s load and must
+be read together with the achieved background rate.
+
+Go short-flow benchmarks were retried explicitly with
+`XHYS_BENCH_GO_OPENCLOSE=1`; both Go and native servers produced
+`io: read/write on closed pipe` with the Go client. Those cases have no valid
+latency comparison and are explicitly skipped in the matrix. Native-client
+short-flow measurements remain available.
+
+### Throughput, CPU and allocations
+
+Arithmetic means of three fresh processes per cell. CPU and Go allocation
+columns describe one Transfer operation (64 KiB each way).
+
+With Salamander:
+
+| Client | Server | Transfer MB/s | Parallel MB/s | Upload MB/s | Download MB/s | CPU ms/op | Go B/op | Go allocs/op |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Go | Go | 83.49 | 82.16 | 78.07 | 81.22 | 1.452 | 43,658 | 1,204 |
+| Go | Native | 66.18 | 68.28 | 41.50 | 84.66 | 1.796 | 26,428 | 746 |
+| Native | Go | 67.95 | 65.67 | 53.56 | 42.92 | 1.748 | 25,352 | 738 |
+| Native | Native | 108.00 | 106.51 | 130.91 | 126.53 | 1.133 | 5,998 | 197 |
+
+Without Salamander:
+
+| Client | Server | Transfer MB/s | Parallel MB/s | Upload MB/s | Download MB/s | CPU ms/op | Go B/op | Go allocs/op |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Go | Go | 110.21 | 110.15 | 108.80 | 116.46 | 1.052 | 31,088 | 839 |
+| Go | Native | 88.95 | 86.76 | 65.86 | 112.10 | 1.327 | 20,306 | 547 |
+| Native | Go | 98.70 | 99.40 | 117.44 | 71.44 | 1.195 | 18,208 | 521 |
+| Native | Native | 119.49 | 120.73 | 146.30 | 140.43 | 1.019 | 5,962 | 195 |
+
+On the Salamander workload native/native improves Transfer by about 29%,
+Parallel by 30%, upload by 68% and download by 56% over Go/Go on one CPU.
+Transfer CPU work falls about 22%, and Go allocation bytes fall about 86%.
+Without masking, gains are smaller: roughly 8% Transfer and 34% upload.
+The mixed-backend cases often regress on one CPU. In particular, a native
+server with a Go client does not demonstrate a universal speed or CPU advantage.
+
+Native-client open/exchange/close averages 1.017 ms against a native server and
+1.084 ms against Go with Salamander; without it the means are 0.992 and
+1.060 ms. The Go-client cases failed as described above, so these are comparisons
+of servers with the same native client, not a comparison against a Go short-flow
+baseline.
+
+### Latency
+
+All values below are microseconds. Background rates are aggregate MiB/s actually
+achieved, not the configured load. Mean p99 values are means of the per-process
+p99 observations.
+
+With Salamander:
+
+| Client | Server | Idle TCP p50/p99 | Saturated TCP p99 / background MiB/s | Paced TCP p99 / background MiB/s | UDP p50/p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Go | Go | 94.4 / 139.9 | 7,317 / 76.8 | 4,236 / 63.7 | 92.7 / 148.8 |
+| Go | Native | 157.4 / 214.4 | 7,854 / 70.6 | 6,044 / 59.6 | 154.9 / 238.8 |
+| Native | Go | 156.6 / 217.1 | 10,537 / 63.4 | 8,038 / 58.1 | 148.7 / 231.9 |
+| Native | Native | 171.9 / 235.7 | 5,819 / 114.4 | 1,966 / 61.8 | 156.9 / 227.5 |
+
+Without Salamander:
+
+| Client | Server | Idle TCP p50/p99 | Saturated TCP p99 / background MiB/s | Paced TCP p99 / background MiB/s | UDP p50/p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Go | Go | 94.9 / 136.7 | 7,153 / 104.7 | 2,353 / 62.9 | 93.9 / 164.5 |
+| Go | Native | 155.4 / 209.5 | 5,682 / 90.3 | 2,959 / 62.1 | 153.4 / 228.6 |
+| Native | Go | 153.0 / 212.8 | 7,494 / 89.7 | 3,243 / 63.8 | 146.7 / 222.9 |
+| Native | Native | 167.3 / 230.1 | 5,254 / 130.0 | 1,754 / 63.6 | 152.1 / 214.2 |
+
+Go/Go wins idle TCP and UDP latency. Native/native serves more saturated traffic
+and has lower observed tail latency under load. The paced comparison is only
+approximately equal: some combinations fail to sustain the offered 64 MiB/s.
+The loaded rows must not be used as proof of latency at identical delivered
+load. These findings do not support a claim of universally improved latency.
+
+### Capacity and memory methodology
+
+The entry server handles 500 distinct identities, 1000 authenticated QUIC
+connections and 1000 live TCP streams. Eight routes forward through an exit
+server, using sixteen pooled native upstream sessions or Go's eight normal
+sessions. Every stream uploads 256 KiB and receives its echo, totaling 500 MiB
+duplex. Readers start after two seconds while uploads may still be pending.
+All streams then exchange heartbeats for twelve seconds. The same cgroup limits,
+Salamander and traffic apply to both backends.
+
+`GOMEMLIMIT=128MiB` is a Go runtime limit; it does not include Rust allocations.
+Its effect on the live Go heap and collection work must be considered when
+comparing CPU time. `XHYS_CAPACITY_GOMEMLIMIT` supports a higher-limit comparison.
+Only the entry server's cgroup supplies memory peak and CPU usage. A separate
+RSS high-water value may differ from cgroup memory accounting. A passing
+1 GiB cgroup test does not establish that Xray plus all other services fit on
+the reported RU host, which previously killed Xray at approximately 283 MiB RSS
+during global OOM.
+
+Earlier development runs decreased from roughly 533 to 442 MiB while narrowing
+buffer size classes; heap profiles attributed about 94% of the intermediate
+Go live heap to byte-pool arrays. Subsequent smaller windows and read batches
+restored backpressure. Upload/read sequencing changed at that point, so these
+development numbers are not a controlled before/after capacity comparison.
+
+Two fresh capacity samples per backend, without heap-profile sampling, with
+`GOMEMLIMIT=128MiB`:
+
+| Entry backend | Setup s | Idle RSS MiB | Peak cgroup MiB | Final RSS MiB | Entry CPU s | Traffic + heartbeats s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Go | 2.494 | 162.8 | 288.7 | 196.9 | 26.925 | 36.351 |
+| Native | 1.143 | 155.4 | 333.8 | 318.2 | 10.508 | 20.651 |
+
+All samples passed. The native process uses about 61% less CPU and completes
+the traffic/heartbeat phase about 43% sooner at this Go memory limit, but its
+peak cgroup memory is about 16% higher. Its post-transfer RSS is also higher.
+Native Go heaps are much smaller, but that does not mean total native RSS is
+smaller: native allocations and retained allocator pages remain outside the
+Go heap accounting.
+
+Single diagnostic runs at `GOMEMLIMIT=256MiB`, including heap-profile sampling:
+
+| Entry backend | Peak cgroup MiB | Final RSS MiB | Entry CPU s | Traffic + heartbeats s | GC cycles at final sample |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Go | 291.8 | 269.1 | 18.188 | 32.185 | 88 |
+| Native | 333.2 | 321.7 | 10.598 | 20.785 | 12 |
+
+An additional Go 128 MiB profiling run observed 248 GC cycles at its final
+sample, versus 88 with 256 MiB. Raising the Go limit reduces its collection
+pressure and CPU work while retaining more Go memory after traffic. Therefore
+the 61% CPU advantage from the 128 MiB fixture must not be treated as an
+advantage over an optimally configured Go process. At 256 MiB the diagnostic
+native run used about 42% less CPU; these are single samples, not a tuning study.
+
+### Simulated WAN
+
+Three fresh runs per backend, Salamander, 100 ms RTT, 16 MiB upload plus its
+16 MiB echo, with the complete test inside a 1 GiB / 100%-CPU cgroup. There is
+no injected packet loss or bandwidth cap. Both endpoints and the UDP delay relay
+are included; this is not the capacity fixture's isolated-server accounting.
+
+| Backends | Mean duplex MiB/s | Observed range MiB/s |
+| --- | ---: | ---: |
+| Go / Go | 18.83 | 17.82–20.13 |
+| Native / Native | 16.74 | 15.95–18.07 |
+
+Both passed the transfer correctness and completion checks. Native has no
+demonstrated WAN speed advantage in this fixture. Its small-node receive-window
+settings trade memory for bandwidth-delay capacity; real high-BDP and lossy
+paths still need separate measurement.
+
+All raw matrix, capacity and simulated-WAN results live in ignored
+`build_assets/native-go-release-20261117`, alongside the native archive hash,
+source diff and affinity settings. Earlier raw results in
+`build_assets/native-go-comparison-20261117` predate the short-flow close fix
+and did not pin Rust threads to one CPU. The separate historical native
+comparison in `build_assets/native-memory-final-20261117` has that same affinity
+limitation.
+
+### Verification boundaries
+
+The vendored Quinn suite passed 314 tests, the engine passed 39 tests, and Go
+race checks passed for bytespool, buf, xhysteria and hysteria. Full interop
+passed with shared/socket bridges, port hopping, capacity recovery, dynamic
+users, TLS replacement and the actual NodeX-generated server configuration.
+Linux amd64 and Android arm64/API 26 CLI builds succeeded.
+
+The broader `go test ./common/...` remains unsuccessful in unrelated packages:
+geodata tests lack `resources/geosite.dat` and `resources/geoip.dat`; log tests
+receive no registered log output; a reflect JSON test also fails. These were
+not changed to make an unrelated suite green.
+
+No remote deployment, Android-device performance measurement, real RU route
+measurement or WAN loss experiment was performed. Receive-window expansion
+reservations remain held until session closure. The process budgets do not
+cover every native allocation, Go allocation or kernel socket, and do not
+guarantee a bound on whole-node RSS.
+
+## November 17, 2026: final delivery comparison
+
+This section supersedes the initial bounded-memory milestone above. The final
+implementation uses 64 KiB initial server receive windows, eight-chunk QUIC
+reads, shared outbound runtimes with dedicated inbound runtimes, compact
+small-node outbound receive workspaces, and lazy server UDP dispatch. Header
+scratch storage is released after parsing, and UDP expiry follows activity
+without per-second polling. Optional allocation instrumentation is disabled
+for every measurement below. No allocator or host sysctl tuning was applied.
+
+All final raw results, the archive hash, methodology, and source snapshot are in
+`build_assets/native-delivery-20261117`. `summary.json` contains arithmetic means
+and individual capacity/WAN observations. These remain local ignored artifacts;
+this document preserves the results for other checkouts.
+
+### Final one-CPU matrix
+
+The same Xeon E5-2698 v3 host and Go/Rust toolchains are used. Three fresh
+two-second processes per cell alternate server order. CPU affinity 0 pins Go,
+Rust, both endpoints and the echo target to one logical CPU; `GOMAXPROCS=1`.
+Salamander is enabled. Native uses its normal shared bridge and two-session
+client pool; Go uses its existing session reuse. Both include the current common
+buffer-pool fixes. There is no concurrent build during measurement.
+
+```sh
+XHYS_BENCH_PACED_MIBPS=32 XHYS_BENCH_AFFINITY=0 \
+XHYS_BENCH_TIME=2s XHYS_BENCH_COUNT=3 XHYS_BENCH_CPUS=1 \
+XHYS_BENCH_SCENARIOS='Transfer Parallel Upload Download Latency LoadedLatency PacedLatency UDPLatency' \
+XHYS_BENCH_CLIENTS='go shared_pool2' XHYS_BENCH_MASKS=1 \
+bash native/libxhysteria/bench-server.sh build_assets/native-delivery-20261117
+```
+
+Throughput is decimal MB/s; Transfer/Parallel count both directions, while
+Upload/Download count one direction. CPU and Go allocation columns describe a
+Transfer operation of 64 KiB each way. CPU includes native work; Go allocation
+bytes exclude Rust allocations and shared arenas.
+
+| Client | Server | Transfer MB/s | Parallel MB/s | Upload MB/s | Download MB/s | CPU ms/op | Go B/op |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Go | Go | 80.83 | 79.92 | 77.25 | 79.09 | 1.501 | 43,508 |
+| Go | Native | 66.36 | 65.00 | 41.68 | 89.45 | 1.784 | 26,274 |
+| Native | Go | 67.48 | 67.20 | 58.02 | 42.95 | 1.759 | 25,239 |
+| Native | Native | 109.76 | 109.90 | 142.54 | 137.55 | 1.095 | 5,904 |
+
+Native/native achieves 1.36x Transfer and 1.85x upload, not a universal 2.5x.
+Transfer CPU work is about 27% lower and Go allocation bytes about 86% lower.
+The allocation reduction is not a measurement of total process memory. Mixed
+combinations often regress, especially upload with a Go client/native server.
+
+Latency values are microseconds. Each p99 is the mean of the three process p99
+observations. Background rates are actual aggregate MiB/s.
+
+| Client | Server | Idle TCP p50/p99 | Saturated TCP p99 / background MiB/s | Paced TCP p99 / background MiB/s | UDP p50/p99 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Go | Go | 95.1 / 140.6 | 8,261 / 74.36 | 1,282 / 31.96 | 93.7 / 151.8 |
+| Go | Native | 159.9 / 218.8 | 9,086 / 66.67 | 2,274 / 31.94 | 157.9 / 239.7 |
+| Native | Go | 158.5 / 225.8 | 9,583 / 67.30 | 2,414 / 31.95 | 154.0 / 239.7 |
+| Native | Native | 178.0 / 244.2 | 5,253 / 121.83 | 1,169 / 31.95 | 163.4 / 233.1 |
+
+Go/Go remains better for idle TCP and UDP latency. Native/native has about 36%
+lower saturated TCP p99 at its higher delivered load. With a common offered
+32 MiB/s and essentially equal achieved rates, its TCP p99 is about 9% lower.
+The saturated row is not an equal-delivered-load latency comparison.
+
+### Final 500-user cascade
+
+Two fresh samples per backend alternate Go/native, then native/Go. The entry
+alone is in a 1 GiB cgroup with `CPUQuota=100%`, `GOMAXPROCS=1`, and
+`GOMEMLIMIT=256MiB`; the generator and exit are outside it. This quota is not
+the matrix's CPU affinity. There are 500 identities, 1000 authenticated QUIC
+sessions and 1000 open TCP flows. Eight routes use sixteen native upstream
+sessions or Go's normal eight sessions. All links use Salamander.
+
+Each stream sends 256 KiB and receives its echo, totaling 500 MiB duplex.
+Transfer time includes the mandatory two-second delayed reader start, but
+excludes setup and the following twelve seconds of per-flow heartbeats.
+Heap profiling is disabled. This is a cascade comparison with each backend's
+normal pooling, not a comparison with identical upstream session counts.
+
+```sh
+XHYS_CAPACITY_BACKEND=go XHYS_CAPACITY_GOMEMLIMIT=256MiB \
+XHYS_CAPACITY_SYSTEMD=1 XHYS_CAPACITY_CASCADE=1 \
+build_assets/native-delivery-20261117/interop.test \
+  -test.run '^TestNativeServer500Users$' -test.v -test.timeout=2m
+```
+
+Repeat with `XHYS_CAPACITY_BACKEND=native`. Build the test binary first with
+`bench-server.sh`, or use the README's `go test` invocation after rebuilding the
+Rust archive. All four final samples pass the 512 MiB RSS/cgroup ceiling.
+
+| Metric | Go mean | Native mean |
+| --- | ---: | ---: |
+| Setup seconds | 1.476 | 1.066 |
+| Transfer seconds | 25.061 | 5.830 |
+| Duplex MiB/s | 20.16 | 85.76 |
+| Idle entry RSS MiB | 186.6 | 142.6 |
+| Buffered entry RSS MiB | 266.3 | 238.3 |
+| Peak entry RSS MiB | 295.1 | 279.3 |
+| Peak entry cgroup MiB | 286.0 | 261.0 |
+| Final entry RSS MiB | 272.6 | 279.3 |
+| Entry RSS two seconds after close MiB | 272.7 | 277.0 |
+| Entry cgroup CPU seconds | 18.732 | 8.079 |
+| Heartbeat p50 microseconds | 2,171.9 | 1,081.9 |
+| Heartbeat p99 microseconds | 6,895.2 | 2,339.7 |
+
+Individual observations expose the variation rather than hiding it in a mean:
+
+| Backend/sample | Duplex MiB/s | Peak cgroup MiB | Heartbeat p99 microseconds | Final RSS MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Go 1 | 22.20 | 302.1 | 4,037.2 | 278.3 |
+| Go 2 | 18.12 | 269.8 | 9,753.1 | 266.9 |
+| Native 1 | 85.83 | 264.3 | 2,583.2 | 282.9 |
+| Native 2 | 85.69 | 257.7 | 2,096.2 | 275.7 |
+
+The mean duplex-rate ratio is 4.25x; both individual native rates exceed both
+Go rates by more than 2.5x. Idle RSS is about 24% lower, peak cgroup memory about
+8.7% lower, and entry CPU work about 57% lower. Mean heartbeat p99 is about 66%
+lower, but the Go tail varies substantially; two runs do not establish a stable
+universal p99 factor. Final RSS is about 2.5% higher for native, and allocator
+pages remain retained after closing all sessions. Peak RSS and cgroup accounting
+are distinct, not interchangeable memory estimates.
+
+### Final simulated WAN
+
+Three fresh samples per backend alternate order. The whole fixture, including
+both endpoints and the UDP relay, is in a 1 GiB / 100%-CPU cgroup with
+`GOMAXPROCS=1` and `GOMEMLIMIT=256MiB`. Salamander, simulated 100 ms RTT, and
+16 MiB upload plus 16 MiB echo are used. No loss or bandwidth cap is injected.
+
+```sh
+XHYS_WAN_BACKEND=native systemd-run --user --quiet --scope \
+  --property=MemoryMax=1G --property=CPUQuota=100% \
+  env GOMAXPROCS=1 GOMEMLIMIT=256MiB \
+  build_assets/native-delivery-20261117/interop.test \
+  -test.run '^TestNativeServerBulkTransferWith100msRTT$' -test.v -test.timeout=1m
+```
+
+Repeat with `XHYS_WAN_BACKEND=go`.
+
+| Backends | Mean duplex MiB/s | Individual MiB/s |
+| --- | ---: | --- |
+| Go / Go | 14.69 | 15.43, 13.40, 15.23 |
+| Native / Native | 14.35 | 15.61, 12.76, 14.67 |
+
+All samples pass. The ranges overlap; this does not demonstrate a native WAN
+speed advantage. Historical WAN rates above belong to earlier builds and must
+not be combined with these observations.
+
+### Final validation and unresolved bottlenecks
+
+The final engine suite passes 42 tests, also with `allocation-profile` enabled.
+The unchanged BBR patch passes the 314-test vendored Quinn suite. Go race tests
+pass for bytespool, buf, xhysteria and hysteria. Full interop passes, including
+shared/socket bridges, dynamic users, TLS rotation, port hopping, 300 sequential
+short flows, UDP activity/idle slot recovery, 500-user capacity and the actual
+NodeX-generated configuration. Linux amd64 and Android arm64/API 26 CLI builds
+succeed. The unrelated broad `common/...` failures described above remain.
+
+Next targets are idle TCP/UDP bridge scheduling, allocator page retention after
+traffic, receive-window expansion held by idle sessions, and throughput with
+mixed Go/native endpoints or high-BDP/lossy paths. Sharing the server runtime
+with outbound engines worsened saturated p99 and was rejected; mimalloc
+increased peak memory and was removed. Larger frames and fewer credits also
+regressed throughput or caused stalls and were not retained.
+
+This is not a hard whole-process memory cap. Base client RX, kernel buffers,
+Go forwarding and other allocations are outside the process expansion/send
+budgets. Other services on the RU host caused global memory pressure; a passing
+isolated cgroup test does not make that node OOM-proof. No remote deployment,
+real RU-path comparison, Android-device benchmark or bypclient library
+replacement is included.
+
+## November 17, 2026: latency follow-up (latest)
+
+The final delivery implementation above is the baseline for this follow-up.
+Shared storage layout advances from 4 to 5, without changing the 1,115,456-byte
+arena or engine ABI 4. Go and Rust must be rebuilt together.
+
+Full-ring writers arm a waiting flag and recheck the ring before sleeping.
+Consumers publish the freed slot before inspecting the flag and send space
+notifications only when a writer is waiting. Sequentially consistent ordering
+of the flag/recheck pair prevents missed wakes during concurrent draining.
+The Rust publication path creates its `Notified` future before inspecting the
+ring; it enters the waiter list only on actual backpressure, with
+`notify_waiters` generations preserving intervening notifications.
+
+Go uses nonblocking raw syscalls for eventfd I/O under RawConn descriptor
+lifetime protection. EAGAIN still sleeps in Go netpoll rather than spinning.
+Each reader retains its own buffer and callback instead of allocating a new
+closure for each wait. Go and Rust credit messages reference immutable tables;
+the shared decoder no longer allocates a forwarding buffer for credit events.
+Payload frames still copy into owned storage before releasing ring slots.
+
+### Paired latency measurement
+
+Three fresh two-second processes per cell, alternating baseline/current/Go
+order, with Salamander and `GOMAXPROCS=1`. All Go and Rust threads, endpoints and
+echo targets are pinned to logical CPU 14. This CPU was selected after CPU 0
+became heavily loaded by unrelated work. There is no concurrent build during
+the measurements. Raw results and individual observations are in
+`build_assets/native-latency-20261117/delivery-*.txt` and
+`delivery-summary.json`.
+
+The baseline/current columns both use native client and server, the shared
+bridge and the normal two-session client pool. Go means Go at both endpoints.
+All three binaries include the common byte-pool fixes. These observations must
+not be treated as the earlier CPU-0 matrix or combined with those samples.
+There is still background host noise; three runs do not establish significance
+or a guaranteed tail-latency bound.
+
+| Metric | Native before | Native current | Go |
+| --- | ---: | ---: | ---: |
+| Idle TCP p50 microseconds | 179.7 | 171.1 | 95.8 |
+| Idle TCP p99 microseconds | 309.6 | 284.4 | 185.8 |
+| Idle UDP p50 microseconds | 164.3 | 158.5 | 94.9 |
+| Idle UDP p99 microseconds | 288.8 | 272.4 | 256.4 |
+| Paced TCP p99 microseconds | 1,185.3 | 1,170.7 | 1,407.7 |
+| Paced achieved background MiB/s | 31.93 | 31.84 | 31.95 |
+| Saturated TCP p99 microseconds | 5,239.7 | 5,188.3 | 8,075.3 |
+| Saturated achieved background MiB/s | 121.57 | 121.07 | 74.01 |
+| Transfer MB/s | 108.07 | 107.94 | 80.42 |
+| Transfer CPU ms/op | 1.101 | 1.057 | 1.489 |
+| Transfer Go B/op | 5,898 | 5,379 | 43,506 |
+| Transfer Go allocs/op | 195.0 | 165.3 | 1,203.0 |
+| Idle TCP Go B/op / allocs/op | 490 / 22 | 384 / 16 | 1,223 / 38 |
+| Idle UDP Go B/op / allocs/op | 913 / 39 | 809 / 33 | 2,378 / 72 |
+
+Compared with native before, observed idle TCP p99 is 8.1% lower and UDP p99
+5.7% lower. TCP p50 is 4.8% lower and UDP p50 3.5% lower. Transfer rate differs
+by -0.1%, while its CPU work falls about 4%, Go allocation bytes about 9%, and
+Go allocation count about 15%. Idle TCP exchanges use six fewer Go allocations.
+These allocation values exclude Rust allocations and arena storage.
+
+At essentially equal achieved load near 32 MiB/s, current native TCP p99 is
+16.8% below Go; the improvement relative to native before is only 1.2%.
+The saturated p99 is 35.8% below Go while delivering more traffic; that row is
+not an equal-delivered-load comparison. Go still wins idle TCP and UDP latency.
+There is no demonstrated 2.5x idle-latency advantage over Go.
+
+An earlier five-process CPU-14 comparison, before the raw eventfd reader,
+observed native idle TCP p99 decrease 268.9 to 259.7 microseconds and UDP p99
+253.1 to 245.2. A subsequent three-process reader comparison reduced TCP p99
+259.9 to 254.0 and UDP p99 245.0 to 242.9. The absolute tails vary across
+measurement windows, so these stages are not added to manufacture a total gain.
+The final table uses only the contemporaneous baseline/current/Go samples.
+
+Scheduler experiments with more frequent I/O polling or a multithread scheduler
+for a one-worker listener did not give a consistent latency gain. The latter
+worsened saturated p99. Giving small TCP writes higher stream priority also
+failed to produce a consistent gain. All three experiments were removed.
+An initial raw-read callback allocated on each wait; that version was replaced
+with the per-reader buffer and callback before the final comparison.
+
+### Capacity and verification after latency changes
+
+One fresh native capacity validation uses the same 500 identities, 1000 QUIC
+sessions, 1000 TCP flows, 500 MiB duplex, two-second delayed readers, twelve
+seconds of heartbeats, eight cascade routes, 1 GiB entry cgroup, 100% CPU quota
+and `GOMEMLIMIT=256MiB` as above:
+
+| Metric | Current native |
+| --- | ---: |
+| Idle entry RSS MiB | 139.8 |
+| Duplex MiB/s / transfer seconds | 90.94 / 5.498 |
+| Heartbeat p50/p99 microseconds | 988.0 / 3,597.4 |
+| Peak entry cgroup MiB | 259.4 |
+| Final/peak entry RSS MiB | 277.7 |
+| Entry RSS two seconds after close MiB | 270.8 |
+| Entry cgroup CPU seconds | 7.570 |
+
+The validation passes; it is one native observation, not a fresh repeated Go
+capacity comparison. Its heartbeat p99 is higher than the two pre-follow-up
+native samples above despite lower CPU work. The load-test tail is variable,
+and the idle microbench improvement does not prove a lower 500-user p99.
+Allocator retention and whole-node OOM limits remain unresolved.
+
+The Rust suite now passes 44 tests, including waiting-writer flags and
+uncontended notification suppression, also with allocation profiling enabled.
+Clippy passes with warnings denied. Go race checks pass for bytespool, buf,
+xhysteria and hysteria. Shared tests cover full queues, wraparound, concurrent
+publication, close wakeups, read deadlines and recovery, and credit bytes after
+slot reuse. Full native interop and the NodeX-generated configuration pass.
+Linux amd64 and Android arm64/API 26 CLI builds succeed. The vendored BBR code
+is unchanged from its 314-test validation. No remote or device test is included.

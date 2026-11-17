@@ -37,6 +37,7 @@ h3-quinn = { path = "vendor/h3-quinn" }
 [features]
 probe = ["dep:bytes", "dep:h3", "dep:h3-quinn", "dep:http", "dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:tokio"]
 engine = ["probe", "dep:serde", "dep:serde_json", "dep:webpki-roots", "dep:quinn-proto"]
+allocation-profile = ["engine"]
 
 [[bin]]
 name = "xhys-probe"

@@ -3,6 +3,7 @@
 package xhysteria
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"testing"
@@ -11,6 +12,39 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 )
+
+func TestServerFlowQueuesAndCreditsStayWithinChunkBudget(t *testing.T) {
+	e := &Engine{role: "server", done: make(chan struct{}), out: make(chan frame, 8)}
+	c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	payload := bytes.Repeat([]byte{0xa7}, 65536)
+	if _, err := c.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.out) != 4 || len(c.writeCredit) != 0 || cap(c.in) != 6 {
+		t.Fatal("server exceeded its four-frame flow window")
+	}
+	for range 4 {
+		f := <-e.out
+		if len(f.data) != 16384 {
+			t.Fatalf("server chunk is %d bytes, want 16384", len(f.data))
+		}
+		f.release()
+	}
+	for range 4 {
+		if _, err := c.received(frame{kind: dataFrame}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(e.out) != 2 {
+		t.Fatal("server did not return credits at half its flow window")
+	}
+	for range 2 {
+		f := <-e.out
+		if f.kind != creditFrame || !bytes.Equal(f.data, []byte{2}) {
+			t.Fatalf("incorrect server credit frame: %+v", f)
+		}
+	}
+}
 
 func TestEmptyTCPMultiBuffersPreserveWriteCredits(t *testing.T) {
 	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
@@ -21,7 +55,7 @@ func TestEmptyTCPMultiBuffersPreserveWriteCredits(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(c.writeCredit) != 16 || len(e.out) != 0 {
+	if len(c.writeCredit) != 8 || len(e.out) != 0 {
 		t.Fatal("empty writes consumed credits or queued payload")
 	}
 }
@@ -55,13 +89,13 @@ func TestReceiveCreditsAreBatchedWithoutDelayingPayload(t *testing.T) {
 			t.Fatal("credit batching delayed or changed payload")
 		}
 		buf.ReleaseMulti(mb)
-		if len(e.out) != (sequence+1)/8 {
+		if len(e.out) != (sequence+1)/4 {
 			t.Fatal("unexpected credit count")
 		}
 	}
-	for range 4 {
+	for range 9 {
 		f := <-e.out
-		if f.kind != creditFrame || len(f.data) != 1 || f.data[0] != 8 {
+		if f.kind != creditFrame || len(f.data) != 1 || f.data[0] != 4 {
 			t.Fatalf("incorrect credit batch: %+v", f)
 		}
 	}
@@ -70,7 +104,7 @@ func TestReceiveCreditsAreBatchedWithoutDelayingPayload(t *testing.T) {
 func TestQueuedPayloadSurvivesEngineShutdownAtCreditBoundary(t *testing.T) {
 	e := &Engine{done: make(chan struct{}), out: make(chan frame, 16)}
 	c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
-	c.readCredits = 7
+	c.readCredits = 3
 	c.in <- frame{kind: dataFrame, id: c.id, data: []byte("last payload")}
 	close(e.done)
 	c.fail(errors.New("connection stopped"))
@@ -94,7 +128,7 @@ func TestChangingDeadlineInterruptsBlockedNativeReadAndWrite(t *testing.T) {
 			e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
 			c := newConn(e, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
 			if write {
-				for range 16 {
+				for range cap(c.writeCredit) {
 					<-c.writeCredit
 				}
 			}

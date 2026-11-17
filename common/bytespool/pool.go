@@ -13,8 +13,8 @@ func createAllocFunc(size int32) func() interface{} {
 // Package buf is guaranteed to not use buffers larger than the largest pool.
 // Other packets may use larger buffers.
 const (
-	numPools  = 4
-	sizeMulti = 4
+	numPools  = 7
+	sizeMulti = 2
 )
 
 var (
@@ -64,7 +64,7 @@ func Free(b []byte) {
 	size := int32(cap(b))
 	b = b[0:cap(b)]
 	for i := numPools - 1; i >= 0; i-- {
-		if size >= poolSize[i] {
+		if size == poolSize[i] {
 			pool[i].Put(b)
 			return
 		}

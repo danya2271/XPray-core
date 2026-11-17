@@ -10,6 +10,10 @@ cpus=${XHYS_BENCH_CPUS:-4}
 scenarios=${XHYS_BENCH_SCENARIOS:-"Transfer Parallel Upload Download Latency LoadedLatency PacedLatency UDPLatency"}
 clients=${XHYS_BENCH_CLIENTS:-"go shared_pool2"}
 masks=${XHYS_BENCH_MASKS:-"0 1"}
+runner=()
+if [[ -n "${XHYS_BENCH_AFFINITY:-}" ]]; then
+    runner=(taskset -c "$XHYS_BENCH_AFFINITY")
+fi
 
 mkdir -p "$output"
 output=$(CDPATH= cd -- "$output" && pwd)
@@ -21,7 +25,11 @@ CGO_ENABLED=1 go test -c -tags 'xhysteria_native xhysteria_interop' \
     -o "$output/interop.test" ./native/libxhysteria/interop
 git rev-parse HEAD > "$output/revision.txt"
 printf '%s\n' "${native_hash%% *}" > "$output/native-archive.sha256"
-git diff --binary -- native/libxhysteria transport/internet/xhysteria \
+printf 'gomaxprocs=%s\ncpu_affinity=%s\nbenchtime=%s\ncount=%s\npaced_mibps=%s\n' \
+    "$cpus" "${XHYS_BENCH_AFFINITY:-unrestricted}" "$duration" "$count" \
+    "${XHYS_BENCH_PACED_MIBPS:-64}" \
+    > "$output/methodology.txt"
+git diff HEAD --binary -- common/bytespool native/libxhysteria transport/internet/xhysteria \
     transport/internet/hysteria/native.go transport/internet/hysteria/native_test.go \
     > "$output/source.patch"
 
@@ -36,12 +44,14 @@ for ((sample=1; sample<=count; sample++)); do
                 for server in $servers; do
                     name="$scenario-mask$masked-client$client-server$server-$sample"
                     XHYS_BENCH_NATIVE_SERVER="$server" XHYS_BENCH_SALAMANDER="$masked" \
-                        "$output/interop.test" -test.run '^$' \
+                        "${runner[@]}" "$output/interop.test" -test.run '^$' -test.v \
                         -test.bench "^BenchmarkNative${scenario}$/${client}$" \
                         -test.benchtime "$duration" -test.count 1 -test.cpu "$cpus" \
                         -test.benchmem -test.timeout 120s > "$output/$name.txt" 2>&1
                     printf '%s ' "$name"
-                    rg 'ns/op' "$output/$name.txt"
+                    if ! rg 'ns/op' "$output/$name.txt"; then
+                        rg -- '--- SKIP:' "$output/$name.txt"
+                    fi
                 done
             done
         done
