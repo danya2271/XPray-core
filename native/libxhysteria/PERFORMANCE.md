@@ -1411,3 +1411,180 @@ is an invalid mask-name invocation without traffic; `go-only-shipped.log`
 similarly tries an exclusively native-tagged package without its tag. Corrected
 validation logs are `loss-header-shipped.log`, `go-only-valid-shipped.log` and
 `go-race-fresh-shipped.log`; preserve failed invocations instead of hiding them.
+
+## 2026-11-18: Receive-Stream Metadata Reuse
+
+This pass targets the existing vendored Quinn stream assembler, not packet
+masking, QUIC pacing, flow-control windows or the Go/Rust bridge ABI.
+
+- Defragmentation converts the existing heap to its sorted backing vector,
+  processes chunks backwards, and writes retained nodes only into already
+  consumed storage. Rebuilding the heap reuses the vector rather than allocating
+  a second metadata heap. Removing its empty prefix can still move metadata;
+  this is not zero-copy defragmentation. Payload compaction remains intentional
+  to avoid retaining oversized receive allocations.
+- Sparse metadata capacity greater than 512 slots is shrunk when fewer than
+  one quarter of the slots survive merging, retaining at least 128 slots or
+  twice the surviving count. A regression fixture reduces 4,096 slots to 128:
+  **224 KiB to 7 KiB** of metadata on this x86-64 build, not total process RSS.
+- Reset/closed streams keep small metadata caches, but release backing storage
+  with capacity above 128 slots. Active chunk-count limits and receive windows
+  remain unchanged. Clearing a stream preserves its offsets and ordering state.
+
+The differential regression test checks 128 deterministic overlapping,
+duplicate and gapped inputs against the previous defragmentation algorithm,
+including mixed retained/compacted chunks, emitted bytes and accounting.
+
+### Defragmentation Microbenchmark
+
+The before binary uses `c864d1f9` production code and the same new microbenchmark
+harness. Release standalone Quinn, CPUs 12–15, ABBA phases, three fresh-process
+samples per phase: six per variant. Each sample times 4,096 defragmentations
+of 1,024 gapped 64-byte chunks; fixture setup and destruction are outside the
+timer. A node is 56 bytes, so the old second heap requests **56 KiB per run**.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Median defragmentation, µs | 125.450 | 106.014 |
+| Samples, µs | 121.514; 121.973; 125.119; 126.771; 125.986; 125.781 | 105.954; 107.928; 106.073; 105.253; 105.814; 109.627 |
+
+The median is **15.5% lower (1.18× speed)** for this deliberately fragmented
+workload. Ordinary in-order streams rarely need defragmentation, so this is
+not an end-to-end throughput or latency promise.
+
+### Same-Harness Native A/B
+
+`/tmp/xhys-memory-shipped.test` versus `/tmp/xhys-assembler-after.test`, identical
+packet/header-mask Go benchmark sources, release native archives, `GOMAXPROCS=4`,
+CPUs 12–15, shared bridge/pool size 1. ABBA phases with two 2-second samples
+per phase: four per variant. Other validation runs use different physical cores
+on the same machine; the host is not otherwise isolated. Median results:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| TCP upload, MB/s | 332.80 | 328.90 |
+| TCP download, MB/s | 298.52 | 293.50 |
+| UDP 4 KiB request+reply, MB/s | 36.69 | 38.47 |
+| Upload process CPU, µs / 64 KiB | 519.64 | 523.57 |
+| Download process CPU, µs / 64 KiB | 570.00 | 573.64 |
+| UDP process CPU, µs / exchange | 332.16 | 320.24 |
+| TCP unloaded p50 / p99, µs | 159.95 / 289.85 | 156.75 / 258.25 |
+| Paced TCP p50 / p99, µs | 190.45 / 1041.85 | 168.05 / 742.50 |
+| Paced background, MiB/s | 62.22 | 63.42 |
+
+Upload/download are **1.2%/1.7% lower**; UDP is 4.9% higher. Latency medians
+improve in this run, but phase-to-phase variation is large and does not
+establish causality from assembler changes. No blanket throughput improvement
+is claimed. Go upload allocation count remains 31 per 64 KiB.
+
+### Whole-Process Memory and Go Comparison
+
+Five rotating-order fresh-process uploads, each exactly 8,192 × 64 KiB
+(512 MiB), Linux `wait4` peak RSS, same binary harness and CPU settings:
+
+| Backend | Samples, KiB | Median, MiB |
+| --- | --- | ---: |
+| Before native | 81,436; 81,012; 80,996; 80,500; 80,876 | 79.10 |
+| After native | 78,028; 81,300; 82,492; 78,728; 81,504 | 79.39 |
+| Go | 39,200; 38,884; 41,360; 39,360; 41,268 | 38.44 |
+
+**No whole-process RSS reduction is demonstrated** in ordinary streaming:
+native median is 0.4% higher than before and 2.07× Go. Metadata-specific savings
+must not be represented as a global-memory or VPS OOM fix.
+
+Both-native versus both-Go in the after binary, three 2-second samples per
+metric, same packet/header masks and CPU settings:
+
+| Metric | Go | Native |
+| --- | ---: | ---: |
+| TCP upload, MB/s | 160.97 | 331.83 |
+| TCP download, MB/s | 171.38 | 300.54 |
+| UDP 4 KiB request+reply, MB/s | 35.89 | 41.86 |
+| TCP unloaded p50 / p99, µs | 137.80 / 236.20 | 158.50 / 260.90 |
+| Paced TCP p50 / p99, µs | 137.50 / 533.10 | 164.80 / 837.00 |
+| Paced background, MiB/s | 63.91 | 61.34 |
+| Go upload allocated bytes / allocations | 14,739 / 379 | 1,600 / 31 |
+| Go download allocated bytes / allocations | 15,370 / 395 | 1,666 / 41 |
+| Go UDP allocated bytes / allocations | 57,903 / 152 | 848 / 34 |
+
+Native upload/download/UDP rates are **2.06×/1.75×/1.17× Go**. Native still
+loses unloaded latency and paced p99, the latter by 1.57× despite lower achieved
+load. The requested 2.5× across metrics is not achieved. Go allocation counters
+exclude Rust, mmap and kernel memory; they are not whole-process savings.
+
+### Loaded UDP Repeat
+
+The eight direct/cascade × native/Go × 256/4,096-byte scenarios initially
+receive **2,000/2,000 each (16,000/16,000 total)**, sampled kernel drops zero.
+Native background rates are 280.57–283.46 MiB/s direct and 148.51–159.34
+cascade; Go is 204.93–211.61 direct and 130.96–133.06 cascade. Loads differ.
+
+Two further native cascade/256 ABBA rounds produce these received counts out
+of 2,000 per sample:
+
+| Round | Before A1 | After B1 | After B2 | Before A2 |
+| --- | ---: | ---: | ---: | ---: |
+| First | 2,000 | 1,987 | 1,996 | 1,995 |
+| Repeat | 1,995 | 2,000 | 1,997 | 2,000 |
+
+Sampled kernel drops remain zero. Intermittent application UDP loss persists:
+before loses 10/8,000 (0.125%), after 20/8,000 (0.250%); per-sample after loss
+ranges 0–0.65%. The second round does not reproduce the first round's direction,
+so these small samples do not establish a deterministic regression or a fix.
+The harness fails only for total loss; its PASS must not be interpreted as
+loss-free operation. No WAN or production-server reliability claim is made.
+
+### 1,000-Session Capacity Check
+
+Normal, non-race binaries, 1,000 authenticated QUIC connections and TCP flows
+(the harness's 500-user model), 500 MiB duplex transfer plus 12 seconds of
+heartbeats. Parent affinity is CPUs 12–15 with `GOMAXPROCS=4`; the separate
+server child uses `GOMAXPROCS=1`, one native worker and `GOMEMLIMIT=128MiB`.
+The same masks, session counts and limits apply to both variants and Go.
+Two native samples per variant in ABBA order, then two Go samples; medians:
+
+| Metric | Before native | After native | Go |
+| --- | ---: | ---: | ---: |
+| Duplex transfer, MiB/s | 173.29 | 174.44 | 47.08 |
+| Heartbeat p50, µs | 699.75 | 688.05 | 7,110.70 |
+| Heartbeat p99, µs | 2,192.00 | 2,176.35 | 30,350.05 |
+| Server idle RSS, MiB | 125.85 | 124.85 | 166.70 |
+| Server peak RSS, MiB | 228.20 | 225.30 | 191.75 |
+| Server RSS two seconds after close, MiB | 227.85 | 223.30 | 165.95 |
+
+Before/after throughput is only 0.7% higher and peak RSS 1.3% lower in this
+small sample; it does not establish a general RSS improvement. Under this
+specific high-concurrency workload native is **3.71× Go** in throughput and
+has much lower heartbeat latency, but peak RSS is **17.5% higher**. This does
+not contradict the slower native micro-request latency or 2.06× streaming
+upload result: they are different workloads. All six normal capacity runs
+pass the 512 MiB server-RSS assertion; no actual 1 GiB cgroup is applied here.
+
+The initial broad race run fails that assertion at 747.4 MiB; the old baseline
+race binary also fails at 739.9 MiB. These instrumented runs cannot measure
+production RSS. Their failure is preserved rather than represented as PASS.
+Earlier `capacity-before/after/go.log` trials on CPUs 0–7 overlapped other
+validation work; use the `capacity-isolated-*` series for the table.
+
+### Validation
+
+- Standalone Quinn release: 320 passed, one ignored microbenchmark; debug:
+  321 passed, one ignored. Engine: 89 passed both normally and with allocation
+  profiling; default-feature core: 19 passed. Both engine and standalone Quinn
+  all-target Clippy pass with warnings denied; assembler rustfmt check passes.
+- Fresh archive-hash-linked Go race tests pass for buffers, native transport,
+  Hysteria and the full FinalMask subtree. Applicable Go-only packages pass.
+- The functional interop race run passes 140 packet-mask combinations, shared
+  and socket bridges, HTTP masquerade, file/proxy cover handlers, local/remote
+  hopping, pooling, short flows, UDP expiry, capacity recovery and 100 ms RTT.
+  The long loss/capacity cases are skipped in that short run and tested
+  separately. The optional NodeX external-binary case is not configured.
+- A separate 128-session capacity run under race detection passes, peak server
+  RSS 171.8 MiB. This is a concurrency/ownership check, not production memory.
+  The 1,000-session race-RSS failure described above remains recorded.
+- Linux amd64 and Android arm64/API 26 native binaries are rebuilt. Neither is
+  deployed; no service restart, push or neighboring-repository change occurs.
+
+Logs, raw measurements, artifact hashes and `results.json` are in ignored
+`build_assets/assembler-overhead-20261118/`. The native metadata microbenchmark
+and ordinary streaming/RSS results are distinct workloads.

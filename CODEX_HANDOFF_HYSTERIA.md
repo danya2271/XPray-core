@@ -773,3 +773,72 @@ loss-shipped has an invalid mask name; go-only-shipped lacks the native tag.
 Corrected runs are loss-header-shipped, go-only-valid-shipped and
 go-race-fresh-shipped. Do not use experimental owner/lean/final RSS samples as
 the shipped comparison. No deployment, restart, push or neighboring-repo edit.
+
+## Latest: Receive-Stream Metadata Reuse (2026-11-18)
+
+Baseline production commit c864d1f9. Only native production change is the
+vendored Quinn assembler: defragment reuses its backing Vec instead of allocating
+a second BinaryHeap, writes output backwards into processed slots, drains the
+empty prefix and heapifies in place. Payload compaction copies remain deliberate;
+drain can move metadata. Active stream windows and chunk-count bounds unchanged.
+Sparse capacity >512 with occupancy <1/4 shrinks to max(128, 2*len). clear/reinit
+release caches with capacity >128; clear preserves stream offsets/ordering.
+
+Four regression tests cover 128 deterministic differential overlap/duplicate/
+gap cases against the old algorithm, retained backing pointer/capacity, small/
+large reset caches, clear offsets and 4096->128 slot shrink. x86-64 Buffer is
+56 bytes: 224->7KiB sparse metadata, old second heap 56KiB per1024-node defrag.
+Ignored microbenchmark times setup/destruction separately; six samples/variant,
+ABBA phases, median125.450->106.014us (-15.5%, 1.18x). This targets fragmented
+streams, not whole-process memory or ordinary in-order throughput.
+
+Same Go harness binaries /tmp/xhys-memory-shipped.test (before) and
+/tmp/xhys-assembler-after.test (after), GOMAXPROCS4 CPUs12-15 packet/header masks,
+shared bridge/pool1. Normal release native; archive-hash-linked rebuilds.
+Native ABBA four samples/variant: upload332.80->328.90MB/s (-1.2%),
+download298.52->293.50 (-1.7%), UDP36.69->38.47 (+4.9%); unloaded p99
+289.85->258.25us, paced1041.85->742.50 at background62.22->63.42MiB/s.
+Large phase variation; no causality or universal latency gain claimed.
+
+Five rotating fresh-process fixed512MiB upload peak RSS medians before79.10,
+after79.39, Go38.44MiB: no ordinary-stream RSS reduction; native2.07xGo.
+Both-native/both-Go after-binary medians upload331.83/160.97 (2.06x),
+download300.54/171.38 (1.75x), UDP41.86/35.89 (1.17x). Native unloaded
+p50/p99=158.5/260.9us vsGo137.8/236.2; paced164.8/837.0 vs137.5/533.1
+at lower achieved native load61.34vs63.91MiB/s. Go allocations exclude native
+and kernel memory. The requested across-metrics2.5x target remains unmet.
+
+Non-race1000-session capacity with one server worker/GOMAXPROCS1/GOMEMLIMIT128MiB,
+parent CPUs12-15GOMAXPROCS4, 500MiB duplex +12sec heartbeats. Native ABBA
+two samples/variant then two Go: throughput173.29->174.44MiB/s vsGo47.08
+(3.71x only this concurrency workload); p99heartbeat2192.00->2176.35us
+vsGo30350.05; peakRSS228.20->225.30MiB vsGo191.75 (native17.5%higher).
+Afterclose227.85->223.30 vsGo165.95. All6normal runs pass512MiB RSS guard;
+no1GiB cgroup actually applied. Use capacity-isolated-* logs; first CPU0-7
+capacity trials overlap other validation and are not the comparison table.
+
+Loaded UDP eight scenarios get2000/2000each, but two native cascade256 ABBA
+rounds expose intermittent loss: before counts2000/1995/1995/2000, after
+1987/1996/2000/1997. Aggregates before10/8000(0.125%), after20/8000(0.25%);
+after worstsample0.65%. All sampled kernel drops0, loads unequal; second round
+direction differs. Neither deterministic regression nor loss fix established.
+Harness fails only total loss, so PASS != lossfree. WAN/production unknown.
+
+320release/321debug Quinn tests +1ignored benchmark,19core,89engine alsoprofile,
+bothClippy warningsdenied, rustfmt check pass. Fresh-linked Go package race,
+Go-only applicable packages, functional interop-short-race with140masks/all
+bridges/HTTP/hopping/pooling/shortflows/UDPexpiry/capacity/100msRTT pass.
+External NodeX binary case unconfigured. 128-session racecapacity passes171.8MiB.
+Initial broad1000-session race run fails512MiB RSS at747.4MiB; baseline race
+alsofails739.9MiB. Preserve failures; not production RSS or a passing suite.
+Correct functional validation uses interop-functional-race.log/capacity-128-race.
+
+Linuxamd64/Androidarm64API26 rebuilt, not deployed. Logs/raw results.json/
+artifact-hashes.txt in ignored build_assets/assembler-overhead-20261118/.
+Current test binaries /tmp/xhys-assembler-after.test and -after-race.test;
+standalone micro binaries /tmp/xhys-assembler-proto-before.test and -after.test.
+Standalone Cargo target-dir native/libxhysteria/target/proto-tests; rustfmt only
+assembler.rs, not cargo fmt (which changes unrelated upstream vendored files).
+No push, restart or neighboring-repo edits. Follow up on remaining receive
+workspace (~3MiB/Quinn endpoint), latency and application UDP losses; do not
+disable GRO blindly or truncate advertised receive segment capacity.

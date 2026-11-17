@@ -712,6 +712,10 @@ Local changes add:
   this fork's Go client. Standard Quinn behavior remains the default.
 - Defaulted controller hooks for exact lost-packet counts, pacing deadlines,
   and send-window admission. Existing controllers retain their default behavior.
+- Receive-stream defragmentation reuses its metadata backing storage instead of
+  allocating a second heap, and shrinks oversized sparse storage after merging.
+  Closed or reset streams retain at most 128 metadata slots; active chunk limits,
+  receive windows and duplicate/overlap handling remain unchanged.
 
 The native tools enable the omitted-parameter fallback only for Hysteria. The
 engine disables GSO while its custom pacer accounts individual transmissions.

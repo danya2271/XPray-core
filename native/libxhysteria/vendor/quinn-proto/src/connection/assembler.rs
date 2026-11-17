@@ -1,6 +1,6 @@
 use std::{
-    cmp::{Ordering, max},
-    collections::{BinaryHeap, binary_heap::PeekMut},
+    cmp::{max, Ordering},
+    collections::{binary_heap::PeekMut, BinaryHeap},
     mem,
 };
 
@@ -31,10 +31,12 @@ impl Assembler {
 
     /// Reset to the initial state
     pub(super) fn reinit(&mut self) {
-        let old_data = mem::take(&mut self.data);
+        let mut old_data = mem::take(&mut self.data);
         *self = Self::default();
-        self.data = old_data;
-        self.data.clear();
+        if old_data.capacity() <= MAX_CACHED_CHUNKS {
+            old_data.clear();
+            self.data = old_data;
+        }
     }
 
     pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
@@ -105,9 +107,7 @@ impl Assembler {
     fn defragment(&mut self) {
         // Chunks smaller than min_chunk_size are merged regardless of fragmentation
         let min_chunk_size = max(self.buffered.div_ceil(MAX_CHUNKS), MIN_RETAINED_CHUNK_SIZE);
-        let new = BinaryHeap::with_capacity(self.data.len());
-        let old = mem::replace(&mut self.data, new);
-        let mut buffers = old.into_sorted_vec();
+        let mut buffers = mem::take(&mut self.data).into_sorted_vec();
         self.buffered = 0;
         let mut fragmented_buffered = 0;
         let mut offset = 0;
@@ -123,29 +123,41 @@ impl Assembler {
         self.allocated = self.buffered;
         let mut buffer = BytesMut::with_capacity(fragmented_buffered);
         let mut offset = 0;
-        for chunk in buffers.into_iter().rev() {
+        let mut first_retained = buffers.len();
+        for index in (0..buffers.len()).rev() {
+            let chunk = mem::replace(
+                &mut buffers[index],
+                Buffer::new_defragmented(0, Bytes::new()),
+            );
             // bytes might be empty after try_mark_defragment
             if chunk.bytes.is_empty() {
                 continue;
             }
             if chunk.defragmented && chunk.bytes.len() >= min_chunk_size {
-                self.data.push(chunk);
+                first_retained -= 1;
+                buffers[first_retained] = chunk;
                 continue;
             }
             // Overlap is resolved by try_mark_defragment
             if chunk.offset != offset + (buffer.len() as u64) {
                 if !buffer.is_empty() {
-                    self.data
-                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+                    first_retained -= 1;
+                    buffers[first_retained] =
+                        Buffer::new_defragmented(offset, buffer.split().freeze());
                 }
                 offset = chunk.offset;
             }
             buffer.extend_from_slice(&chunk.bytes);
         }
         if !buffer.is_empty() {
-            self.data
-                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+            first_retained -= 1;
+            buffers[first_retained] = Buffer::new_defragmented(offset, buffer.split().freeze());
         }
+        drop(buffers.drain(..first_retained));
+        if buffers.capacity() > 4 * MAX_CACHED_CHUNKS && buffers.len() < buffers.capacity() / 4 {
+            buffers.shrink_to(MAX_CACHED_CHUNKS.max(2 * buffers.len()));
+        }
+        self.data = BinaryHeap::from(buffers);
     }
 
     // Note: If a packet contains many frames from the same stream, the estimated over-allocation
@@ -230,7 +242,11 @@ impl Assembler {
 
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
-        self.data.clear();
+        if self.data.capacity() > MAX_CACHED_CHUNKS {
+            self.data = BinaryHeap::new();
+        } else {
+            self.data.clear();
+        }
         self.buffered = 0;
         self.allocated = 0;
     }
@@ -372,10 +388,194 @@ const MIN_RETAINED_CHUNK_SIZE: usize = 128;
 /// per frame.
 const COMPACT_THRESHOLD: usize = 2 * MAX_CHUNKS;
 
+const MAX_CACHED_CHUNKS: usize = 128;
+
 #[cfg(test)]
 mod test {
     use super::*;
     use assert_matches::assert_matches;
+
+    fn reference_defragment(assembler: &mut Assembler) {
+        let min_chunk_size = max(
+            assembler.buffered.div_ceil(MAX_CHUNKS),
+            MIN_RETAINED_CHUNK_SIZE,
+        );
+        let new = BinaryHeap::with_capacity(assembler.data.len());
+        let old = mem::replace(&mut assembler.data, new);
+        let mut buffers = old.into_sorted_vec();
+        assembler.buffered = 0;
+        let mut fragmented_buffered = 0;
+        let mut offset = 0;
+        for chunk in buffers.iter_mut().rev() {
+            chunk.try_mark_defragment(offset);
+            let size = chunk.bytes.len();
+            offset = chunk.offset + size as u64;
+            assembler.buffered += size;
+            if !chunk.defragmented || size < min_chunk_size {
+                fragmented_buffered += size;
+            }
+        }
+        assembler.allocated = assembler.buffered;
+        let mut buffer = BytesMut::with_capacity(fragmented_buffered);
+        let mut offset = 0;
+        for chunk in buffers.into_iter().rev() {
+            if chunk.bytes.is_empty() {
+                continue;
+            }
+            if chunk.defragmented && chunk.bytes.len() >= min_chunk_size {
+                assembler.data.push(chunk);
+                continue;
+            }
+            if chunk.offset != offset + buffer.len() as u64 {
+                if !buffer.is_empty() {
+                    assembler
+                        .data
+                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+                }
+                offset = chunk.offset;
+            }
+            buffer.extend_from_slice(&chunk.bytes);
+        }
+        if !buffer.is_empty() {
+            assembler
+                .data
+                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+        }
+    }
+
+    #[test]
+    fn defragment_reuses_metadata_and_matches_reference() {
+        for scenario in 0..128u64 {
+            let mut assembler = Assembler::new();
+            let mut reference = Assembler::new();
+            let mut random = scenario + 1;
+            for index in 0..128 {
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let offset = (random >> 32) % 4096;
+                let length = [1, 3, 64, 128, 256, 512][index % 6];
+                let payload = Bytes::from(vec![index as u8; length]);
+                let allocation = if index % 3 == 0 { length } else { length * 8 };
+                for current in [&mut assembler, &mut reference] {
+                    current
+                        .data
+                        .push(Buffer::new(offset, payload.clone(), allocation));
+                    current.buffered += length;
+                    current.allocated += allocation;
+                    current.end = current.end.max(offset + length as u64);
+                }
+            }
+            let pointer = assembler.data.as_slice().as_ptr();
+            let capacity = assembler.data.capacity();
+            assembler.defragment();
+            reference_defragment(&mut reference);
+            assert_eq!(assembler.data.as_slice().as_ptr(), pointer);
+            assert_eq!(assembler.data.capacity(), capacity);
+            assert_eq!(assembler.buffered, reference.buffered);
+            assert_eq!(assembler.allocated, reference.allocated);
+            loop {
+                let actual = assembler.read(17, false);
+                let expected = reference.read(17, false);
+                assert_eq!(actual, expected, "scenario {scenario}");
+                if actual.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reinit_keeps_small_metadata_cache_but_releases_large_cache() {
+        for capacity in [8, 128, 1024, 4096] {
+            let mut assembler = Assembler::new();
+            assembler.data.reserve_exact(capacity);
+            assembler.insert(0, Bytes::from_static(b"held"), 4).unwrap();
+            let pointer = assembler.data.as_slice().as_ptr();
+            assembler.reinit();
+            assert!(assembler.data.is_empty());
+            assert_eq!(
+                (
+                    assembler.buffered,
+                    assembler.allocated,
+                    assembler.bytes_read,
+                    assembler.end
+                ),
+                (0, 0, 0, 0)
+            );
+            assert!(assembler.state.is_ordered());
+            if capacity <= 128 {
+                assert_eq!(assembler.data.capacity(), capacity);
+                assert_eq!(assembler.data.as_slice().as_ptr(), pointer);
+            } else {
+                assert_eq!(assembler.data.capacity(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_large_metadata_cache_preserves_stream_offsets() {
+        let mut assembler = Assembler::new();
+        assembler.insert(0, Bytes::from_static(b"read"), 4).unwrap();
+        assert_eq!(assembler.read(4, true).unwrap().bytes, b"read".as_slice());
+        assembler.data.reserve_exact(4096);
+        assembler
+            .insert(10, Bytes::from_static(b"held"), 4)
+            .unwrap();
+        assembler.clear();
+        assert_eq!((assembler.bytes_read, assembler.end), (4, 14));
+        assert_eq!((assembler.buffered, assembler.allocated), (0, 0));
+        assert!(assembler.data.is_empty());
+        assert_eq!(assembler.data.capacity(), 0);
+    }
+
+    #[test]
+    fn defragment_reclaims_sparse_oversized_metadata_storage() {
+        let mut assembler = Assembler::new();
+        assembler.data.reserve_exact(4096);
+        for index in 0..1024u64 {
+            assembler
+                .data
+                .push(Buffer::new(index * 64, Bytes::from_static(&[0x71; 64]), 64));
+            assembler.buffered += 64;
+            assembler.allocated += 64;
+            assembler.end = index * 64 + 64;
+        }
+        assembler.defragment();
+        assert_eq!(assembler.data.len(), 1);
+        assert_eq!(assembler.data.capacity(), MAX_CACHED_CHUNKS);
+        assert_eq!(assembler.buffered, 65536);
+        assert_eq!(assembler.allocated, 65536);
+        assert_eq!(
+            assembler.read(65536, true).unwrap().bytes.as_ref(),
+            &[0x71; 65536][..]
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_defragment_metadata() {
+        let mut elapsed = std::time::Duration::ZERO;
+        for _ in 0..4096 {
+            let mut assembler = Assembler::new();
+            assembler.data.reserve_exact(1024);
+            for index in 0..1024u64 {
+                assembler
+                    .data
+                    .push(Buffer::new(index * 256, Bytes::from_static(&[0; 64]), 64));
+                assembler.buffered += 64;
+                assembler.allocated += 64;
+                assembler.end = index * 256 + 64;
+            }
+            let started = std::time::Instant::now();
+            assembler.defragment();
+            elapsed += started.elapsed();
+            std::hint::black_box(assembler);
+        }
+        println!(
+            "defragment_ns_per_run={} node_bytes={}",
+            elapsed.as_nanos() / 4096,
+            std::mem::size_of::<Buffer>()
+        );
+    }
 
     #[test]
     fn assemble_ordered() {
