@@ -84,3 +84,76 @@ func TestNativeHalfClosePreservesRequestAndCompleteResponse(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeLeasedBuffersRemainReadableAfterEngineJoin(t *testing.T) {
+	t.Setenv("XRAY_HYSTERIA_BRIDGE", "shared")
+	certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
+	ca := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate}))
+	key := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: certificate.PrivateKey}))
+	start := func(config Config, accept func(*Conn)) *Engine {
+		t.Helper()
+		udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer udp.Close()
+		file, err := udp.File()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		engine, err := Start(context.Background(), config, file, udp.LocalAddr(), nil, accept)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { engine.Close() })
+		return engine
+	}
+	payload := bytes.Repeat([]byte("leased-buffer"), 17)
+	server := start(Config{Server: true, Users: []string{"test-password"}, CertificatePEM: ca, KeyPEM: key}, func(connection *Conn) {
+		defer connection.Close()
+		connection.Write(payload)
+		connection.CloseWrite()
+	})
+	client := start(Config{Peer: server.local.String(), ServerName: "localhost", Auth: "test-password", CAPEM: ca}, nil)
+	connection, err := client.Open(context.Background(), xnet.TCPDestination(xnet.LocalHostIP, 80))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var held buf.MultiBuffer
+	defer func() { buf.ReleaseMulti(held) }()
+	var received []byte
+	for len(received) < len(payload) {
+		parts, err := connection.ReadMultiBuffer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, parts...)
+		for _, part := range parts {
+			received = append(received, part.Bytes()...)
+		}
+	}
+	bridge := client.bridge.(*sharedBridge)
+	if bridge.owner.refs.Load() <= 1 {
+		t.Fatal("native receive did not retain a leased arena")
+	}
+	client.Close()
+	server.Close()
+	if bridge.owner.refs.Load() < 1 || client.handle != nil {
+		t.Fatal("engine join freed outstanding leases")
+	}
+	var after []byte
+	for _, part := range held {
+		after = append(after, part.Bytes()...)
+	}
+	if !bytes.Equal(after, payload) {
+		t.Fatal("payload changed after native engine join")
+	}
+	buf.ReleaseMulti(held)
+	held = nil
+	if bridge.owner.refs.Load() != 0 {
+		t.Fatal("arena ownership leaked after buffer release")
+	}
+}

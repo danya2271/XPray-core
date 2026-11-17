@@ -1,7 +1,7 @@
 //! Bounded frame rings with serialized publishers. Only setup/teardown use C.
 //!
 //! The Go peer uses aligned 32-bit atomics over this little-endian storage ABI.
-//! Payload access is exclusive between head publication and tail release.
+//! Payload leases outlive descriptor consumption; release returns independent slots.
 
 use crate::h3_transport::Result;
 use bytes::Bytes;
@@ -18,12 +18,16 @@ use std::{
 use tokio::{io::unix::AsyncFd, sync::Notify};
 
 pub const MAGIC: u64 = 0x5848595353484d32;
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 pub const CAPACITY: u32 = 8;
 pub const MAX_FRAME: usize = 65536 + 4096;
 pub const STRIDE: usize = (16 + MAX_FRAME + 63) & !63;
 pub const HEADER: usize = 320;
-pub const ARENA_BYTES: usize = HEADER + 2 * CAPACITY as usize * STRIDE;
+pub const PAYLOAD_SLOTS: usize = 16;
+pub const PAYLOAD_SIZE: usize = 16384;
+pub const RINGS_BYTES: usize = HEADER + 2 * CAPACITY as usize * STRIDE;
+pub const ARENA_BYTES: usize = RINGS_BYTES + 2 * PAYLOAD_SLOTS * PAYLOAD_SIZE;
+const PAYLOAD_FLAG: u32 = 1 << 8;
 
 #[repr(C, align(64))]
 struct Line {
@@ -45,7 +49,8 @@ struct Header {
     space_pending: AtomicU32,
     event_waiting: AtomicU32,
     command_waiting: AtomicU32,
-    pad: [u8; 8],
+    command_free: AtomicU32,
+    event_free: AtomicU32,
     command_head: Line,
     command_tail: Line,
     event_head: Line,
@@ -60,6 +65,7 @@ pub struct View {
     pub notify_fd: i32,
     pub wake_fd: i32,
     pub space_fd: i32,
+    pub owner: *mut std::ffi::c_void,
 }
 
 pub struct Bridge {
@@ -72,7 +78,7 @@ pub struct Bridge {
 }
 
 // The allocation has interior mutability. Each slot has exactly one owner
-// established by the ring indices; no Rust reference spans a Go-owned payload.
+// established by ring publication and payload leases; peers do not mutate held leases.
 unsafe impl Send for Bridge {}
 unsafe impl Sync for Bridge {}
 
@@ -117,7 +123,8 @@ impl Bridge {
                 space_pending: AtomicU32::new(0),
                 event_waiting: AtomicU32::new(0),
                 command_waiting: AtomicU32::new(0),
-                pad: [0; 8],
+                command_free: AtomicU32::new((1 << PAYLOAD_SLOTS) - 1),
+                event_free: AtomicU32::new((1 << PAYLOAD_SLOTS) - 1),
                 command_head: Line {
                     value: AtomicU32::new(0),
                     pad: [0; 60],
@@ -150,7 +157,7 @@ impl Bridge {
         unsafe { &*self.data.cast::<Header>().as_ptr() }
     }
 
-    pub fn view(&self) -> io::Result<View> {
+    pub fn view(self: &Arc<Self>) -> io::Result<View> {
         let duplicate = |fd: i32| -> io::Result<OwnedFd> {
             let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
             if fd < 0 {
@@ -168,6 +175,7 @@ impl Bridge {
             notify_fd: notify.into_raw_fd(),
             wake_fd: wake.into_raw_fd(),
             space_fd: space.into_raw_fd(),
+            owner: Box::into_raw(Box::new(self.clone())).cast(),
         })
     }
 
@@ -270,7 +278,38 @@ impl Bridge {
         }
     }
 
-    pub fn pop(&self, commands: bool) -> Result<Option<(u8, u64, Bytes)>> {
+    fn free_slots(&self, commands: bool) -> &AtomicU32 {
+        if commands {
+            &self.header().command_free
+        } else {
+            &self.header().event_free
+        }
+    }
+
+    fn payload_pointer(&self, commands: bool, slot: usize) -> *mut u8 {
+        let offset = RINGS_BYTES + (usize::from(!commands) * PAYLOAD_SLOTS + slot) * PAYLOAD_SIZE;
+        unsafe { self.data.as_ptr().add(offset) }
+    }
+
+    fn acquire_payload(&self, commands: bool) -> Option<usize> {
+        let free = self.free_slots(commands);
+        let mut available = free.load(Ordering::Acquire);
+        while available != 0 {
+            let slot = available.trailing_zeros() as usize;
+            match free.compare_exchange_weak(
+                available,
+                available & !(1 << slot),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(slot),
+                Err(current) => available = current,
+            }
+        }
+        None
+    }
+
+    pub fn pop(self: &Arc<Self>, commands: bool) -> Result<Option<(u8, u64, Bytes)>> {
         let header = self.header();
         let (head, tail) = if commands {
             (&header.command_head.value, &header.command_tail.value)
@@ -289,10 +328,29 @@ impl Bridge {
         let kind = unsafe { slot.cast::<u32>().read() };
         let len = unsafe { slot.add(4).cast::<u32>().read() } as usize;
         let id = unsafe { slot.add(8).cast::<u64>().read() };
-        if kind > u8::MAX as u32 || len > MAX_FRAME {
+        let leased = kind & PAYLOAD_FLAG != 0;
+        let payload_slot = (kind >> 16) as usize;
+        if kind & 0xfe00 != 0
+            || len > MAX_FRAME
+            || (leased
+                && (payload_slot >= PAYLOAD_SLOTS
+                    || len > PAYLOAD_SIZE
+                    || self.free_slots(commands).load(Ordering::Acquire) & (1 << payload_slot)
+                        != 0))
+            || (!leased && kind > u8::MAX as u32)
+        {
             return Err("invalid shared frame descriptor".into());
         }
-        let data = Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(slot.add(16), len) });
+        let data = if leased {
+            Bytes::from_owner(Payload {
+                bridge: self.clone(),
+                commands,
+                slot: payload_slot,
+                len,
+            })
+        } else {
+            Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(slot.add(16), len) })
+        };
         tail.store(index.wrapping_add(1), Ordering::SeqCst);
         Ok(Some((kind as u8, id, data)))
     }
@@ -331,18 +389,67 @@ impl Bridge {
             }
         }
         let slot = self.slot(commands, index);
+        let payload_slot = if kind == 3 || kind == 4 {
+            if len != 0 && len <= PAYLOAD_SIZE {
+                self.acquire_payload(commands)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let encoded_kind =
+            u32::from(kind) | payload_slot.map_or(0, |slot| PAYLOAD_FLAG | ((slot as u32) << 16));
+        let payload = if let Some(payload_slot) = payload_slot {
+            self.payload_pointer(commands, payload_slot)
+        } else {
+            unsafe { slot.add(16) }
+        };
         unsafe {
-            slot.cast::<u32>().write(kind as u32);
+            slot.cast::<u32>().write(encoded_kind);
             slot.add(4).cast::<u32>().write(len as u32);
             slot.add(8).cast::<u64>().write(id);
-            let mut offset = 16;
+            let mut offset = 0;
             for part in parts {
-                std::ptr::copy_nonoverlapping(part.as_ptr(), slot.add(offset), part.len());
+                std::ptr::copy_nonoverlapping(part.as_ptr(), payload.add(offset), part.len());
                 offset += part.len();
             }
         }
         head.store(index.wrapping_add(1), Ordering::Release);
         Ok(true)
+    }
+}
+
+struct Payload {
+    bridge: Arc<Bridge>,
+    commands: bool,
+    slot: usize,
+    len: usize,
+}
+
+impl AsRef<[u8]> for Payload {
+    fn as_ref(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.bridge.payload_pointer(self.commands, self.slot),
+                self.len,
+            )
+        }
+    }
+}
+
+impl Drop for Payload {
+    fn drop(&mut self) {
+        self.bridge
+            .free_slots(self.commands)
+            .fetch_or(1 << self.slot, Ordering::Release);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_shared_release(owner: *mut std::ffi::c_void) {
+    if !owner.is_null() {
+        drop(unsafe { Box::from_raw(owner.cast::<Arc<Bridge>>()) });
     }
 }
 
@@ -360,6 +467,132 @@ impl Drop for Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_free_out_of_range_and_reserved_payload_leases() {
+        for kind in [
+            3 | PAYLOAD_FLAG,
+            3 | PAYLOAD_FLAG | ((PAYLOAD_SLOTS as u32) << 16),
+            3 | (1 << 9),
+        ] {
+            let bridge = Bridge::new().unwrap();
+            let descriptor = bridge.slot(true, 0);
+            unsafe {
+                descriptor.cast::<u32>().write(kind);
+                descriptor.add(4).cast::<u32>().write(1);
+            }
+            bridge
+                .header()
+                .command_head
+                .value
+                .store(1, Ordering::Release);
+            assert!(bridge.pop(true).is_err());
+            assert_eq!(
+                bridge.header().command_tail.value.load(Ordering::Acquire),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn payload_leases_support_concurrent_release_and_publication() {
+        let bridge = Bridge::new().unwrap();
+        let producers: Vec<_> = (0u64..4)
+            .map(|producer| {
+                let bridge = bridge.clone();
+                std::thread::spawn(move || {
+                    for sequence in 0..1024 {
+                        let id = producer * 1024 + sequence;
+                        let payload = id.to_le_bytes();
+                        while !bridge.push(false, 3, id, &payload).unwrap() {
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Bytes)>(PAYLOAD_SLOTS);
+        let consumer = std::thread::spawn(move || {
+            for (id, payload) in receiver {
+                assert_eq!(payload.as_ref(), id.to_le_bytes());
+            }
+        });
+        for _ in 0..4096 {
+            loop {
+                if let Some((kind, id, payload)) = bridge.pop(false).unwrap() {
+                    assert_eq!(kind, 3);
+                    sender.send((id, payload)).unwrap();
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        drop(sender);
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        consumer.join().unwrap();
+        assert_eq!(
+            bridge.header().event_free.load(Ordering::Acquire),
+            (1 << PAYLOAD_SLOTS) - 1
+        );
+    }
+
+    #[test]
+    fn leased_payload_survives_descriptor_reuse_and_releases_after_last_clone() {
+        let bridge = Bridge::new().unwrap();
+        assert!(bridge.push(true, 3, 1, b"owned payload").unwrap());
+        let (_, _, payload) = bridge.pop(true).unwrap().unwrap();
+        assert_eq!(payload.as_ptr(), bridge.payload_pointer(true, 0));
+        let clone = payload.clone();
+        for id in 2..40 {
+            assert!(bridge.push(true, 3, id, b"replacement").unwrap());
+            drop(bridge.pop(true).unwrap().unwrap());
+        }
+        assert_eq!(payload.as_ref(), b"owned payload");
+        drop(payload);
+        assert_eq!(bridge.header().command_free.load(Ordering::Acquire) & 1, 0);
+        drop(clone);
+        assert_ne!(bridge.header().command_free.load(Ordering::Acquire) & 1, 0);
+    }
+
+    #[test]
+    fn exhausted_payload_pool_falls_back_without_blocking_other_frames() {
+        let bridge = Bridge::new().unwrap();
+        let mut held = Vec::new();
+        for id in 0..PAYLOAD_SLOTS {
+            assert!(bridge.push(true, 3, id as u64, b"held").unwrap());
+            held.push(bridge.pop(true).unwrap().unwrap().2);
+        }
+        assert_eq!(bridge.header().command_free.load(Ordering::Acquire), 0);
+        assert!(bridge.push(true, 3, 99, b"fallback").unwrap());
+        let (_, _, payload) = bridge.pop(true).unwrap().unwrap();
+        assert_eq!(payload.as_ref(), b"fallback");
+        let address = payload.as_ptr() as usize;
+        let start = bridge.data.as_ptr() as usize;
+        assert!(address < start || address >= start + ARENA_BYTES);
+        assert!(bridge.push(true, 5, 99, b"").unwrap());
+        assert_eq!(bridge.pop(true).unwrap().unwrap().0, 5);
+        drop(held);
+        assert_eq!(
+            bridge.header().command_free.load(Ordering::Acquire),
+            (1 << PAYLOAD_SLOTS) - 1
+        );
+    }
+
+    #[test]
+    fn payload_owner_keeps_arena_alive_after_bridge_shutdown() {
+        let bridge = Bridge::new().unwrap();
+        let weak = Arc::downgrade(&bridge);
+        assert!(bridge.push(true, 3, 1, b"survives close").unwrap());
+        let payload = bridge.pop(true).unwrap().unwrap().2;
+        bridge.close();
+        drop(bridge);
+        assert_eq!(payload.as_ref(), b"survives close");
+        assert!(weak.upgrade().is_some());
+        drop(payload);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn command_space_notification_requires_a_waiting_writer() {

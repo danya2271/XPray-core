@@ -619,12 +619,15 @@ impl Bus {
         }
         Ok(total)
     }
-    async fn udp_payload(&self, frame: Frame) -> Result<()> {
+    async fn udp_payload(&self, id: u64, address: &[u8], payload: &[u8]) -> Result<()> {
+        if address.is_empty() || address.len() > protocol::MAX_ADDRESS {
+            return Err("invalid bridge address".into());
+        }
         let credit = self
             .flows
             .lock()
             .unwrap()
-            .get(&frame.id)
+            .get(&id)
             .map(|flow| flow.receive_credit.clone());
         let Some(credit) = credit else { return Ok(()) };
         // An unread UDP session drops payloads instead of blocking other sessions.
@@ -633,7 +636,15 @@ impl Bus {
             return Ok(());
         };
         permit.forget();
-        self.send(frame).await
+        if let Some(shared) = &self.shared {
+            let length = (address.len() as u16).to_be_bytes();
+            shared
+                .send_vectored(DATAGRAM, id, &[&length, address, payload])
+                .await
+        } else {
+            self.send(Frame::new(DATAGRAM, id, address_data(address, payload)?))
+                .await
+        }
     }
     async fn writable(&self, id: u64, pending: &mut u8) -> Result<()> {
         *pending += 1;
@@ -1492,8 +1503,7 @@ async fn client_udp(
         };
         let id = sessions.lock().await.get(&session).copied();
         if let Some(id) = id {
-            bus.udp_payload(Frame::new(DATAGRAM, id, address_data(address, payload)?))
-                .await?;
+            bus.udp_payload(id, address, payload).await?;
         }
     }
 }
@@ -1581,7 +1591,7 @@ async fn server_udp(
                     sessions.insert(session_id, (id, session_activity));
                     id
                 };
-                bus.udp_payload(Frame::new(DATAGRAM, id, address_data(address, payload)?)).await?;
+                bus.udp_payload(id, address, payload).await?;
             }
             _ = cleanup.tick(), if defrag.pending() != 0 => { defrag.expire(start.elapsed().as_nanos() as u64); }
             Some(done) = tasks.join_next(), if !tasks.is_empty() => {
@@ -2147,11 +2157,12 @@ pub unsafe extern "C" fn xhys_engine_start(
 }
 
 /// Starts the active shared-memory bridge. Three duplicated notification fds are
-/// transferred to Go; arena storage remains owned by the Engine until join.
+/// transferred to Go together with an arena owner that can outlive engine join.
 ///
 /// # Safety
 /// Input pointers must be valid for the call. Go must cease every arena access
-/// before calling join, including accesses from pending read/write operations.
+/// before calling join, except accesses protected by the returned arena owner.
+/// Release that owner exactly once after the last outstanding payload lease.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xhys_engine_start_shared(
     config: *const u8,
@@ -2325,26 +2336,26 @@ mod tests {
         let (_, readable) = bus.register(2, 1).await.unwrap();
         let window = blocked.available_permits();
         blocked.acquire_many(window as u32).await.unwrap().forget();
-        bus.udp_payload(Frame::new(DATAGRAM, 1, b"dropped".as_slice()))
-            .await
-            .unwrap();
+        bus.udp_payload(1, b"target", b"dropped").await.unwrap();
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
         assert!(receiver.try_recv().is_err());
-        bus.udp_payload(Frame::new(DATAGRAM, 2, b"delivered".as_slice()))
-            .await
-            .unwrap();
+        bus.udp_payload(2, b"target", b"delivered").await.unwrap();
         let frame = receiver.try_recv().unwrap();
         assert_eq!(frame.id, 2);
-        assert_eq!(&frame.data[..], b"delivered");
+        assert_eq!(
+            parse_address(&frame.data).unwrap(),
+            (b"target".as_slice(), b"delivered".as_slice())
+        );
         assert_eq!(readable.available_permits(), window - 1);
         assert_eq!(blocked.available_permits(), 0);
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
         bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])))
             .await;
-        bus.udp_payload(Frame::new(DATAGRAM, 1, b"resumed".as_slice()))
-            .await
-            .unwrap();
-        assert_eq!(&receiver.try_recv().unwrap().data[..], b"resumed");
+        bus.udp_payload(1, b"target", b"resumed").await.unwrap();
+        assert_eq!(
+            parse_address(&receiver.try_recv().unwrap().data).unwrap().1,
+            b"resumed"
+        );
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
     }
 
@@ -2594,6 +2605,9 @@ mod tests {
         use std::os::fd::OwnedFd;
         let bridge = shared::Bridge::new().unwrap();
         let view = bridge.view().unwrap();
+        unsafe {
+            shared::xhys_shared_release(view.owner);
+        }
         let (_notify, wake, _space) = unsafe {
             (
                 OwnedFd::from_raw_fd(view.notify_fd),

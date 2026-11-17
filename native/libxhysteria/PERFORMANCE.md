@@ -1054,3 +1054,89 @@ ignored `build_assets/direct-masks-20261118/`.
 The final race rerun also passes traffic/concurrency, Brutal, HTTP string/file/
 proxy/lifecycle and pooling tests (about 107 seconds). Go-only transport tests
 pass. Linux and Android arm64 masking binaries are rebuilt, not deployed.
+
+## Payload leases and publication contention — November 18, 2026
+
+Shared storage now separates descriptor recycling from payload recycling.
+Sixteen 16 KiB slots per direction remove the Rust command-consumption and Go
+event-consumption copies for DATA/DATAGRAM frames. Go borrowed writes copy into
+shared storage synchronously, taking a snapshot only when queued. TCP buffer
+vectors and UDP address/payload slices publish directly without an intermediate
+coalescing buffer. Go release callbacks are created once per payload slot rather
+than per frame; ordinary `buf.Buffer` objects retain their previous struct size.
+The final publication copy is still present. Pool exhaustion and oversized or
+control frames retain the safe bounded copy fallback. No busy spinning is added.
+
+The independent pools add **512 KiB of arena capacity per shared engine**:
+1,115,456 → 1,639,744 bytes. Leases can retain an arena after engine join until
+the forwarding buffers are released. This is an explicit trade-off, not a
+whole-process memory reduction claim. Storage version is 6 and engine ABI is 5;
+rebuild Go and Rust together. `Stats().ArenaBytes` counts active engine arenas,
+not closed arenas still retained by outstanding leases.
+
+Fresh paired baseline/after measurements use the Salamander + WireGuard packet
+harness, release Rust, `GOMAXPROCS=1 taskset -c 14`, pool size one, three
+one-second repetitions. Echo counts both directions. CPU includes Rust threads;
+Go allocation metrics exclude Rust, kernel memory and arena capacity. Medians
+are exploratory samples, not confidence intervals:
+
+| Path | Transfer MB/s | Process CPU ms/op | Go bytes/op | Go allocations/op |
+|---|---:|---:|---:|---:|
+| Go before | 83.96 | 1.428 | 27,270 | 724 |
+| Native before | 102.81 | 1.085 | 4,314 | 119 |
+| Go after | 82.48 | 1.452 | 27,269 | 724 |
+| Native after | 100.86 | 1.067 | 3,779 | 96 |
+
+Native Go allocation bytes decrease about **12.4%** and allocation count about
+**19.3%** versus this stage's native baseline. Native throughput is effectively
+unchanged within run variation, not a demonstrated speedup. It is about 1.22×
+the paired Go sample, not 2.5× Go. This table must not be conflated with the
+earlier direct-mask versus adapter speedup.
+
+| Path | TCP p50 µs | TCP p99 µs | UDP p50 µs | UDP p99 µs |
+|---|---:|---:|---:|---:|
+| Go before | 89.12 | 168.4 | 89.44 | 180.8 |
+| Native before | 175.6 | 272.9 | 159.6 | 251.0 |
+| Go after | 90.89 | 170.2 | 93.66 | 184.7 |
+| Native after | 175.1 | 268.0 | 162.5 | 259.7 |
+
+These runs do **not** establish an idle-latency improvement: native TCP is
+similar, UDP slightly higher, and both remain slower than Go. Fewer copies alone
+do not remove cross-runtime scheduling/notification latency.
+
+The four-CPU parallel check uses `GOMAXPROCS=4`, CPU affinity 12–15, native server,
+shared bridge, pool size two, three two-second repetitions. Throughput medians
+are 282.37 → 283.99 MB/s; Go bytes/op are 4,924 → 4,282 and allocations/op are
+130 → 107. Moving eventfd notification outside `Engine.publishMu` reduces the
+sampled `prepareFrame` cumulative mutex delay **425.43 → 86.75 ms (~80%)**.
+Total sampled Go mutex delay falls 1,006 → 578.87 ms. These are aggregate
+contention samples across the benchmark, not request latency or Rust lock time.
+Remaining Go samples mostly involve runtime scheduling and forwarding.
+
+A separate `perf cycles:u` run collects about 3,000 samples with no lost samples.
+The native futex contended-lock symbol accounts for about 0.40% of sampled CPU;
+observed callers include Quinn `SendStream::write_chunk` and
+`MaskedSocket::try_send`, rather than proving a flow-map bottleneck. The AES-GCM
+assembly symbol accounts for about 10.44%, and Go `runtime.memmove` 2.85%.
+CPU sampling does not measure sleeping lock wait time; kernel futex tracepoints
+are unavailable with the current tracing permissions. No speculative map
+sharding or QUIC synchronization changes are made on this evidence.
+
+Validation covers 76 Rust unit tests, Clippy with warnings denied, Go race tests,
+buffer release exactly once, partial reads, descriptor reuse, concurrent lease
+release/publication, pool exhaustion and malformed leases, queued write
+snapshots, TCP vector splitting, UDP vectors, and real native-engine join with
+outstanding readable buffers. Raw logs and profiles are saved in ignored
+`build_assets/payload-leases-20261118/`.
+
+The final mixed interoperability/race rerun passes native/Go masks, local and
+remote hopping, concurrent transfers, Brutal, HTTP masquerade lifecycle, pools,
+short-flow capacity and UDP expiry. Go-only transport/buffer tests pass. Linux
+and Android arm64 binaries are rebuilt, not deployed.
+
+The subsequent saturated loss run uses unrestricted CPU placement and receives
+2000/2000, 1999/2000, 1995/2000, 2000/2000 in direct/cascade × 256/4096-byte
+cases. Application loss is **0–0.25%**, sampled kernel UDP drops are zero.
+This test only fails on complete application loss; PASS does not mean zero loss.
+The missed replies are not attributed yet. This is not a matched Go comparison
+or directly comparable with the previous CPU-14-pinned zero-loss run.

@@ -11,8 +11,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/bits"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,12 +26,16 @@ import (
 )
 
 const (
-	sharedMagic    = 0x5848595353484d32
-	sharedVersion  = 5
-	sharedHeader   = 320
-	sharedCapacity = 8
-	sharedStride   = (16 + maxFrame + 63) &^ 63
-	sharedBytes    = sharedHeader + 2*sharedCapacity*sharedStride
+	sharedMagic        = 0x5848595353484d32
+	sharedVersion      = 6
+	sharedHeader       = 320
+	sharedCapacity     = 8
+	sharedStride       = (16 + maxFrame + 63) &^ 63
+	sharedRingBytes    = sharedHeader + 2*sharedCapacity*sharedStride
+	sharedPayloadSlots = 16
+	sharedPayloadSize  = 16384
+	sharedPayloadFlag  = 1 << 8
+	sharedBytes        = sharedRingBytes + 2*sharedPayloadSlots*sharedPayloadSize
 )
 
 var eventfdSignal = [8]byte{1}
@@ -62,13 +68,61 @@ func (b *socketBridge) writeBatch(batch []frame) error {
 }
 
 type sharedBridge struct {
-	data         []byte
-	notify, wake *os.File
-	space        *os.File
-	once         sync.Once
-	wakeRaw      syscall.RawConn
-	notifyReader *eventReader
-	spaceReader  *eventReader
+	data           []byte
+	notify, wake   *os.File
+	space          *os.File
+	once           sync.Once
+	wakeRaw        syscall.RawConn
+	notifyReader   *eventReader
+	spaceReader    *eventReader
+	owner          *sharedOwner
+	ownerOnce      sync.Once
+	payloadRelease [sharedPayloadSlots]func()
+}
+
+type sharedOwner struct {
+	data   []byte
+	handle unsafe.Pointer
+	refs   atomic.Int64
+	once   sync.Once
+}
+
+func (owner *sharedOwner) free() {
+	owner.once.Do(func() {
+		if owner.handle != nil {
+			C.xhys_shared_release(owner.handle)
+		}
+	})
+}
+
+func (owner *sharedOwner) release() {
+	if owner.refs.Add(-1) == 0 && owner.handle != nil {
+		owner.free()
+		runtime.SetFinalizer(owner, nil)
+	}
+}
+
+func (b *sharedBridge) releaseOwner() {
+	b.ownerOnce.Do(func() {
+		if b.owner != nil {
+			b.owner.release()
+		}
+	})
+}
+
+func (b *sharedBridge) initializeOwner(handle unsafe.Pointer) {
+	owner := &sharedOwner{data: b.data, handle: handle}
+	owner.refs.Store(1)
+	if handle != nil {
+		runtime.SetFinalizer(owner, (*sharedOwner).free)
+	}
+	b.owner = owner
+	for slot := range sharedPayloadSlots {
+		b.payloadRelease[slot] = func() {
+			atomic.OrUint32((*uint32)(unsafe.Pointer(&owner.data[60])), 1<<slot)
+			owner.release()
+		}
+	}
 }
 
 type eventReader struct {
@@ -119,16 +173,24 @@ func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
 	notify := os.NewFile(uintptr(view.notify_fd), "xhysteria-eventfd")
 	wake := os.NewFile(uintptr(view.wake_fd), "xhysteria-wakefd")
 	space := os.NewFile(uintptr(view.space_fd), "xhysteria-spacefd")
-	if view.data == nil || uint64(view.len) != sharedBytes || uintptr(unsafe.Pointer(view.data))%64 != 0 {
+	if view.data == nil || view.owner == nil || uint64(view.len) != sharedBytes || uintptr(unsafe.Pointer(view.data))%64 != 0 {
 		notify.Close()
 		wake.Close()
 		space.Close()
+		C.xhys_shared_release(view.owner)
 		return nil, errors.New("invalid native shared arena view")
 	}
 	b := &sharedBridge{
 		data:   unsafe.Slice((*byte)(unsafe.Pointer(view.data)), sharedBytes),
 		notify: notify, wake: wake, space: space,
 	}
+	b.initializeOwner(view.owner)
+	success := false
+	defer func() {
+		if !success {
+			b.releaseOwner()
+		}
+	}()
 	var err error
 	b.wakeRaw, err = wake.SyscallConn()
 	if err != nil {
@@ -160,6 +222,7 @@ func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
 		b.close()
 		return nil, err
 	}
+	success = true
 	return b, nil
 }
 
@@ -244,11 +307,22 @@ func (b *sharedBridge) read() (frame, error) {
 			offset := sharedHeader + sharedCapacity*sharedStride + int(tail&(sharedCapacity-1))*sharedStride
 			d := b.data[offset:]
 			kind, n := binary.LittleEndian.Uint32(d), binary.LittleEndian.Uint32(d[4:])
-			if kind > 255 || n > maxFrame {
+			leased := kind&sharedPayloadFlag != 0
+			slot := int(kind >> 16)
+			if kind&0xfe00 != 0 || n > maxFrame || leased && (slot >= sharedPayloadSlots || n > sharedPayloadSize || atomic.LoadUint32(b.word(60))&(1<<slot) != 0) || !leased && kind > 255 {
 				return frame{}, errors.New("invalid native shared event")
 			}
 			f := frame{kind: byte(kind), id: binary.LittleEndian.Uint64(d[8:])}
-			if f.kind == writableFrame && n == 1 && d[16] < byte(len(creditCounts)) {
+			if leased {
+				owner := b.owner
+				if owner == nil {
+					return frame{}, errors.New("shared payload has no arena owner")
+				}
+				owner.refs.Add(1)
+				offset := sharedRingBytes + (sharedPayloadSlots+slot)*sharedPayloadSize
+				f.data = owner.data[offset : offset+int(n) : offset+int(n)]
+				f.storage = buf.FromBytesWithRelease(f.data, b.payloadRelease[slot])
+			} else if f.kind == writableFrame && n == 1 && d[16] < byte(len(creditCounts)) {
 				f.data = creditCounts[d[16] : int(d[16])+1]
 			} else if n != 0 {
 				f.storage = buf.NewWithSize(int32(n))
@@ -274,6 +348,9 @@ func (b *sharedBridge) writeBatch(batch []frame) error {
 	for len(batch) != 0 {
 		n, err := b.tryWriteBatch(batch)
 		if err != nil {
+			return err
+		}
+		if err := b.notifyRust(); err != nil {
 			return err
 		}
 		batch = batch[n:]
@@ -302,20 +379,44 @@ func (b *sharedBridge) tryWriteBatch(batch []frame) (int, error) {
 		count = head - atomic.LoadUint32(b.word(128))
 	}
 	n := min(len(batch), sharedCapacity-int(count))
-	for i := range n {
-		f := batch[i]
-		if len(f.data) > maxFrame {
+	for index := range n {
+		if batch[index].size() > maxFrame {
 			return 0, errors.New("oversized native command")
 		}
+	}
+	for i := range n {
+		f := batch[i]
+		size := f.size()
 		offset := sharedHeader + int((head+uint32(i))&(sharedCapacity-1))*sharedStride
 		d := b.data[offset:]
-		binary.LittleEndian.PutUint32(d, uint32(f.kind))
-		binary.LittleEndian.PutUint32(d[4:], uint32(len(f.data)))
+		kind := uint32(f.kind)
+		payload := d[16:]
+		if (f.kind == dataFrame || f.kind == datagramFrame) && size != 0 && size <= sharedPayloadSize {
+			free := b.word(56)
+			for available := atomic.LoadUint32(free); available != 0; available = atomic.LoadUint32(free) {
+				slot := bits.TrailingZeros32(available)
+				if atomic.CompareAndSwapUint32(free, available, available&^(1<<slot)) {
+					kind |= sharedPayloadFlag | uint32(slot)<<16
+					offset := sharedRingBytes + slot*sharedPayloadSize
+					payload = b.data[offset : offset+sharedPayloadSize]
+					break
+				}
+			}
+		}
+		binary.LittleEndian.PutUint32(d, kind)
+		binary.LittleEndian.PutUint32(d[4:], uint32(size))
 		binary.LittleEndian.PutUint64(d[8:], f.id)
-		copy(d[16:], f.data)
+		if f.parts != nil {
+			offset := 0
+			for _, part := range f.parts {
+				offset += copy(payload[offset:], part.Bytes())
+			}
+		} else {
+			copy(payload, f.data)
+		}
 	}
 	if n != 0 {
 		atomic.StoreUint32(b.word(64), head+uint32(n))
 	}
-	return n, b.notifyRust()
+	return n, nil
 }

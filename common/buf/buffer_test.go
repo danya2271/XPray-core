@@ -26,6 +26,35 @@ func TestBufferClear(t *testing.T) {
 	}
 }
 
+func TestOwnedBufferReleaseAndPartialRead(t *testing.T) {
+	data := []byte("owned payload")
+	released := 0
+	buffer := FromBytesWithRelease(data, func() { released++ })
+	if &buffer.Bytes()[0] != &data[0] {
+		t.Fatal("owned buffer copied the payload")
+	}
+	buffer.Advance(6)
+	if string(buffer.Bytes()) != "payload" {
+		t.Fatal("owned buffer lost its unread suffix")
+	}
+	buffer.Release()
+	buffer.Release()
+	if released != 1 || !buffer.IsEmpty() {
+		t.Fatalf("release count=%d length=%d", released, buffer.Len())
+	}
+	borrowed := FromBytes(data)
+	borrowed.Release()
+	if string(borrowed.Bytes()) != string(data) {
+		t.Fatal("borrowed buffer behavior changed")
+	}
+	empty := FromBytesWithRelease(nil, func() { released++ })
+	empty.Release()
+	empty.Release()
+	if released != 2 {
+		t.Fatal("empty owned buffer did not release exactly once")
+	}
+}
+
 func TestRegularBufferCapacityMatchesReleasePool(t *testing.T) {
 	for range 32 {
 		buffer := New()

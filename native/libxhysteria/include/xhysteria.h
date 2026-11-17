@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define XHYS_ABI_VERSION UINT32_C(4)
+#define XHYS_ABI_VERSION UINT32_C(5)
 
 typedef struct {
     uint8_t event_type;
@@ -49,10 +49,12 @@ typedef struct {
     int32_t notify_fd;
     int32_t wake_fd;
     int32_t space_fd;
+    void *owner;
 } XhysSharedView;
 void *xhys_engine_start_shared(const uint8_t *config_json, uintptr_t config_len,
                               int32_t udp_fd, XhysSharedView *view);
 void xhys_engine_join(void *engine);
+void xhys_shared_release(void *owner);
 
 #ifdef __cplusplus
 }

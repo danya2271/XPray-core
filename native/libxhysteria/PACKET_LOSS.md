@@ -1,5 +1,24 @@
 # Hysteria packet-loss diagnosis
 
+## Payload-lease regression — November 18, 2026
+
+With payload leases, release Rust, direct Salamander + WireGuard masking and
+shared bridges, a twelve-second-per-case saturated run produces:
+
+| Cascade | Payload bytes | Sent | Received | Application loss | Sampled kernel UDP drops |
+|---|---:|---:|---:|---:|---:|
+| No | 256 | 2000 | 2000 | 0% | 0 |
+| No | 4096 | 2000 | 1999 | 0.05% | 0 |
+| Yes | 256 | 2000 | 1995 | 0.25% | 0 |
+| Yes | 4096 | 2000 | 2000 | 0% | 0 |
+
+CPU placement is unrestricted in this run, unlike the previous CPU-14-pinned
+check. Background throughput is about 276–369 MiB/s. Missing application replies
+are not attributed yet. The harness fails only when no application packets
+arrive, so its PASS does **not** establish zero loss. There is no matched Go
+loss measurement in this run, and no production/WAN sampling. Raw log:
+`build_assets/payload-leases-20261118/xhys-payload-loss.log`.
+
 ## Direct mask regression — November 18, 2026
 
 Salamander + WireGuard now uses direct Rust UDP masking instead of the packet

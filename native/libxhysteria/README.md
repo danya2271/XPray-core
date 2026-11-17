@@ -403,14 +403,16 @@ without the optional feature before measuring or deploying a normal binary.
 
 Linux/Android amd64 and arm64 use the shared-memory bridge by default. Each
 engine owns two bounded frame rings with eight slots each and three nonblocking
-`eventfd` notification descriptors. The arena is 1,115,456 bytes (about 1.06 MiB),
-aligned to 64 bytes; storage layout version 5 and engine ABI version 4 are
+`eventfd` notification descriptors. The arena is 1,639,744 bytes (about 1.56 MiB),
+aligned to 64 bytes; storage layout version 6 and engine ABI version 5 are
 checked during setup. Event publication is serialized with a short native
 mutex; command publication uses a short Go mutex and an ordered queue fallback.
 No lock is held over a blocked ring wait. Separate descriptors wake RX and
 blocked TX directly through Go netpoll; a third wakes Rust. Coalesced pending
 flags reduce redundant notification syscalls without delaying data. No CGO
-call is made to transfer traffic. The socket bridge remains available for
+call is made for normal payload publication or per-payload release. The last
+Go arena owner uses a teardown CGO call to release its Rust reference.
+The socket bridge remains available for
 comparison and rollback, and is the default on other supported architectures.
 Space notifications are armed only by writers that observe a full ring, then
 recheck it before waiting. A consumer publishes the freed slot before checking
@@ -423,17 +425,33 @@ Rust handles wake descriptors and command dispatch in the same task. When a
 control queue is full, it continues handling notification readiness so that
 event-space backpressure cannot deadlock the engine.
 
-Payloads are copied across the ownership boundary: Rust copies commands out of
-the ring, and Go copies events into pooled Xray buffers before releasing slots.
-Those buffers then pass directly to `ReadMultiBuffer`; native arena pointers
-never escape into Xray's forwarding buffers. This is not end-to-end zero-copy.
+DATA and DATAGRAM payloads up to 16 KiB use independent leased storage: each
+direction has sixteen 16 KiB slots and an atomic free bitmap. Publication copies
+directly into one slot; consuming the descriptor does not copy the payload.
+Rust wraps it in `Bytes::from_owner`, and Go exposes it through a releasable
+Xray buffer. Releasing the last Rust clone or the Go buffer returns its slot.
+Descriptor slots become reusable immediately, independently of payload lifetime.
+An exhausted payload pool falls back to the existing inline ring/copy path,
+never blocking unrelated flows or control frames on a retained lease. Larger
+payloads and control frames also retain that fallback. This is not end-to-end
+zero-copy: publication, socket bridges, QUIC wire encoding and `Read(p)` still
+copy. The extra pool capacity is bounded at 512 KiB per shared engine; reduced
+Go allocation traffic does not establish a lower whole-process RSS.
 TCP writes are coalesced up to 16 KiB on both client and server;
 reads aggregate available QUIC chunks directly into bridge frames, without a
 per-flow scratch buffer or waiting to fill a frame. Each read batch holds at most
 eight chunks. Engine shutdown stops submissions,
-wakes blocked operations, joins dispatchers and Rust, then releases the arena.
-Single Xray buffers are transferred to the bridge without an extra coalescing
-copy. Rust writes owned chunks directly into Quinn and reads server TCP through
+wakes blocked operations and joins dispatchers and Rust. Arena ownership survives
+join until every outstanding Go/Rust payload lease is released. Go retains one
+Rust arena reference rather than making a CGO call for each payload; a finalizer
+is a safety net for abandoned Go buffers. Both Go and Rust must be rebuilt for
+ABI version 5; old standalone C callers must be updated too.
+Single Xray buffers and vectors of whole buffers are transferred without an
+extra coalescing copy. Oversized TCP buffers copy their slices straight into
+shared storage; queued borrowed writes first take an owned snapshot. UDP address
+headers and payloads publish as separate slices in both runtimes, avoiding a
+temporary combined payload. Eventfd notification happens after the command
+publication lock is released. Rust writes owned chunks directly into Quinn and reads server TCP through
 the underlying Quinn stream after parsing the Hysteria header. Data arriving
 with that header is preserved. Clients use eight frame credits and return them
 in groups of four. Servers use four and return two at a time, bounding their

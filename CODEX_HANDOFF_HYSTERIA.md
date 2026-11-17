@@ -600,6 +600,54 @@ The final wider race rerun passes traffic/concurrency, Brutal, cover handlers/
 lifecycle and pooling alongside the full mask/hopping matrix (about 107 seconds).
 Native transport/finalmask race tests and Go-only transport tests also pass.
 
+## Payload leases and lock profiling — November 18, 2026
+
+Shared DATA/DATAGRAM frames now use independent payload leases rather than
+copying out of consumed descriptors. Sixteen 16 KiB slots per direction add
+512 KiB arena capacity: 1,115,456 → 1,639,744 bytes. Storage layout is version 6,
+engine ABI is version 5. Rebuild Go/Rust together; C shared-view callers must
+release the returned owner exactly once after all payload accesses finish.
+Descriptor tails advance immediately; retaining a lease cannot block unrelated
+flow descriptors. Pool exhaustion falls back to inline storage and copying.
+
+Go borrowed writes snapshot only on queue fallback. TCP vectors, oversized
+buffer slices and UDP headers/payloads publish without a temporary coalescing
+payload. Rust UDP RX also sends header/address/payload slices directly. Go slot
+release callbacks are prebuilt, and ordinary Buffer struct size is unchanged.
+The arena owner survives native join while buffers remain readable; startup
+failure releases it explicitly. Finalizer cleanup backs up abandoned ownership.
+Publication and `Read(p)` still copy; this is not end-to-end zero-copy.
+
+Paired packet-path medians on CPU 14, GOMAXPROCS=1, three one-second runs:
+- Go/native throughput: 82.48/100.86 MB/s (native about 1.22× Go).
+- Go/native process CPU: 1.452/1.067 ms per 64 KiB bidirectional exchange.
+- Go/native Go allocation bytes: 27,269/3,779; counts: 724/96.
+- Native allocation bytes/count decrease 12.4%/19.3% from this stage's baseline.
+- TCP native p50/p99: 175.1/268.0 µs, versus Go 90.89/170.2 µs.
+- UDP native p50/p99: 162.5/259.7 µs, versus Go 93.66/184.7 µs.
+- No throughput or idle-latency improvement established over previous native.
+
+Four-CPU parallel profiling reduces cumulative Go `prepareFrame` mutex delay
+425.43 → 86.75 ms (~80%) by moving eventfd notification outside publication
+locking. Parallel throughput stays about 284 MB/s. Perf samples find native
+contended futex CPU in Quinn writes and masked UDP sends; this does not measure
+sleeping wait time or justify speculative flow-map sharding. Kernel futex
+tracepoints are unavailable. More detail in PERFORMANCE.md.
+
+Validation: 76 Rust unit tests, all-target Clippy with warnings denied; Go race
+tests for common buffers/native transport/FinalMask; mixed masks, local/remote
+hopping, concurrent transfers, Brutal, HTTP string/file/proxy/lifecycle, pools,
+short flows and UDP expiry. Go-only tests pass. Linux and Android arm64 binaries
+are rebuilt, not deployed. Measurements are in ignored
+`build_assets/payload-leases-20261118/`.
+
+The latest saturated loss check (unrestricted CPU placement, unlike the previous
+single-CPU run) receives 2000/2000, 1999/2000, 1995/2000, 2000/2000 across
+direct/cascade and 256/4096-byte cases: **0–0.25% application loss**, sampled
+kernel UDP drops zero. The test only fails on complete application loss, so
+PASS is not proof of zero drops. The missing replies are not yet attributed.
+Do not report this as four zero-loss scenarios or a matched Go comparison.
+
 ## Remaining Limits
 
 This work does not bound every allocation in the Xray process or the whole

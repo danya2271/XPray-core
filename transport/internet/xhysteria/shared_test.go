@@ -32,6 +32,9 @@ func testSharedBridge(t *testing.T) *sharedBridge {
 		return file
 	}
 	b := &sharedBridge{data: make([]byte, sharedBytes), notify: efd(), wake: efd(), space: efd()}
+	b.initializeOwner(nil)
+	atomic.StoreUint32(b.word(56), (1<<sharedPayloadSlots)-1)
+	atomic.StoreUint32(b.word(60), (1<<sharedPayloadSlots)-1)
 	t.Cleanup(func() { b.close() })
 	var err error
 	b.notifyReader, err = newEventReader(b.notify)
@@ -74,11 +77,22 @@ func TestSharedBridgeBatchWraparoundAndWakeups(t *testing.T) {
 			}
 			offset := sharedHeader + int(tail&(sharedCapacity-1))*sharedStride
 			d := b.data[offset:]
-			if binary.LittleEndian.Uint64(d[8:]) != id || !bytes.Equal(d[16:16+len(payload)], payload) {
+			contents := d[16 : 16+len(payload)]
+			kind := binary.LittleEndian.Uint32(d)
+			leased := kind&sharedPayloadFlag != 0
+			slot := int(kind >> 16)
+			if leased {
+				offset := sharedRingBytes + slot*sharedPayloadSize
+				contents = b.data[offset : offset+len(payload)]
+			}
+			if binary.LittleEndian.Uint64(d[8:]) != id || !bytes.Equal(contents, payload) {
 				result <- io.ErrUnexpectedEOF
 				return
 			}
 			atomic.StoreUint32(b.word(128), tail+1)
+			if leased {
+				atomic.OrUint32(b.word(56), 1<<slot)
+			}
 			if atomic.SwapUint32(b.word(52), 0) != 0 && atomic.SwapUint32(b.word(44), 1) == 0 {
 				if _, err := b.space.Write(eventfdSignal[:]); err != nil {
 					result <- err
@@ -356,7 +370,14 @@ func TestDirectAndQueuedPublicationsPreserveDataFINOrder(t *testing.T) {
 				continue
 			}
 			d := b.data[sharedHeader+int(tail&(sharedCapacity-1))*sharedStride:]
-			kind, id := byte(binary.LittleEndian.Uint32(d)), binary.LittleEndian.Uint64(d[8:])
+			encoded := binary.LittleEndian.Uint32(d)
+			kind, id := byte(encoded), binary.LittleEndian.Uint64(d[8:])
+			payload := d[16:]
+			leased := encoded&sharedPayloadFlag != 0
+			slot := int(encoded >> 16)
+			if leased {
+				payload = b.data[sharedRingBytes+slot*sharedPayloadSize:]
+			}
 			if id >= producers || finished[id] {
 				result <- io.ErrUnexpectedEOF
 				return
@@ -367,13 +388,16 @@ func TestDirectAndQueuedPublicationsPreserveDataFINOrder(t *testing.T) {
 					return
 				}
 				finished[id] = true
-			} else if kind != dataFrame || binary.BigEndian.Uint32(d[16:]) != sequences[id] {
+			} else if kind != dataFrame || binary.BigEndian.Uint32(payload) != sequences[id] {
 				result <- io.ErrUnexpectedEOF
 				return
 			} else {
 				sequences[id]++
 			}
 			atomic.StoreUint32(b.word(128), tail+1)
+			if leased {
+				atomic.OrUint32(b.word(56), 1<<slot)
+			}
 			if _, err := b.space.Write(eventfdSignal[:]); err != nil {
 				result <- err
 				return
@@ -405,5 +429,142 @@ func TestDirectAndQueuedPublicationsPreserveDataFINOrder(t *testing.T) {
 	e.Close()
 	if e.queued.Load() != 0 {
 		t.Fatalf("publication reservations leaked: %d", e.queued.Load())
+	}
+}
+
+func TestSharedPayloadBufferSurvivesEngineCloseAndDescriptorReuse(t *testing.T) {
+	bridge := testSharedBridge(t)
+	atomic.AndUint32(bridge.word(60), ^uint32(1))
+	offset := sharedRingBytes + sharedPayloadSlots*sharedPayloadSize
+	copy(bridge.data[offset:], "owned payload")
+	descriptor := bridge.data[sharedHeader+sharedCapacity*sharedStride:]
+	binary.LittleEndian.PutUint32(descriptor, uint32(dataFrame)|sharedPayloadFlag)
+	binary.LittleEndian.PutUint32(descriptor[4:], 13)
+	atomic.StoreUint32(bridge.word(192), 1)
+	value, err := bridge.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if &value.data[0] != &bridge.data[offset] {
+		t.Fatal("shared receive payload was copied")
+	}
+	clear(descriptor[:16+13])
+	engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame, 16), flows: make(map[uint64]*Conn)}
+	connection := newConn(engine, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	connection.in <- value
+	prefix := make([]byte, 6)
+	if _, err := connection.Read(prefix); err != nil || string(prefix) != "owned " {
+		t.Fatalf("partial read=%q err=%v", prefix, err)
+	}
+	buffers, err := connection.ReadMultiBuffer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.Close()
+	if string(buffers[0].Bytes()) != "payload" || &buffers[0].Bytes()[0] != &bridge.data[offset+6] {
+		t.Fatal("leased buffer lost its payload during shutdown")
+	}
+	if atomic.LoadUint32(bridge.word(60))&1 != 0 || bridge.owner.refs.Load() != 1 {
+		t.Fatal("payload slot released before the reader finished")
+	}
+	buf.ReleaseMulti(buffers)
+	if atomic.LoadUint32(bridge.word(60))&1 == 0 || bridge.owner.refs.Load() != 0 {
+		t.Fatal("payload owner was not released")
+	}
+}
+
+func TestSharedBorrowedWriteAndVectoredPartsCopyOnlyIntoDestination(t *testing.T) {
+	bridge := testSharedBridge(t)
+	engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame, 16), flows: make(map[uint64]*Conn)}
+	connection := newConn(engine, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	payload := []byte("direct write")
+	if _, err := connection.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	clear(payload)
+	if string(bridge.data[sharedRingBytes:sharedRingBytes+12]) != "direct write" {
+		t.Fatal("borrowed write retained caller memory")
+	}
+	parts := buf.MultiBuffer{buf.FromBytes([]byte("first")), buf.FromBytes([]byte("second"))}
+	if err := connection.WriteMultiBuffer(parts); err != nil {
+		t.Fatal(err)
+	}
+	descriptor := bridge.data[sharedHeader+sharedStride:]
+	slot := int(binary.LittleEndian.Uint32(descriptor) >> 16)
+	offset := sharedRingBytes + slot*sharedPayloadSize
+	if string(bridge.data[offset:offset+11]) != "firstsecond" || parts[0] != nil || parts[1] != nil {
+		t.Fatal("vectored ownership or payload was lost")
+	}
+	large := bytes.Repeat([]byte{0xa7}, 2*sharedPayloadSize+1)
+	buffers := buf.MultiBuffer{buf.FromBytes(large)}
+	if err := connection.WriteMultiBuffer(buffers); err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadUint32(bridge.word(64)) != 5 || buffers[0] != nil {
+		t.Fatal("oversized buffer did not split into bounded frames")
+	}
+	for index, size := range []int{sharedPayloadSize, sharedPayloadSize, 1} {
+		descriptor := bridge.data[sharedHeader+(index+2)*sharedStride:]
+		slot := int(binary.LittleEndian.Uint32(descriptor) >> 16)
+		offset := sharedRingBytes + slot*sharedPayloadSize
+		if int(binary.LittleEndian.Uint32(descriptor[4:])) != size || !bytes.Equal(bridge.data[offset:offset+size], large[index*sharedPayloadSize:index*sharedPayloadSize+size]) {
+			t.Fatal("split payload changed")
+		}
+	}
+	udp := newConn(engine, 2, xnet.UDPDestination(xnet.LocalHostIP, 53), nil)
+	datagram := buf.MultiBuffer{buf.FromBytes([]byte("UDP payload"))}
+	if err := udp.WriteMultiBuffer(datagram); err != nil {
+		t.Fatal(err)
+	}
+	descriptor = bridge.data[sharedHeader+5*sharedStride:]
+	slot = int(binary.LittleEndian.Uint32(descriptor) >> 16)
+	offset = sharedRingBytes + slot*sharedPayloadSize
+	size := int(binary.LittleEndian.Uint32(descriptor[4:]))
+	address, contents, err := decodeAddress(bridge.data[offset : offset+size])
+	if err != nil || string(address) != udp.targetAddress || string(contents) != "UDP payload" || datagram[0] != nil {
+		t.Fatalf("vectored UDP changed: %q %q %v", address, contents, err)
+	}
+}
+
+func TestSharedQueuedBorrowedWriteTakesSnapshotAndReleasesOnClose(t *testing.T) {
+	bridge := testSharedBridge(t)
+	engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame, 16), flows: make(map[uint64]*Conn)}
+	connection := newConn(engine, 1, xnet.TCPDestination(xnet.LocalHostIP, 80), nil)
+	atomic.StoreUint32(bridge.word(64), sharedCapacity)
+	payload := []byte("queued snapshot")
+	if _, err := connection.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	clear(payload)
+	queued := <-engine.out
+	if queued.borrowed || queued.storage == nil || string(queued.data) != "queued snapshot" {
+		t.Fatal("queued write retained caller memory")
+	}
+	engine.out <- queued
+	engine.Close()
+	if queued.storage.Bytes() != nil || engine.queued.Load() != 0 {
+		t.Fatal("queued write was not released on close")
+	}
+}
+
+func TestSharedPayloadPoolFallbackAndMalformedLease(t *testing.T) {
+	bridge := testSharedBridge(t)
+	atomic.StoreUint32(bridge.word(56), 0)
+	if count, err := bridge.tryWriteBatch([]frame{{kind: dataFrame, id: 1, data: []byte("fallback")}, {kind: finFrame, id: 2}}); count != 2 || err != nil {
+		t.Fatalf("exhausted pool blocked other frames: %d %v", count, err)
+	}
+	descriptor := bridge.data[sharedHeader:]
+	if binary.LittleEndian.Uint32(descriptor) != uint32(dataFrame) || string(descriptor[16:24]) != "fallback" {
+		t.Fatal("fallback payload changed")
+	}
+	for _, kind := range []uint32{uint32(dataFrame) | sharedPayloadFlag, uint32(dataFrame) | sharedPayloadFlag | sharedPayloadSlots<<16, uint32(dataFrame) | 1<<9} {
+		descriptor := bridge.data[sharedHeader+sharedCapacity*sharedStride:]
+		binary.LittleEndian.PutUint32(descriptor, kind)
+		binary.LittleEndian.PutUint32(descriptor[4:], 1)
+		atomic.StoreUint32(bridge.word(192), 1)
+		if value, err := bridge.read(); err == nil {
+			value.release()
+			t.Fatalf("accepted invalid lease %#x", kind)
+		}
 	}
 }

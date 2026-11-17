@@ -127,10 +127,19 @@ type MasqueradeConfig struct {
 }
 
 type frame struct {
-	kind    byte
-	id      uint64
-	data    []byte
-	storage *buf.Buffer
+	kind     byte
+	id       uint64
+	data     []byte
+	storage  *buf.Buffer
+	parts    buf.MultiBuffer
+	borrowed bool
+}
+
+func (f *frame) size() int {
+	if f.parts != nil {
+		return int(f.parts.Len())
+	}
+	return len(f.data)
 }
 
 func (f *frame) release() {
@@ -139,6 +148,8 @@ func (f *frame) release() {
 		f.storage = nil
 	}
 	f.data = nil
+	buf.ReleaseMulti(f.parts)
+	f.parts = nil
 }
 
 func readFrame(r io.Reader) (frame, error) {
@@ -295,6 +306,9 @@ func Start(ctx context.Context, config Config, udp *os.File, local, remote net.A
 	if err != nil || ready.kind != readyFrame {
 		bridge.close()
 		C.xhys_engine_join(handle)
+		if shared, ok := bridge.(*sharedBridge); ok {
+			shared.releaseOwner()
+		}
 		if err != nil {
 			return nil, fmt.Errorf("native startup: %w", err)
 		}
@@ -363,7 +377,7 @@ func (e *Engine) send(f frame, until time.Time) error {
 	if !until.IsZero() && !time.Now().Before(until) {
 		return os.ErrDeadlineExceeded
 	}
-	if direct, err := e.prepareFrame(f); direct || err != nil {
+	if direct, err := e.prepareFrame(&f); direct || err != nil {
 		return err
 	}
 	queued := true
@@ -393,7 +407,7 @@ func (e *Engine) send(f frame, until time.Time) error {
 	}
 }
 
-func (e *Engine) prepareFrame(f frame) (bool, error) {
+func (e *Engine) prepareFrame(f *frame) (bool, error) {
 	e.publishMu.Lock()
 	select {
 	case <-e.done:
@@ -402,9 +416,12 @@ func (e *Engine) prepareFrame(f frame) (bool, error) {
 	default:
 	}
 	if bridge, ok := e.bridge.(*sharedBridge); ok && e.queued.Load() == 0 {
-		n, err := bridge.tryWriteBatch([]frame{f})
+		n, err := bridge.tryWriteBatch([]frame{*f})
 		if err != nil || n != 0 {
 			e.publishMu.Unlock()
+			if err == nil {
+				err = bridge.notifyRust()
+			}
 			if err == nil {
 				f.release()
 			} else {
@@ -417,6 +434,18 @@ func (e *Engine) prepareFrame(f frame) (bool, error) {
 	// must never overtake a batch already owned by the background writer.
 	e.queued.Add(1)
 	e.publishMu.Unlock()
+	if f.borrowed {
+		f.storage = buf.NewWithSize(int32(len(f.data)))
+		f.storage.Write(f.data)
+		f.data = f.storage.Bytes()
+		f.borrowed = false
+	}
+	if bridge, ok := e.bridge.(*sharedBridge); ok {
+		if err := bridge.notifyRust(); err != nil {
+			e.queued.Add(-1)
+			return false, err
+		}
+	}
 	return false, nil
 }
 
@@ -457,6 +486,9 @@ func (e *Engine) Close() error {
 		e.packet.wg.Wait()
 	}
 	e.submitWG.Wait()
+	if bridge, ok := e.bridge.(*sharedBridge); ok {
+		bridge.releaseOwner()
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.handle != nil {
@@ -1001,7 +1033,7 @@ func (c *Conn) waitWrite(f *frame) error {
 			default:
 			}
 		} else if !reserved {
-			direct, err := c.engine.prepareFrame(*f)
+			direct, err := c.engine.prepareFrame(f)
 			if direct || err != nil {
 				return err
 			}
@@ -1056,7 +1088,14 @@ func (c *Conn) waitWrite(f *frame) error {
 }
 
 func (c *Conn) awaitWriteCredit() error { return c.waitWrite(nil) }
-func (c *Conn) sendFrame(f frame) error { return c.waitWrite(&f) }
+func (c *Conn) sendFrame(f frame) error {
+	borrowed := f.borrowed
+	err := c.waitWrite(&f)
+	if err != nil && borrowed {
+		f.release()
+	}
+	return err
+}
 
 func (c *Conn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
@@ -1116,11 +1155,17 @@ func (c *Conn) Write(p []byte) (int, error) {
 		if err := c.awaitWriteCredit(); err != nil {
 			return n, err
 		}
-		storage := buf.NewWithSize(int32(chunk))
-		storage.Write(p[:chunk])
-		if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: storage.Bytes(), storage: storage}); err != nil {
-			storage.Release()
-			return n, err
+		if _, shared := c.engine.bridge.(*sharedBridge); shared {
+			if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: p[:chunk], borrowed: true}); err != nil {
+				return n, err
+			}
+		} else {
+			storage := buf.NewWithSize(int32(chunk))
+			storage.Write(p[:chunk])
+			if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: storage.Bytes(), storage: storage}); err != nil {
+				storage.Release()
+				return n, err
+			}
 		}
 		n += chunk
 		p = p[chunk:]
@@ -1236,6 +1281,28 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				mb[0] = nil
 				return nil
 			}
+			if _, shared := c.engine.bridge.(*sharedBridge); shared {
+				count, size := 0, int32(0)
+				for count < len(mb) && size+mb[count].Len() <= c.chunkSize() {
+					size += mb[count].Len()
+					count++
+				}
+				if count != 0 {
+					parts := append(buf.MultiBuffer(nil), mb[:count]...)
+					if err := c.sendFrame(frame{kind: dataFrame, id: c.id, parts: parts}); err != nil {
+						return err
+					}
+					clear(mb[:count])
+					mb = mb[count:]
+					continue
+				}
+				chunk := mb[0].BytesTo(c.chunkSize())
+				if err := c.sendFrame(frame{kind: dataFrame, id: c.id, data: chunk, borrowed: true}); err != nil {
+					return err
+				}
+				mb[0].Advance(c.chunkSize())
+				continue
+			}
 			storage := buf.NewWithSize(c.chunkSize())
 			for len(mb) != 0 && storage.Len() < c.chunkSize() {
 				b := mb[0]
@@ -1259,7 +1326,7 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 		return nil
 	}
-	for _, b := range mb {
+	for index, b := range mb {
 		if b.Len() == 0 || b.Len() > 4096 {
 			return errors.New("native UDP size outside 1..4096")
 		}
@@ -1278,6 +1345,17 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 		if err := c.awaitWriteCredit(); err != nil {
 			return err
+		}
+		if _, shared := c.engine.bridge.(*sharedBridge); shared {
+			header := buf.NewWithSize(int32(2 + len(address)))
+			binary.BigEndian.PutUint16(header.Extend(2), uint16(len(address)))
+			header.WriteString(address)
+			if err := c.sendFrame(frame{kind: datagramFrame, id: c.id, parts: buf.MultiBuffer{header, b}}); err != nil {
+				header.Release()
+				return err
+			}
+			mb[index] = nil
+			continue
 		}
 		storage := buf.NewWithSize(int32(2+len(address)) + b.Len())
 		var size [2]byte
