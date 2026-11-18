@@ -1588,3 +1588,61 @@ validation work; use the `capacity-isolated-*` series for the table.
 Logs, raw measurements, artifact hashes and `results.json` are in ignored
 `build_assets/assembler-overhead-20261118/`. The native metadata microbenchmark
 and ordinary streaming/RSS results are distinct workloads.
+
+## 2026-11-18: Native Scheduler Intervals
+
+Commit `e44700c8` checks Tokio I/O, timers and the global task queue every
+seven scheduler ticks on the dedicated server and shared client runtimes.
+The comparison against `69ec63f7` uses the same loopback harness, header mask,
+shared bridge, pool size 1, CPUs 12–15 and `GOMAXPROCS=4`. Native results are
+medians of four samples in ABBA order. Go uses four subsequent samples from
+the same candidate binary. Paced samples last three seconds, other samples two.
+
+| Offered background, MiB/s | Native before p99, µs | Native after p99, µs | Go p99, µs | Achieved before / after / Go, MiB/s |
+| --- | ---: | ---: | ---: | --- |
+| 16 | 496.50 | 463.00 | 444.65 | 15.97 / 15.95 / 15.97 |
+| 32 | 542.55 | 537.30 | 497.80 | 31.79 / 31.30 / 31.95 |
+| 64 | 668.10 | 606.65 | 618.80 | 62.87 / 63.97 / 63.97 |
+| Saturated | 2,181 | 2,071 | 1,054 | 264.00 / 254.10 / 210.85 |
+
+The 64 MiB/s run shows 9.2% lower native p99 at 1.7% higher achieved load.
+The 32 MiB/s result differs by 1% with slightly lower achieved load. At
+saturation native p99 falls 5.0% while delivered load falls 3.8%, so this row
+cannot isolate a latency improvement at equal throughput.
+
+| Metric | Native before | Native after | Go |
+| --- | ---: | ---: | ---: |
+| TCP upload, MB/s | 343.50 | 348.12 | 169.24 |
+| TCP download, MB/s | 318.29 | 315.69 | 168.90 |
+| Upload process CPU, µs / 64 KiB | 504.75 | 491.80 | 1,060.41 |
+| Download process CPU, µs / 64 KiB | 533.56 | 534.27 | 1,038.39 |
+| Idle TCP p99, µs | 229.20 | 225.25 | 196.10 |
+| Peak RSS during 512 MiB upload, MiB | 65.06 | 72.48 | 30.78 |
+
+Native delivers 2.06× Go upload throughput and 1.87× Go download throughput.
+Peak RSS medians come from three rotating fresh-process measurements via
+`wait4`. The native samples before are 64,684–75,504 KiB and after are
+70,612–75,444 KiB. The 11.4% median increase warrants a larger repeat before
+attributing it to scheduling. Native uses 2.35× Go peak RSS in this sample.
+
+Smaller transfer batches, extra yields and short-write priority did not
+provide a consistent gain. Priority increased saturated p99 from 2,010 to
+2,157 µs in its ABBA comparison despite lower achieved load. Follow-up
+31/31 and 31/7 scheduler intervals had lower paced p99 in short ABBA runs,
+with different baselines across runs and no matched saturation, CPU or RSS
+validation. The selected runtime remains 7/7. The artifact labeled `event7-global1`
+contains the priority experiment because the preceding source edit failed.
+
+With four background TCP streams, the native direct 4 KiB UDP case received
+1,975/2,000 at 275.67 MiB/s. The other seven native/Go direct/cascade cases
+received 2,000/2,000. Sampled kernel UDP drops were zero throughout. Two
+subsequent direct 4 KiB samples per native revision each received 2,000/2,000
+at 276–284 MiB/s. The loss is intermittent and its cause is unresolved.
+
+Engine and allocation-profile suites each passed 89 tests, with Clippy and
+format checks passing. Go package race tests passed. The broad interop suite
+hit its global timeout twice. Across the completed cases and targeted repeats,
+140 packet mask cases, short flows, hopping, HTTP interop, UDP expiry, capacity
+recovery, 100 ms RTT and the 128-session race case passed. Linux amd64 and
+Android arm64/API 26 artifacts were rebuilt. The raw logs and result summaries
+are in `build_assets/loaded-latency-20261118/`.
