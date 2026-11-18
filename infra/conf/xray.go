@@ -32,6 +32,8 @@ var (
 		"socks":         func() interface{} { return new(SocksServerConfig) },
 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
 		"hysteria":      func() interface{} { return new(HysteriaServerConfig) },
+		"hysteria2":     func() interface{} { return new(HysteriaServerConfig) },
+		"hy2":          func() interface{} { return new(HysteriaServerConfig) },
 		"masque":        func() interface{} { return new(MasqueServerConfig) },
 	}, "protocol", "settings")
 

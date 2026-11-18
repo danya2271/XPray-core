@@ -770,8 +770,8 @@ type HysteriaConfig struct {
 }
 
 func (c *HysteriaConfig) Build() (proto.Message, error) {
-	if c.Version != 2 {
-		return nil, errors.New("version != 2")
+	if err := checkHysteriaVersion(c.Version); err != nil {
+		return nil, err
 	}
 
 	if c.UdpIdleTimeout != 0 && (c.UdpIdleTimeout < 2 || c.UdpIdleTimeout > 600) {
