@@ -1741,3 +1741,21 @@ columns show medians of two samples each.
 The separate mixed-load smoke test delivered 4,000/4,000 4 KiB UDP
 datagrams at 154.69 MiB/s of TCP background traffic with zero sampled
 kernel UDP drops. Raw logs are in `build_assets/udp-header-20261119/`.
+
+## 2026-11-19 Buffered Reads and Go Scheduling
+
+An ABBA experiment tried receiving a queued frame before acquiring the
+connection mutex. The empty-queue path retained the existing deadline and
+shutdown handling. Four-CPU native medians from two samples per revision
+were 356.25 → 345.13 MB/s upload and 306.34 → 302.53 MB/s download.
+At a 64 MiB/s offered background rate, p99 was 609.45 → 624.50 µs while
+achieved background throughput fell from 63.75 to 59.77 MiB/s. The change
+was reverted after the observed throughput and latency regressions.
+
+Separate Go runtime traces of the baseline at 63.99 MiB/s native and
+63.96 MiB/s Go measured p99 of 581.5 and 576.0 µs respectively. In the
+native trace, goroutines woken by the bridge read loop accumulated 180.62 ms
+of runnable delay, 43.7% of the aggregate Go scheduler delay. This profile
+attributes delay to the wake-up site and covers the Go scheduler. Measuring
+shared-ring residence and Rust-side dispatch requires timestamps at those
+stages. Raw traces and benchmark logs are in `build_assets/read-fast/`.
