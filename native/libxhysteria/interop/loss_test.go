@@ -62,6 +62,24 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 	if testing.Short() {
 		t.Skip("packet-loss sampling takes twelve seconds per scenario")
 	}
+	packets := 2000
+	if value := os.Getenv("XHYS_LOSS_PACKETS"); value != "" {
+		var err error
+		packets, err = strconv.Atoi(value)
+		if err != nil || packets < 1 || packets > 12000 {
+			t.Fatal("XHYS_LOSS_PACKETS must be 1..12000")
+		}
+	}
+	var backgroundPeriod time.Duration
+	if value := os.Getenv("XHYS_LOSS_PACED_MIBPS"); value != "" {
+		rate, err := strconv.Atoi(value)
+		if err != nil || rate < 1 || rate > 4096 || os.Getenv("XHYS_LOSS_LOAD") == "0" {
+			t.Fatal("XHYS_LOSS_PACED_MIBPS must be 1..4096 and requires background load")
+		}
+		backgroundPeriod = time.Second / time.Duration(2*rate)
+	}
+	const packetPeriod = 5 * time.Millisecond
+	sampleTimeout := time.Duration(packets)*packetPeriod + 15*time.Second
 	for _, backend := range []string{"native", "go"} {
 		for _, cascade := range []bool{false, true} {
 			for _, size := range []int{256, 4096} {
@@ -130,8 +148,8 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 					if err := client.Start(); err != nil {
 						t.Fatal(err)
 					}
-					tcp, udp := echoTargetsWithTimeout(t, 30*time.Second)
-					ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+					tcp, udp := echoTargetsWithTimeout(t, sampleTimeout+5*time.Second)
+					ctx, cancel := context.WithTimeout(context.Background(), sampleTimeout)
 					defer cancel()
 					open := func(network, address string) net.Conn {
 						target, err := xnet.ParseDestination(network + ":" + address)
@@ -174,6 +192,12 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 					}
 					for _, bulk := range load {
 						workers.Go(func() {
+							var ticks <-chan time.Time
+							if backgroundPeriod != 0 {
+								ticker := time.NewTicker(backgroundPeriod)
+								defer ticker.Stop()
+								ticks = ticker.C
+							}
 							reportError := func(err error) {
 								select {
 								case <-stopped:
@@ -183,6 +207,13 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 							}
 							payload, reply := make([]byte, 65536), make([]byte, 65536)
 							for {
+								if ticks != nil {
+									select {
+									case <-stopped:
+										return
+									case <-ticks:
+									}
+								}
 								if _, err := bulk.Write(payload); err != nil {
 									reportError(err)
 									return
@@ -202,10 +233,10 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 					if backend == "native" && native.Stats().StartedEngines-before < minimumEngines {
 						t.Fatal("native packet-loss test silently fell back to Go")
 					}
-					const packets = 2000
 					received := make(chan int, 1)
 					workers.Go(func() {
 						buffer := make([]byte, size)
+						expected := bytes.Repeat([]byte{0xa5}, size-4)
 						seen := make([]bool, packets)
 						count := 0
 						defer func() { received <- count }()
@@ -214,7 +245,7 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 								return
 							}
 							sequence := int(binary.BigEndian.Uint32(buffer))
-							if sequence >= packets || !bytes.Equal(buffer[4:], bytes.Repeat([]byte{0xa5}, size-4)) {
+							if sequence < 0 || sequence >= packets || !bytes.Equal(buffer[4:], expected) {
 								t.Error("UDP payload corrupted")
 								return
 							}
@@ -225,8 +256,9 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 						}
 					})
 					kernelBefore := processUDPDrops(t)
+					backgroundBefore := backgroundBytes.Load()
 					started := time.Now()
-					ticker := time.NewTicker(5 * time.Millisecond)
+					ticker := time.NewTicker(packetPeriod)
 					payload := bytes.Repeat([]byte{0xa5}, size)
 					sent := 0
 					for sequence := range packets {
@@ -246,6 +278,7 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 						sent++
 					}
 					ticker.Stop()
+					backgroundRate := float64(backgroundBytes.Load()-backgroundBefore) / (1 << 20) / time.Since(started).Seconds()
 					time.Sleep(2 * time.Second)
 					var kernelDropped uint64
 					for inode, after := range processUDPDrops(t) {
@@ -255,7 +288,7 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 					}
 					conn.Close()
 					count := <-received
-					t.Logf("backend=%s packet_mask=%s cascade=%t payload=%d sent=%d received=%d loss_pct=%.3f background_mibps=%.2f kernel_udp_dropped=%d", backend, maskKind, cascade, size, sent, count, 100*float64(sent-count)/float64(max(1, sent)), float64(backgroundBytes.Load())/(1<<20)/time.Since(started).Seconds(), kernelDropped)
+					t.Logf("backend=%s packet_mask=%s cascade=%t payload=%d sent=%d received=%d loss_pct=%.3f background_mibps=%.2f kernel_udp_dropped=%d", backend, maskKind, cascade, size, sent, count, 100*float64(sent-count)/float64(max(1, sent)), backgroundRate, kernelDropped)
 					if count == 0 {
 						t.Fatal("all application UDP packets lost")
 					}

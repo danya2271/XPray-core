@@ -9,7 +9,7 @@ use crate::{
     packet_socket::PacketSocket,
     protocol, shared,
     socket::{MaskedSocket, ReceiveSocket},
-    udp::{Defragger, Message},
+    udp::{Defragger, Message, ReassemblyDrops},
 };
 use bytes::{Buf, Bytes};
 use h3::quic::{RecvStream as _, SendStream as _};
@@ -322,6 +322,7 @@ struct Bus {
     max_flows: usize,
     flow_window: usize,
     udp_credit_dropped: AtomicU64,
+    udp_reassembly_drops: Option<Arc<ReassemblyDrops>>,
     capacity: Option<ServerCapacity>,
     send_budget: Option<Arc<Semaphore>>,
     process_send_budget: Option<Arc<Semaphore>>,
@@ -1555,7 +1556,7 @@ async fn client_udp(
     sessions: Arc<Mutex<HashMap<u32, u64>>>,
 ) -> Result<()> {
     let start = Instant::now();
-    let mut defrag = Defragger::new(128)?;
+    let mut defrag = Defragger::new(128)?.with_stats(bus.udp_reassembly_drops.clone());
     loop {
         let data = connection.read_datagram().await?;
         let Ok(message) = Message::decode(&data) else {
@@ -1596,7 +1597,7 @@ async fn server_udp(
     first: Bytes,
 ) -> Result<()> {
     let start = Instant::now();
-    let mut defrag = Defragger::new(8)?;
+    let mut defrag = Defragger::new(8)?.with_stats(bus.udp_reassembly_drops.clone());
     let mut sessions: HashMap<u32, (u64, Arc<AtomicU64>)> = HashMap::new();
     let mut tasks = JoinSet::new();
     let mut cleanup = tokio::time::interval(Duration::from_secs(1));
@@ -1973,6 +1974,9 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
         max_flows: config.flow_limit(),
         flow_window: config.flow_window(),
         udp_credit_dropped: AtomicU64::new(0),
+        udp_reassembly_drops: config
+            .diagnostic
+            .then(|| Arc::new(ReassemblyDrops::default())),
         capacity: config.server.then(|| ServerCapacity::new(&config)),
         send_budget: Some({
             Arc::new(Semaphore::new(if config.send_buffer_bytes == 0 {
@@ -2133,6 +2137,16 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
                     dropped.saturating_sub(previous_udp_credit_dropped),
                 );
                 previous_udp_credit_dropped = dropped;
+                if let Some(stats) = &bus.udp_reassembly_drops {
+                    eprintln!(
+                        "[XRAY_NET_DIAG][XHYSTERIA] event=udp_reassembly role={} expired_total={} evicted_total={} replaced_total={} oversized_total={}",
+                        if config.server { "server" } else { "client" },
+                        stats.expired.load(Ordering::Relaxed),
+                        stats.evicted.load(Ordering::Relaxed),
+                        stats.replaced.load(Ordering::Relaxed),
+                        stats.oversized.load(Ordering::Relaxed),
+                    );
+                }
             }
             reason = async { if let Some(c) = &client { c.closed().await } else { std::future::pending().await } } => {
                 break Err(format!("QUIC connection closed: {reason}").into());
@@ -2413,6 +2427,7 @@ mod tests {
             max_flows: config.flow_limit(),
             flow_window: config.flow_window(),
             udp_credit_dropped: AtomicU64::new(0),
+            udp_reassembly_drops: None,
             capacity: Some(ServerCapacity::new(&config)),
             send_budget: Some(Arc::new(Semaphore::new(8))),
             process_send_budget: None,
@@ -2972,6 +2987,7 @@ mod tests {
             max_flows: 128,
             flow_window: 16,
             udp_credit_dropped: AtomicU64::new(0),
+            udp_reassembly_drops: None,
             capacity: None,
             send_budget: None,
             process_send_budget: None,

@@ -302,3 +302,21 @@ still fails only on complete loss, so PASS alone is not a no-loss assertion.
 The new fixed-512MiB upload memory comparison measures native peak RSS at
 82.72 MiB versus Go 38.75 MiB. Fewer Go allocations do not mean lower total
 memory; this change does not establish that the original 1 GiB VPS OOM is fixed.
+
+## Matched-load UDP diagnostics: November 19, 2026
+
+The loopback test accepts `XHYS_LOSS_PACKETS` (1–12,000, default 2,000)
+and `XHYS_LOSS_PACED_MIBPS` (aggregate offered bidirectional TCP rate).
+The reported background rate counts completed TCP echo bytes during UDP
+sending, excluding the two-second UDP drain. With `XRAY_NET_DIAG=1`, native
+`event=udp_reassembly` reports cumulative expired, evicted, replaced and
+oversized incomplete assemblies per engine. These are assembly counts, not
+QUIC packet loss; an incomplete assembly can expire after an upstream loss.
+
+One direct 4 KiB run per backend, with the header mask, four background
+TCP flows and 192 MiB/s offered load, received 8,000/8,000 replies on both.
+Achieved rates were 191.27 MiB/s native and 189.66 MiB/s Go. Sampled kernel
+UDP drops were zero on both, and native bridge credit, QUIC DATAGRAM and
+reassembly drop counters stayed zero in the sampled logs. This does not
+explain or rule out the earlier intermittent loss under saturation. Logs:
+`build_assets/loaded-latency-20261119/udp-192-*.log`.

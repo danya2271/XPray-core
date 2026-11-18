@@ -1646,3 +1646,22 @@ hit its global timeout twice. Across the completed cases and targeted repeats,
 recovery, 100 ms RTT and the 128-session race case passed. Linux amd64 and
 Android arm64/API 26 artifacts were rebuilt. The raw logs and result summaries
 are in `build_assets/loaded-latency-20261118/`.
+
+## 2026-11-19: TCP p99 at Comparable High Load
+
+The `e44700c8` binary and the same loopback header-mask harness were run
+with `GOMAXPROCS=4` on CPUs 12–15. The first pass used native/Go/Go/native
+order at each common offered rate. Native achieved less than offered,
+so a subsequent Go-only sweep targeted the measured native rates. Each
+table entry is the median of four 4-second samples. The matched results
+are from sequential sweeps, not a paired ABBA run at the adjusted rates.
+
+| Achieved native / Go, MiB/s | Native TCP p99, µs | Go TCP p99, µs | Native relative to Go |
+| --- | ---: | ---: | ---: |
+| 124.90 / 124.95 | 824.85 | 617.45 | +33.6% |
+| 186.35 / 185.85 | 1,313.00 | 864.00 | +52.0% |
+
+The higher tail persists at comparable achieved load; unequal saturation
+throughput is not the only explanation. These runs do not identify where
+the requests wait. No scheduler or buffer tuning changed in this pass.
+Raw logs are in `build_assets/loaded-latency-20261119/`.

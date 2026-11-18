@@ -1,4 +1,8 @@
 use crate::protocol::{Error, MAX_ADDRESS, read_varint, varint_len, write_varint};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 pub const MAX_PAYLOAD: usize = 4096;
 pub const FRAGMENT_TTL_NS: u64 = 10_000_000_000;
@@ -144,6 +148,15 @@ struct Assembly {
 pub struct Defragger {
     slots: Vec<Assembly>,
     limit: usize,
+    stats: Option<Arc<ReassemblyDrops>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReassemblyDrops {
+    pub(crate) expired: AtomicU64,
+    pub(crate) evicted: AtomicU64,
+    pub(crate) replaced: AtomicU64,
+    pub(crate) oversized: AtomicU64,
 }
 
 impl Defragger {
@@ -154,7 +167,14 @@ impl Defragger {
         Ok(Self {
             slots: Vec::new(),
             limit: max_incomplete_packets,
+            stats: None,
         })
+    }
+
+    #[cfg(any(feature = "engine", test))]
+    pub(crate) fn with_stats(mut self, stats: Option<Arc<ReassemblyDrops>>) -> Self {
+        self.stats = stats;
+        self
     }
 
     pub fn pending(&self) -> usize {
@@ -162,8 +182,15 @@ impl Defragger {
     }
 
     pub fn expire(&mut self, now_ns: u64) {
+        let before = self.slots.len();
         self.slots
             .retain(|slot| now_ns.saturating_sub(slot.last_seen) <= FRAGMENT_TTL_NS);
+        let expired = before - self.slots.len();
+        if expired != 0
+            && let Some(stats) = &self.stats
+        {
+            stats.expired.fetch_add(expired as u64, Ordering::Relaxed);
+        }
     }
 
     pub fn feed(&mut self, now_ns: u64, message: &Message<'_>) -> Result<Option<Datagram>, Error> {
@@ -206,6 +233,9 @@ impl Defragger {
                     || self.slots[i].parts.len() != message.count as usize =>
             {
                 self.slots.swap_remove(i);
+                if let Some(stats) = &self.stats {
+                    stats.replaced.fetch_add(1, Ordering::Relaxed);
+                }
                 None
             }
             other => other,
@@ -220,6 +250,9 @@ impl Defragger {
                     .unwrap()
                     .0;
                 self.slots.swap_remove(oldest);
+                if let Some(stats) = &self.stats {
+                    stats.evicted.fetch_add(1, Ordering::Relaxed);
+                }
             }
             self.slots.push(Assembly {
                 session: message.session,
@@ -240,6 +273,9 @@ impl Defragger {
         slot.bytes += message.payload.len();
         if slot.bytes > MAX_PAYLOAD {
             self.slots.swap_remove(index);
+            if let Some(stats) = &self.stats {
+                stats.oversized.fetch_add(1, Ordering::Relaxed);
+            }
             return Err(Error::Invalid("UDP assembly exceeds payload limit"));
         }
         *part = Some(message.payload.into());
@@ -378,7 +414,8 @@ mod tests {
 
     #[test]
     fn duplicates_expiration_and_eviction_are_bounded() {
-        let mut d = Defragger::new(1).unwrap();
+        let stats = Arc::new(ReassemblyDrops::default());
+        let mut d = Defragger::new(1).unwrap().with_stats(Some(stats.clone()));
         d.feed(0, &msg(1, 0, b"old")).unwrap();
         d.feed(FRAGMENT_TTL_NS, &msg(1, 0, b"duplicate")).unwrap();
         d.expire(FRAGMENT_TTL_NS + 1);
@@ -390,15 +427,28 @@ mod tests {
             d.feed(2, &msg(2, 1, b"data")).unwrap().unwrap().payload,
             b"newdata"
         );
+        assert_eq!(stats.expired.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.evicted.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.replaced.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.oversized.load(Ordering::Relaxed), 0);
     }
 
     #[test]
     fn rejects_oversized_assembly_and_bad_metadata() {
-        let mut d = Defragger::new(8).unwrap();
+        let stats = Arc::new(ReassemblyDrops::default());
+        let mut d = Defragger::new(8).unwrap().with_stats(Some(stats.clone()));
         d.feed(0, &msg(1, 0, &[0; 3000])).unwrap();
         assert!(d.feed(1, &msg(1, 1, &[0; 2000])).is_err());
         assert_eq!(d.pending(), 0);
+        assert_eq!(stats.oversized.load(Ordering::Relaxed), 1);
         assert!(d.feed(1, &msg(1, 2, b"bad")).is_err());
+        d.feed(2, &msg(2, 0, b"original")).unwrap();
+        let replacement = Message {
+            address: b"other:443",
+            ..msg(2, 0, b"replacement")
+        };
+        assert!(d.feed(3, &replacement).unwrap().is_none());
+        assert_eq!(stats.replaced.load(Ordering::Relaxed), 1);
         assert!(Message::decode(&[0; 9]).is_err());
         assert!(msg(1, 0, b"").validate().is_err());
         assert!(msg(1, 0, b"a").fragment(1).is_err());
