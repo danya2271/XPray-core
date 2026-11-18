@@ -178,7 +178,11 @@ fn runtime(config: &Config) -> io::Result<tokio::runtime::Runtime> {
     } else {
         tokio::runtime::Builder::new_current_thread()
     };
-    builder.enable_all().build()
+    builder
+        .event_interval(7)
+        .global_queue_interval(7)
+        .enable_all()
+        .build()
 }
 
 static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -204,6 +208,8 @@ fn start_worker(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(usize::from(config.process_workers.max(1)))
             .thread_name("xhysteria-shared")
+            .event_interval(7)
+            .global_queue_interval(7)
             .enable_all()
             .build()
             .expect("native client runtime")
@@ -2656,7 +2662,7 @@ mod tests {
     async fn tcp_batches_bound_chunks_and_bytes_for_fairness() {
         let mut bus = capacity_bus();
         bus.send_budget = None;
-        for size in [1, 49152, 65536] {
+        for (size, expected) in [(1, 8), (16384, 8), (32768, 4), (49152, 2), (65536, 2)] {
             let (sender, mut commands) = mpsc::channel(16);
             let payload = Bytes::from(vec![1; size]);
             for _ in 0..9 {
@@ -2668,7 +2674,7 @@ mod tests {
             let mut chunks = std::array::from_fn(|_| Bytes::new());
             chunks[0] = payload;
             let (count, pending) = bus.fill_tcp_batch(&mut commands, &mut chunks);
-            assert_eq!(count, if size == 1 { 8 } else { 2 });
+            assert_eq!(count, expected);
             if size == 49152 {
                 assert_eq!(pending.unwrap().data.len(), size);
                 assert_eq!(commands.len(), 9 - count);
