@@ -320,3 +320,24 @@ UDP drops were zero on both, and native bridge credit, QUIC DATAGRAM and
 reassembly drop counters stayed zero in the sampled logs. This does not
 explain or rule out the earlier intermittent loss under saturation. Logs:
 `build_assets/loaded-latency-20261119/udp-192-*.log`.
+
+## Send MTU and Bridge Credits: November 19, 2026
+
+An MTU reduction during UDP enqueue no longer closes the session when Quinn
+returns `TooLarge`. Before the first fragment is queued, the sender retries
+once at a smaller limit. If part of the old layout was already queued, it
+abandons that datagram without mixing layouts and keeps the session open.
+`send_mtu_dropped_total` counts those local enqueue failures independently of
+QUIC's counter for datagrams already queued. A deterministic unit test checks
+both cases. Server UDP reuses the existing flow credit handle rather than
+locking the global flow table for each incoming datagram. Queue limits are
+unchanged.
+
+With both endpoints and the load generator pinned to one logical CPU, a
+direct 4 KiB UDP test got 4,000/4,000 before and 3,999/4,000 after, at 94.27
+and 94.35 MiB/s of completed TCP background traffic. The latter run recorded
+one server bridge-credit drop; sampled kernel, QUIC DATAGRAM, reassembly and
+send MTU drop counters stayed zero. That run identifies a local bottleneck,
+not a reproducible regression or the cause of WAN losses. Measure the delay
+from Go consuming a datagram to Rust processing the returned credit before
+changing queue sizes. Logs: `build_assets/weak-server-20261119/udp-*.log`.

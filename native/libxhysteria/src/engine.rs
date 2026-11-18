@@ -16,7 +16,7 @@ use h3::quic::{RecvStream as _, SendStream as _};
 use quinn::{AsyncUdpSocket, Runtime};
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     ffi::c_void,
     future::poll_fn,
     io::{self, BufReader},
@@ -322,6 +322,7 @@ struct Bus {
     max_flows: usize,
     flow_window: usize,
     udp_credit_dropped: AtomicU64,
+    udp_send_mtu_dropped: AtomicU64,
     udp_reassembly_drops: Option<Arc<ReassemblyDrops>>,
     capacity: Option<ServerCapacity>,
     send_budget: Option<Arc<Semaphore>>,
@@ -693,10 +694,25 @@ impl Bus {
             .get(&id)
             .map(|flow| flow.receive_credit.clone());
         let Some(credit) = credit else { return Ok(()) };
+        self.udp_payload_with_credit(id, &credit, address, payloads)
+            .await
+    }
+
+    async fn udp_payload_with_credit<'a>(
+        &self,
+        id: u64,
+        credit: &Semaphore,
+        address: &[u8],
+        payloads: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
+    ) -> Result<()> {
         // An unread UDP session drops payloads instead of blocking other sessions.
-        let Ok(permit) = credit.try_acquire() else {
-            self.udp_credit_dropped.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+        let permit = match credit.try_acquire() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::Closed) => return Ok(()),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                self.udp_credit_dropped.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
         };
         permit.forget();
         if let Some(shared) = &self.shared {
@@ -1531,6 +1547,7 @@ async fn send_udp(
     session: u32,
     packet: u16,
     data: &[u8],
+    mtu_dropped: &AtomicU64,
 ) -> Result<()> {
     let (address, payload) = parse_address(data)?;
     let message = Message {
@@ -1541,13 +1558,57 @@ async fn send_udp(
         address,
         payload,
     };
-    let limit = connection.max_datagram_size().ok_or("peer disabled UDP")?;
-    for part in message.fragments(limit)? {
-        let mut wire = Vec::with_capacity(part.header_len()? + part.payload.len());
-        part.encode(&mut wire)?;
-        connection.send_datagram_wait(Bytes::from(wire)).await?;
+    if !queue_udp(
+        &message,
+        || connection.max_datagram_size(),
+        |wire| connection.send_datagram_wait(wire),
+    )
+    .await?
+    {
+        mtu_dropped.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
+}
+
+async fn queue_udp<SendResult>(
+    message: &Message<'_>,
+    mut max_size: impl FnMut() -> Option<usize>,
+    mut send: impl FnMut(Bytes) -> SendResult,
+) -> Result<bool>
+where
+    SendResult: std::future::Future<Output = std::result::Result<(), quinn::SendDatagramError>>,
+{
+    message.validate()?;
+    let header_len = message.header_len()?;
+    let minimum = header_len + message.payload.len().div_ceil(u8::MAX as usize);
+    let mut limit = max_size().ok_or("peer disabled UDP")?;
+    let mut retried = false;
+    'send: loop {
+        if limit < minimum {
+            break;
+        }
+        for (index, part) in message.fragments(limit)?.enumerate() {
+            let mut wire = Vec::with_capacity(header_len + part.payload.len());
+            part.encode(&mut wire)?;
+            match send(Bytes::from(wire)).await {
+                Ok(()) => (),
+                Err(quinn::SendDatagramError::TooLarge) => {
+                    if index == 0
+                        && !retried
+                        && let Some(smaller) = max_size().filter(|size| *size < limit)
+                    {
+                        limit = smaller;
+                        retried = true;
+                        continue 'send;
+                    }
+                    break 'send;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 async fn client_udp(
@@ -1598,7 +1659,7 @@ async fn server_udp(
 ) -> Result<()> {
     let start = Instant::now();
     let mut defrag = Defragger::new(8)?.with_stats(bus.udp_reassembly_drops.clone());
-    let mut sessions: HashMap<u32, (u64, Arc<AtomicU64>)> = HashMap::new();
+    let mut sessions: HashMap<u32, (u64, Arc<AtomicU64>, Arc<Semaphore>)> = HashMap::new();
     let mut tasks = JoinSet::new();
     let mut cleanup = tokio::time::interval(Duration::from_secs(1));
     cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1626,13 +1687,18 @@ async fn server_udp(
                     |datagram| (datagram.session, datagram.address.as_slice()),
                 );
                 let now_ns = start.elapsed().as_nanos() as u64;
-                let id = if let Some((id, activity)) = sessions.get(&session_id) {
-                    activity.store(now_ns, Ordering::Relaxed);
-                    *id
-                } else {
-                    if sessions.len() >= MAX_FLOWS { continue; }
+                let at_capacity = sessions.len() >= MAX_FLOWS;
+                let (id, _, receive_credit) = match sessions.entry(session_id) {
+                    Entry::Occupied(entry) => {
+                        let entry = entry.into_mut();
+                        if entry.2.is_closed() { continue; }
+                        entry.1.store(now_ns, Ordering::Relaxed);
+                        entry
+                    }
+                    Entry::Vacant(entry) => {
+                    if at_capacity { continue; }
                     let id = bus.next.fetch_add(1, Ordering::Relaxed);
-                    let Ok((mut commands, _)) = bus.register(id, owner).await else { continue };
+                    let Ok((mut commands, receive_credit)) = bus.register(id, owner).await else { continue };
                     let mut metadata = who.to_be_bytes().to_vec();
                     metadata.extend_from_slice(&owner.to_be_bytes());
                     metadata.extend_from_slice(&address_data(peer.as_bytes(), address)?);
@@ -1654,7 +1720,7 @@ async fn server_udp(
                                     if frame.kind != DATAGRAM { break; }
                                     activity.store(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                                     let _ = bus.writable(id, &mut credit).await;
-                                    if send_udp(&connection, session, packet, &frame.data).await.is_err() { break; }
+                                    if send_udp(&connection, session, packet, &frame.data, &bus.udp_send_mtu_dropped).await.is_err() { break; }
                                     packet = packet.wrapping_add(1);
                                 }
                                 _ = &mut expiry => {
@@ -1669,13 +1735,13 @@ async fn server_udp(
                         bus.done(id, Ok(())).await;
                         session
                     });
-                    sessions.insert(session_id, (id, session_activity));
-                    id
+                    entry.insert((id, session_activity, receive_credit))
+                    }
                 };
                 if let Some(datagram) = &assembled {
-                    bus.udp_payload_parts(id, address, datagram.payloads()).await?;
+                    bus.udp_payload_with_credit(*id, receive_credit, address, datagram.payloads()).await?;
                 } else {
-                    bus.udp_payload(id, address, message.payload).await?;
+                    bus.udp_payload_with_credit(*id, receive_credit, address, std::iter::once(message.payload)).await?;
                 }
             }
             _ = cleanup.tick(), if defrag.pending() != 0 => { defrag.expire(start.elapsed().as_nanos() as u64); }
@@ -1974,6 +2040,7 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
         max_flows: config.flow_limit(),
         flow_window: config.flow_window(),
         udp_credit_dropped: AtomicU64::new(0),
+        udp_send_mtu_dropped: AtomicU64::new(0),
         udp_reassembly_drops: config
             .diagnostic
             .then(|| Arc::new(ReassemblyDrops::default())),
@@ -2095,7 +2162,7 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
                             while let Some(command) = commands.recv().await {
                                 if command.kind != DATAGRAM { break; }
                                 bus.writable(id, &mut credit).await?;
-                                if send_udp(&connection, session, packet, &command.data).await.is_err() { break; }
+                                if send_udp(&connection, session, packet, &command.data, &bus.udp_send_mtu_dropped).await.is_err() { break; }
                                 packet = packet.wrapping_add(1);
                             }
                             sessions.lock().await.remove(&session);
@@ -2132,9 +2199,10 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
                 }
                 let dropped = bus.udp_credit_dropped.load(Ordering::Relaxed);
                 eprintln!(
-                    "[XRAY_NET_DIAG][XHYSTERIA] event=udp_bridge role={} credit_dropped_total={dropped} credit_dropped_delta={}",
+                    "[XRAY_NET_DIAG][XHYSTERIA] event=udp_bridge role={} credit_dropped_total={dropped} credit_dropped_delta={} send_mtu_dropped_total={}",
                     if config.server { "server" } else { "client" },
                     dropped.saturating_sub(previous_udp_credit_dropped),
+                    bus.udp_send_mtu_dropped.load(Ordering::Relaxed),
                 );
                 previous_udp_credit_dropped = dropped;
                 if let Some(stats) = &bus.udp_reassembly_drops {
@@ -2427,6 +2495,7 @@ mod tests {
             max_flows: config.flow_limit(),
             flow_window: config.flow_window(),
             udp_credit_dropped: AtomicU64::new(0),
+            udp_send_mtu_dropped: AtomicU64::new(0),
             udp_reassembly_drops: None,
             capacity: Some(ServerCapacity::new(&config)),
             send_budget: Some(Arc::new(Semaphore::new(8))),
@@ -2518,6 +2587,67 @@ mod tests {
         }
         assert!(commands.recv().await.is_none());
         assert!(bus.register(1, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn udp_mtu_retry_only_before_any_fragment_is_queued() {
+        for rejected in [0, 1] {
+            let payload = [7; 4096];
+            let message = Message {
+                session: 1,
+                packet: 2,
+                fragment: 0,
+                count: 1,
+                address: b"example.test:53",
+                payload: &payload,
+            };
+            let mut limits = [1400, 1200].into_iter();
+            let mut attempts = 0;
+            let mut accepted = Vec::new();
+            let queued = queue_udp(
+                &message,
+                || limits.next(),
+                |wire| {
+                    let result = if attempts == rejected {
+                        Err(quinn::SendDatagramError::TooLarge)
+                    } else {
+                        accepted.push(wire);
+                        Ok(())
+                    };
+                    attempts += 1;
+                    std::future::ready(result)
+                },
+            )
+            .await
+            .unwrap();
+            if rejected == 0 {
+                assert!(queued);
+                assert_eq!(accepted.len(), 4);
+                let mut defrag = Defragger::new(1).unwrap();
+                for wire in &accepted[..3] {
+                    assert!(wire.len() <= 1200);
+                    assert!(
+                        defrag
+                            .feed(0, &Message::decode(wire).unwrap())
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                assert_eq!(
+                    defrag
+                        .feed(0, &Message::decode(&accepted[3]).unwrap())
+                        .unwrap()
+                        .unwrap()
+                        .payload,
+                    payload
+                );
+            } else {
+                assert!(!queued);
+                assert_eq!(accepted.len(), 1);
+                assert_eq!(attempts, 2);
+                assert_eq!(limits.next(), Some(1200));
+            }
+        }
     }
 
     #[tokio::test]
@@ -2987,6 +3117,7 @@ mod tests {
             max_flows: 128,
             flow_window: 16,
             udp_credit_dropped: AtomicU64::new(0),
+            udp_send_mtu_dropped: AtomicU64::new(0),
             udp_reassembly_drops: None,
             capacity: None,
             send_budget: None,

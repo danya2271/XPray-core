@@ -235,6 +235,12 @@ func TestNativeServer500Users(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	t.Cleanup(cancel)
 	arguments := []string{executable, "-test.run=^TestNativeCapacityServerProcess$", "-test.timeout=90s"}
+	if cpu := os.Getenv("XHYS_CAPACITY_SERVER_CPU"); cpu != "" {
+		if _, err := strconv.ParseUint(cpu, 10, 31); err != nil {
+			t.Fatal("XHYS_CAPACITY_SERVER_CPU must be a single CPU number")
+		}
+		arguments = append([]string{"taskset", "-c", cpu}, arguments...)
+	}
 	if os.Getenv("XHYS_CAPACITY_SYSTEMD") == "1" {
 		arguments = append([]string{"systemd-run", "--user", "--quiet", "--scope", "--property=MemoryMax=1G", "--property=CPUQuota=100%"}, arguments...)
 	}
@@ -270,6 +276,9 @@ func TestNativeServer500Users(t *testing.T) {
 		input.Close()
 		if err := command.Wait(); err != nil {
 			t.Errorf("capacity server: %v\n%s", err, diagnostics.String())
+		}
+		if state := command.ProcessState; state != nil {
+			t.Logf("server_process_cpu_seconds=%.3f", (state.UserTime() + state.SystemTime()).Seconds())
 		}
 		if os.Getenv("XHYS_CAPACITY_DIAG") == "1" || os.Getenv("XHYS_CAPACITY_PROFILE") != "" {
 			t.Log(diagnostics.String())

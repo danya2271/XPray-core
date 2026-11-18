@@ -1665,3 +1665,24 @@ The higher tail persists at comparable achieved load; unequal saturation
 throughput is not the only explanation. These runs do not identify where
 the requests wait. No scheduler or buffer tuning changed in this pass.
 Raw logs are in `build_assets/loaded-latency-20261119/`.
+
+## 2026-11-19: Single-CPU Server and UDP MTU Handling
+
+`XHYS_CAPACITY_SERVER_CPU` pins only the server process to one logical CPU.
+The server uses one native worker and `GOMAXPROCS=1`; the load generator runs
+on separate CPUs. This is a local 1,000-session, 500 MiB duplex test, not a VPS
+CPU-quota or WAN simulation. CPU seconds include server startup, the transfer,
+heartbeats and teardown. Before is the median of two runs; final and Go each
+have one run. Two intermediate builds also passed (`capacity-B*.log`).
+
+| Metric | Native before | Native final | Go |
+| --- | ---: | ---: | ---: |
+| Duplex throughput, MiB/s | 149.35 | 147.27 | 49.48 |
+| Server process CPU, s | 4.468 | 4.469 | 14.850 |
+| Server peak RSS, MiB | 210.6 | 205.4 | 191.5 |
+| Heartbeat p99, ms | 4.68 | 2.87 | 29.48 |
+
+The final build uses roughly the same CPU as the native baseline. The sample
+size and baseline tail variation do not establish an RSS or p99 improvement.
+Against Go in this test, native delivers 2.98x throughput and uses 70% less
+CPU time, with 7.3% higher peak RSS. Raw logs: `build_assets/weak-server-20261119/`.
