@@ -379,14 +379,16 @@ func (b *sharedBridge) tryWriteBatch(batch []frame) (int, error) {
 		count = head - atomic.LoadUint32(b.word(128))
 	}
 	n := min(len(batch), sharedCapacity-int(count))
+	var sizes [sharedCapacity]int
 	for index := range n {
-		if batch[index].size() > maxFrame {
+		sizes[index] = batch[index].size()
+		if sizes[index] > maxFrame {
 			return 0, errors.New("oversized native command")
 		}
 	}
 	for i := range n {
 		f := batch[i]
-		size := f.size()
+		size := sizes[i]
 		offset := sharedHeader + int((head+uint32(i))&(sharedCapacity-1))*sharedStride
 		d := b.data[offset:]
 		kind := uint32(f.kind)
@@ -406,7 +408,11 @@ func (b *sharedBridge) tryWriteBatch(batch []frame) (int, error) {
 		binary.LittleEndian.PutUint32(d, kind)
 		binary.LittleEndian.PutUint32(d[4:], uint32(size))
 		binary.LittleEndian.PutUint64(d[8:], f.id)
-		if f.parts != nil {
+		if f.address != "" {
+			binary.BigEndian.PutUint16(payload, uint16(len(f.address)))
+			copy(payload[2:], f.address)
+			copy(payload[2+len(f.address):], f.data)
+		} else if f.parts != nil {
 			offset := 0
 			for _, part := range f.parts {
 				offset += copy(payload[offset:], part.Bytes())

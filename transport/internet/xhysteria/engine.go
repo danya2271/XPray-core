@@ -130,6 +130,7 @@ type frame struct {
 	kind     byte
 	id       uint64
 	data     []byte
+	address  string
 	storage  *buf.Buffer
 	parts    buf.MultiBuffer
 	borrowed bool
@@ -138,6 +139,9 @@ type frame struct {
 func (f *frame) size() int {
 	if f.parts != nil {
 		return int(f.parts.Len())
+	}
+	if f.address != "" {
+		return 2 + len(f.address) + len(f.data)
 	}
 	return len(f.data)
 }
@@ -148,6 +152,7 @@ func (f *frame) release() {
 		f.storage = nil
 	}
 	f.data = nil
+	f.address = ""
 	buf.ReleaseMulti(f.parts)
 	f.parts = nil
 }
@@ -1340,21 +1345,11 @@ func (c *Conn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if len(address) == 0 || len(address) > 2048 {
 			return errors.New("invalid native UDP address")
 		}
-		c.mu.Lock()
-		closedErr := c.err
-		c.mu.Unlock()
-		if closedErr != nil {
-			return closedErr
-		}
 		if err := c.awaitWriteCredit(); err != nil {
 			return err
 		}
 		if _, shared := c.engine.bridge.(*sharedBridge); shared {
-			header := buf.NewWithSize(int32(2 + len(address)))
-			binary.BigEndian.PutUint16(header.Extend(2), uint16(len(address)))
-			header.WriteString(address)
-			if err := c.sendFrame(frame{kind: datagramFrame, id: c.id, parts: buf.MultiBuffer{header, b}}); err != nil {
-				header.Release()
+			if err := c.sendFrame(frame{kind: datagramFrame, id: c.id, address: address, data: b.Bytes(), storage: b}); err != nil {
 				return err
 			}
 			mb[index] = nil

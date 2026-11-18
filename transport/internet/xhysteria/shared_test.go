@@ -527,6 +527,38 @@ func TestSharedBorrowedWriteAndVectoredPartsCopyOnlyIntoDestination(t *testing.T
 	}
 }
 
+func TestSharedQueuedUDPWritePreservesAddressAndReleasesPayload(t *testing.T) {
+	bridge := testSharedBridge(t)
+	engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame, 16)}
+	connection := newConn(engine, 1, xnet.UDPDestination(xnet.LocalHostIP, 53), nil)
+	atomic.StoreUint32(bridge.word(64), sharedCapacity)
+	var releases int
+	payload := buf.FromBytesWithRelease([]byte("queued UDP"), func() { releases++ })
+	target := xnet.UDPDestination(xnet.LocalHostIP, 5353)
+	payload.UDP = &target
+	datagram := buf.MultiBuffer{payload}
+	if err := connection.WriteMultiBuffer(datagram); err != nil {
+		t.Fatal(err)
+	}
+	queued := <-engine.out
+	if datagram[0] != nil || releases != 0 {
+		t.Fatal("UDP payload ownership was not transferred to the queue")
+	}
+	atomic.StoreUint32(bridge.word(128), sharedCapacity)
+	if err := bridge.writeBatch([]frame{queued}); err != nil {
+		t.Fatal(err)
+	}
+	queued.release()
+	descriptor := bridge.data[sharedHeader:]
+	slot := int(binary.LittleEndian.Uint32(descriptor) >> 16)
+	size := int(binary.LittleEndian.Uint32(descriptor[4:]))
+	offset := sharedRingBytes + slot*sharedPayloadSize
+	address, contents, err := decodeAddress(bridge.data[offset : offset+size])
+	if err != nil || string(address) != target.NetAddr() || string(contents) != "queued UDP" || releases != 1 {
+		t.Fatalf("queued UDP changed: %q %q %v, releases=%d", address, contents, err, releases)
+	}
+}
+
 func TestSharedQueuedBorrowedWriteTakesSnapshotAndReleasesOnClose(t *testing.T) {
 	bridge := testSharedBridge(t)
 	engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame, 16), flows: make(map[uint64]*Conn)}

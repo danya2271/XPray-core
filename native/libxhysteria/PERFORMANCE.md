@@ -1716,3 +1716,28 @@ Go queued-publication path. At a 64 MiB/s offered rate, native p99 rose from
 measured 470.45 µs at 63.94 MiB/s. The experiment was reverted.
 
 Raw logs are in `build_assets/udp-credit-20261119/`.
+
+## 2026-11-19 Direct UDP Header Encoding
+
+The shared bridge writes the UDP address length and address directly into
+the arena. This removes the temporary Go header buffer and two-element
+vector. The command publisher also reuses the validated frame sizes for
+publication. UDP writes now rely on the existing error check when acquiring
+write credit instead of taking the connection mutex for a duplicate check.
+The Go frame gains a string field, which adds 16 bytes per frame on amd64.
+
+Single-CPU loopback with `GOMAXPROCS=1` and the header mask used native
+ABBA order with two seconds per sample and one Go reference. The native
+columns show medians of two samples each.
+
+| Metric | Native before | Native after | Go |
+| --- | ---: | ---: | ---: |
+| 4 KiB UDP echo throughput, MB/s | 38.49 | 39.13 | 32.54 |
+| 4 KiB echo process CPU, µs/op | 196.39 | 192.86 | 236.22 |
+| 4 KiB echo Go allocation bytes/op | 785.5 | 609 | 57,689 |
+| 4 KiB echo Go allocations/op | 31 | 25 | 149 |
+| UDP latency benchmark p99, µs | 213.9 | 205.2 | 151.7 |
+
+The separate mixed-load smoke test delivered 4,000/4,000 4 KiB UDP
+datagrams at 154.69 MiB/s of TCP background traffic with zero sampled
+kernel UDP drops. Raw logs are in `build_assets/udp-header-20261119/`.
