@@ -341,3 +341,21 @@ send MTU drop counters stayed zero. That run identifies a local bottleneck,
 not a reproducible regression or the cause of WAN losses. Measure the delay
 from Go consuming a datagram to Rust processing the returned credit before
 changing queue sizes. Logs: `build_assets/weak-server-20261119/udp-*.log`.
+
+### Bounded shared-server credit retry
+
+On the shared server path, UDP delivery yields once when no receive credit
+is available and then retries. This gives the command task a chance to apply
+an outstanding credit. A flow that still has no credit drops the datagram.
+The retry adds no queue slots or timer. `credit_recovered_total` counts
+successful retries. Inline credit frames use static bytes so Rust can consume
+them without a per-frame payload allocation.
+
+On one logical CPU with direct 4 KiB UDP and four background TCP streams,
+both revisions received 8,000/8,000 at about 94 MiB/s. At saturation the
+baseline received 4,399/4,400 at 148–151 MiB/s with one server credit drop.
+The retry-only build received 4,400/4,400 at 147–150 MiB/s and recorded no
+recoveries. A separate run of the final build received 4,000/4,000 at
+150.92 MiB/s with one server credit recovery and zero sampled drops. The
+recovery confirms that a credit can arrive during the yield. Production
+loss rates still require measurements from the affected paths.

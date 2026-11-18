@@ -48,7 +48,8 @@ const INCOMING_TCP: u8 = 8;
 const INCOMING_UDP: u8 = 9;
 const ERROR: u8 = 10;
 const READY: u8 = 11;
-const CREDIT: u8 = 13;
+pub(crate) const CREDIT: u8 = 13;
+pub(crate) static CREDIT_COUNTS: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 const WRITABLE: u8 = 14;
 const AUTH_REQUEST: u8 = 15;
 const AUTH_RESPONSE: u8 = 16;
@@ -322,6 +323,7 @@ struct Bus {
     max_flows: usize,
     flow_window: usize,
     udp_credit_dropped: AtomicU64,
+    udp_credit_recovered: AtomicU64,
     udp_send_mtu_dropped: AtomicU64,
     udp_reassembly_drops: Option<Arc<ReassemblyDrops>>,
     capacity: Option<ServerCapacity>,
@@ -705,8 +707,18 @@ impl Bus {
         address: &[u8],
         payloads: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
     ) -> Result<()> {
-        // An unread UDP session drops payloads instead of blocking other sessions.
-        let permit = match credit.try_acquire() {
+        let mut attempt = credit.try_acquire();
+        if matches!(attempt, Err(tokio::sync::TryAcquireError::NoPermits))
+            && self.capacity.is_some()
+            && self.shared.is_some()
+        {
+            tokio::task::yield_now().await;
+            attempt = credit.try_acquire();
+            if attempt.is_ok() {
+                self.udp_credit_recovered.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let permit = match attempt {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::Closed) => return Ok(()),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
@@ -753,11 +765,10 @@ impl Bus {
         while total >= self.flow_window / 2 {
             let count = total.min(self.flow_window);
             total -= count;
-            static CREDITS: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
             self.send(Frame::new(
                 WRITABLE,
                 id,
-                Bytes::from_static(&CREDITS[count..count + 1]),
+                Bytes::from_static(&CREDIT_COUNTS[count..count + 1]),
             ))
             .await?;
         }
@@ -2040,6 +2051,7 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
         max_flows: config.flow_limit(),
         flow_window: config.flow_window(),
         udp_credit_dropped: AtomicU64::new(0),
+        udp_credit_recovered: AtomicU64::new(0),
         udp_send_mtu_dropped: AtomicU64::new(0),
         udp_reassembly_drops: config
             .diagnostic
@@ -2199,10 +2211,11 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
                 }
                 let dropped = bus.udp_credit_dropped.load(Ordering::Relaxed);
                 eprintln!(
-                    "[XRAY_NET_DIAG][XHYSTERIA] event=udp_bridge role={} credit_dropped_total={dropped} credit_dropped_delta={} send_mtu_dropped_total={}",
+                    "[XRAY_NET_DIAG][XHYSTERIA] event=udp_bridge role={} credit_dropped_total={dropped} credit_dropped_delta={} send_mtu_dropped_total={} credit_recovered_total={}",
                     if config.server { "server" } else { "client" },
                     dropped.saturating_sub(previous_udp_credit_dropped),
                     bus.udp_send_mtu_dropped.load(Ordering::Relaxed),
+                    bus.udp_credit_recovered.load(Ordering::Relaxed),
                 );
                 previous_udp_credit_dropped = dropped;
                 if let Some(stats) = &bus.udp_reassembly_drops {
@@ -2495,6 +2508,7 @@ mod tests {
             max_flows: config.flow_limit(),
             flow_window: config.flow_window(),
             udp_credit_dropped: AtomicU64::new(0),
+            udp_credit_recovered: AtomicU64::new(0),
             udp_send_mtu_dropped: AtomicU64::new(0),
             udp_reassembly_drops: None,
             capacity: Some(ServerCapacity::new(&config)),
@@ -2648,6 +2662,38 @@ mod tests {
                 assert_eq!(limits.next(), Some(1200));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shared_server_udp_rechecks_credit_once_without_growing_queue() {
+        let mut bus = capacity_bus();
+        let bridge = shared::Bridge::new().unwrap();
+        bus.shared = Some(bridge.clone());
+        let (_commands, credit) = bus.register(1, 1).await.unwrap();
+        let window = credit.available_permits();
+        credit.acquire_many(window as u32).await.unwrap().forget();
+
+        let pending = bus.udp_payload(1, b"target", b"recovered");
+        tokio::pin!(pending);
+        assert!(
+            poll_fn(|cx| {
+                use std::future::Future;
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        assert!(bridge.pop(false).unwrap().is_none());
+        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])));
+        pending.await.unwrap();
+        let (kind, id, data) = bridge.pop(false).unwrap().unwrap();
+        assert_eq!((kind, id), (DATAGRAM, 1));
+        assert_eq!(parse_address(&data).unwrap().1, b"recovered");
+        assert_eq!(credit.available_permits(), 0);
+
+        bus.udp_payload(1, b"target", b"dropped").await.unwrap();
+        assert!(bridge.pop(false).unwrap().is_none());
+        assert_eq!(bus.udp_credit_recovered.load(Ordering::Relaxed), 1);
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -3117,6 +3163,7 @@ mod tests {
             max_flows: 128,
             flow_window: 16,
             udp_credit_dropped: AtomicU64::new(0),
+            udp_credit_recovered: AtomicU64::new(0),
             udp_send_mtu_dropped: AtomicU64::new(0),
             udp_reassembly_drops: None,
             capacity: None,

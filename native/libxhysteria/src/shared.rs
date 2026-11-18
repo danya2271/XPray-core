@@ -3,7 +3,10 @@
 //! The Go peer uses aligned 32-bit atomics over this little-endian storage ABI.
 //! Payload leases outlive descriptor consumption; release returns independent slots.
 
-use crate::h3_transport::Result;
+use crate::{
+    engine::{CREDIT, CREDIT_COUNTS},
+    h3_transport::Result,
+};
 use bytes::Bytes;
 use std::{
     io,
@@ -366,7 +369,16 @@ impl Bridge {
                 len,
             })
         } else {
-            Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(slot.add(16), len) })
+            let payload = unsafe { std::slice::from_raw_parts(slot.add(16), len) };
+            match payload {
+                [credit]
+                    if kind == u32::from(CREDIT) && usize::from(*credit) < CREDIT_COUNTS.len() =>
+                {
+                    let index = usize::from(*credit);
+                    Bytes::from_static(&CREDIT_COUNTS[index..index + 1])
+                }
+                _ => Bytes::copy_from_slice(payload),
+            }
         };
         tail.store(index.wrapping_add(1), Ordering::SeqCst);
         Ok(Some((kind as u8, id, data)))
@@ -481,6 +493,21 @@ impl Drop for Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popped_credit_counts_use_static_storage_without_changing_other_payloads() {
+        let bridge = Bridge::new().unwrap();
+        for credit in CREDIT_COUNTS {
+            assert!(bridge.push(true, CREDIT, 17, &[credit]).unwrap());
+            let (kind, id, data) = bridge.pop(true).unwrap().unwrap();
+            assert_eq!((kind, id, data.as_ref()), (CREDIT, 17, &[credit][..]));
+            assert_eq!(data.as_ptr(), CREDIT_COUNTS[usize::from(credit)..].as_ptr());
+        }
+        for (kind, payload) in [(CREDIT, &[255][..]), (CREDIT, &[1, 2][..]), (5, &[2][..])] {
+            assert!(bridge.push(true, kind, 17, payload).unwrap());
+            assert_eq!(bridge.pop(true).unwrap().unwrap().2.as_ref(), payload);
+        }
+    }
 
     #[test]
     fn arena_is_zeroed_aligned_and_released_with_last_payload() {

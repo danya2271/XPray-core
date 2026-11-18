@@ -1686,3 +1686,33 @@ The final build uses roughly the same CPU as the native baseline. The sample
 size and baseline tail variation do not establish an RSS or p99 improvement.
 Against Go in this test, native delivers 2.98x throughput and uses 70% less
 CPU time, with 7.3% higher peak RSS. Raw logs: `build_assets/weak-server-20261119/`.
+
+## 2026-11-19: Shared UDP Credit Retry
+
+The same 1,000-session test ran in native ABBA order with one Go reference
+run. The native columns are medians of two runs each.
+
+| Metric | Native before | Native with credit changes | Go |
+| --- | ---: | ---: | ---: |
+| Duplex throughput, MiB/s | 148.20 | 150.13 | 50.51 |
+| Server CPU time, s | 4.493 | 4.409 | 14.501 |
+| Server peak RSS, MiB | 204.7 | 207.2 | 193.3 |
+| Heartbeat p99, ms | 2.90 | 2.95 | 32.06 |
+
+The samples show similar native capacity before and after the credit
+changes. The final native build transfers 2.97× as fast as Go in this
+single-CPU server test with 70% less CPU time and 7.2% higher peak RSS.
+
+In the four-CPU header-mask loopback test, native upload was 350.37 →
+350.55 MB/s and download was 291.70 → 323.32 MB/s. The Go reference was
+179.84 MB/s upload and 179.04 MB/s download. Download varied across native
+runs. At a 125 MiB/s offered background rate, TCP p99 was 890.35 → 922.50 µs
+for native and 668.15 µs for Go. Native achieved 123.0 → 120.4 MiB/s and Go
+achieved 125.0 MiB/s. These samples show no TCP tail-latency gain.
+
+A separate ABBA experiment removed the early eventfd notification on the
+Go queued-publication path. At a 64 MiB/s offered rate, native p99 rose from
+613.0 to 693.7 µs while achieved load fell from 63.01 to 62.42 MiB/s. Go
+measured 470.45 µs at 63.94 MiB/s. The experiment was reverted.
+
+Raw logs are in `build_assets/udp-credit-20261119/`.
