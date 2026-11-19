@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/grpc/encoding"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"google.golang.org/grpc"
@@ -58,6 +59,9 @@ func (l Listener) Addr() net.Addr {
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, settings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
+	if listener := handoff.TCPListenerFromContext(ctx); listener != nil {
+		return ServeListener(ctx, listener, settings, handler), nil
+	}
 	var addr net.Addr
 	if port == 0 {
 		addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}

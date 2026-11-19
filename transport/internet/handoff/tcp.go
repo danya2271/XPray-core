@@ -40,6 +40,10 @@ func ImportTCPListener(file *os.File) (*TCPListener, error) {
 		l.Close()
 		return nil, errors.New("handoff descriptor is not a TCP listener")
 	}
+	if err := validateListeningSocket(tcp); err != nil {
+		tcp.Close()
+		return nil, err
+	}
 	return NewTCPListener(tcp, false), nil
 }
 
