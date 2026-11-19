@@ -1950,3 +1950,240 @@ was 3.011 → 6.351 ms and an exploratory sample spiked higher. See
 for full counts, resource scope, individual latency ranges, strict assertions,
 reproduction instructions and limitations. The new deterministic regression
 test fails on the old one-yield implementation and passes with the wait.
+
+## 2026-11-20: Accounting Overhead Follow-up
+
+A six-second, four-CPU profile of the real direct-mask parallel-connections
+fixture used `perf record -e cpu-clock -F 199 --call-graph dwarf,8192` plus a
+Go CPU profile. The perf user-space samples attributed 11.39% to the main
+AES-GCM assembly routine, 3.66% to BLAKE2b compression, 3.30% to Go memmove,
+and 1.43% to the direct-mask receive wrapper. These are sampled user-space
+costs, not percentages of whole-process CPU including kernel work. No
+security feature or wire masking was disabled to improve the measurements.
+
+Two small changes remain in the final source:
+
+* A successful server receive-window expansion records an atomic boolean.
+  Later receives skip the internal expansion byte counter and its periodic
+  reservation mutex. The pre-expansion path still acquires both listener and
+  process reservations before expanding. Reservations remain held until
+  connection teardown. Traffic statistics and loss counters are unaffected.
+  This adds one flag per connection, not another queue or payload allocation.
+* The Go native writer measures `MultiBuffer.Len()` only when a traffic counter
+  is attached. Without a counter, it avoids another traversal of the payload
+  buffer list. With a counter, the byte count is still captured before the
+  underlying writer consumes/releases the buffers and added only on success.
+
+The earlier two-millisecond UDP credit grace, receive/send budgets, upload
+fairness scheduling, pool sizes, masks and protocol framing are unchanged.
+
+### Rejected Experiments
+
+Fusing the final Salamander XOR with prefix compaction passed its correctness
+tests, including overlapping buffers, nested masks and key alignment. Its
+short ABBA runs did not show a consistent CPU or bulk-throughput advantage;
+it was removed. The original receive decoder and its payload move remain.
+
+Removing the pre-publication Go-to-Rust wake also passed the ordering and race
+tests. Combined with the receive-window flag, however, a three-sample rotating
+comparison measured four-CPU parallel throughput of 478.19 → 476.31 MB/s,
+CPU of 924.27 → 929.29 microseconds/exchange, and one-CPU paced p99 of
+946.7 → 1,039 microseconds. That trial was rejected. Early notifications and
+their original error handling remain in the Go adapter. Those measurements
+do not isolate the wake removal from the receive-window flag.
+
+All trial binaries, patches, profiles and raw logs are retained under ignored
+`build_assets/latency-overhead-20261120/` and
+`build_assets/mask-send-20261119/`. The final source binary is
+`accounting-tail-20261120.test`; `rx-compact-20261120.test`,
+`overhead-final-20261120.test`, `accounting-final-20261120.test` and
+`yield-window-20261120.test` name rejected
+experiments, not the final source.
+
+### Rejected Empty-Queue Yield Trial
+
+Another trial skipped the explicit TCP upload fairness yield when no pending
+command or queued upload supplied more work. It retained the accumulated
+budget until work was ready. Although it improved some small parallel samples,
+the full comparison below did not establish a consistent latency or capacity
+benefit. It was removed. The following tables and `yield-*`/`capacity-*` logs
+describe that rejected trial, not the final accounting-only source.
+
+The baseline is `08291cb8`, including the UDP credit fix. Both binaries use
+the same harness and release settings. Three fresh-process samples per
+before/after/Go mode rotate order for each scenario. Affinity is logical CPU
+14 for one CPU and 14–17 for four. All use the real direct Salamander plus
+WireGuard-header chain. The parallel fixture has 16 independent native client
+engines and exactly 8,192 exchanges of 64 KiB in each direction. Latency
+samples run for three seconds with four background TCP echo streams, either
+paced at 32 MiB/s or saturated. No other benchmark from this investigation
+runs concurrently. Unrelated host activity is not controlled.
+
+| Metric, median of three | Native before | Native after | Go |
+| --- | ---: | ---: | ---: |
+| Four CPUs, parallel echo, MB/s | 459.64 | 467.99 | 234.66 |
+| Four CPUs, parallel CPU, µs/exchange | 954.48 | 938.87 | 1,955.82 |
+| Four CPUs, parallel whole-process peak RSS, MiB | 72.38 | 68.46 | 43.05 |
+| Four CPUs, paced TCP RTT p50, µs | 137.2 | 134.7 | 112.6 |
+| Four CPUs, paced TCP RTT p99, µs | 489.5 | 510.0 | 372.2 |
+| Four CPUs, saturated TCP RTT p99, µs | 1,768 | 1,757 | 990.9 |
+| Four CPUs, saturated background, MiB/s | 301.6 | 312.1 | 228.8 |
+| One CPU, paced TCP RTT p99, µs | 886.8 | 878.8 | 1,018 |
+| One CPU, saturated TCP RTT p99, µs | 4,050 | 4,059 | 6,277 |
+| One CPU, saturated background, MiB/s | 159.3 | 160.2 | 91.34 |
+
+Parallel throughput is 1.8% higher with 1.6% less process CPU per exchange;
+the individual throughput ranges overlap (456.76–467.37 before and
+454.79–470.80 after). This is a small measured change, not proof of a general
+speedup. Native is approximately twice Go's throughput in this fixture and
+uses about 52% less CPU per exchange, but still has substantially higher RSS.
+The before/after RSS samples include native allocators, Go, all endpoints and
+setup/teardown. Their median reduction is not a reduction in queue budgets or
+a guaranteed deployment memory saving.
+
+Paced four-CPU background medians are 31.39/31.38/31.96 MiB/s for
+before/after/Go. One-CPU paced medians are 31.96/31.97/31.96 MiB/s. The small
+one-CPU p99 reduction and four-CPU p99 increase do not establish a uniform
+latency benefit. Saturated Go has lower achieved background load, so its p99
+is not an equal-load latency comparison. Under four-CPU paced load Go remains
+faster at both p50 and p99. These results did not justify retaining the
+scheduling change.
+
+#### Rejected Trial UDP Loss Checks
+
+With `XHYS_LOSS_REQUIRE_ZERO=1`, that trial received 20,000/20,000
+application replies: two paced cascade runs, one saturated cascade, one
+one-CPU cascade and one direct run, each with 2,000 packets at each of 256 B
+and 4 KiB. This includes 16,000/16,000 through the cascade. Sampled owned
+kernel socket drops and duplicates are zero in all ten scenarios. The two
+four-CPU paced cascade runs deliver approximately 125–126 MiB/s background;
+the saturated cascade delivers 178–180 MiB/s, and the one-CPU paced cascade
+delivers approximately 31.6 MiB/s. The UDP fairness/credit changes from the
+previous section remain active.
+
+These are local loopback checks, not a lossless WAN guarantee. UDP p99 still
+has outliers: the saturated 256-byte case measured 13.47 ms. Eliminating
+unnecessary yields and receive-accounting atomics does not eliminate those
+load-dependent delays. Raw `yield-*.log`/`.rss`, `loss-*.log` and scripts in
+the artifact directory preserve every sample, including rejected trials.
+
+#### Rejected Trial Single-CPU Server Capacity Check
+
+The existing 500-user/1,000-session fixture pins its server subprocess to
+logical CPU 14 with `GOMAXPROCS=1`, one native server worker and
+`GOMEMLIMIT=128MiB`. The client/load generator shares the broader 14–17
+affinity. There is no 1 GiB cgroup limit in this run. Each session transfers
+256 KiB in each direction, followed by twelve rounds of heartbeat exchanges.
+
+An initial baseline run without diagnostics failed with a session write
+timeout; its log is retained as `capacity-before.log`. A candidate run and
+an immediately subsequent baseline repeat, both with diagnostics enabled,
+completed all 1,000 sessions and 500 MiB of aggregate payload:
+
+| Single sample | Baseline repeat | Candidate |
+| --- | ---: | ---: |
+| Server peak RSS, MiB | 210.2 | 210.9 |
+| Server process CPU, seconds | 4.228 | 4.537 |
+| Transfer rate, MiB/s | 160.19 | 150.79 |
+| Heartbeat RTT p99, µs | 2,509.5 | 3,397.6 |
+
+This is capacity smoke coverage, not evidence of a many-session performance
+improvement. The candidate is slower in these individual samples. Neither
+the transient baseline failure nor its cause is fixed or ruled out by the
+successful repetitions. Logs: `capacity-final.log` and
+`capacity-before-diag.log`. Memory figures describe the server process, not
+the whole node, sockets/cgroup memory or an Android deployment.
+
+A subsequent ABBA repeat produced three successful samples per mode in total.
+Median before/trial transfer was 158.80/152.46 MiB/s, server CPU
+4.253/4.373 seconds, heartbeat p99 2,529.9/2,575.1 microseconds. Their ranges
+overlap, but there is no capacity benefit to offset the changed scheduling.
+These checks motivated restoring the original upload yield. The raw repeat
+logs are `capacity-repeat-{1,4}-before.log` and
+`capacity-repeat-{2,3}-final.log`.
+
+### Final Accounting Source
+
+The final source retains the receive-window completion flag and an early
+return from `nativeWriter.WriteMultiBuffer` when no counter is attached.
+The counter-enabled path has the original snapshot-before-write semantics.
+The initial form that conditionally calculated a length and then rechecked
+the counter after the write was rejected: longer-volume ABBA measured
+484.46 → 471.53 MB/s and 923.82 → 947.26 µs process CPU per exchange.
+Rust formatting, Clippy and engine unit checks overlapped part of that
+rejected trial, so the difference cannot be attributed solely to the counter
+form. The source uses a single no-counter branch and delegates immediately.
+
+An isolated receive-window-flag-only ABBA, also using 32,768 exchanges and
+16 independent native engines on CPUs 14–17, measured 490.65 → 494.00 MB/s
+and 911.97 → 905.16 µs process CPU per exchange. The approximately 0.7%
+difference is too small to establish a general performance improvement.
+Logs are `volume-*` for the rejected counter form and `isolate-*` for the
+flag-only check. No original decoder, early wake or fairness-yield change
+from the rejected experiments is present in the final source.
+
+For the final early-return form, a 32,768-exchange ABBA uses two fresh
+before and two fresh after processes on CPUs 14–17, each with 16 native
+client engines. The pair medians are:
+
+| Final source, longer-volume check | Before | After |
+| --- | ---: | ---: |
+| Parallel echo, MB/s | 488.59 | 488.50 |
+| Process CPU, µs/exchange | 913.39 | 913.93 |
+| Whole-process peak RSS, MiB | 70.31 | 73.03 |
+| Go allocations/exchange | 101 | 101 |
+
+Bulk throughput and CPU are effectively unchanged; this does not support
+a speedup claim. Peak RSS did not decrease. The structural accounting
+changes add no payload storage or queue capacity, but whole-process allocator
+high-water marks can vary and must not be described as a memory reduction.
+No other test/build from this investigation ran during the final ABBA;
+unrelated host activity remains uncontrolled. Logs are `tailvolume-*`.
+
+Three rotating before/after/Go fresh-process samples of the final source
+measure paced latency with four background TCP streams and 32 MiB/s offered
+load, three seconds each:
+
+| Final source, median of three | Before | After | Go |
+| --- | ---: | ---: | ---: |
+| Four CPUs, TCP RTT p50, µs | 142.3 | 141.3 | 118.7 |
+| Four CPUs, TCP RTT p99, µs | 495.4 | 512.6 | 388.3 |
+| Four CPUs, achieved background, MiB/s | 31.98 | 30.91 | 31.97 |
+| One CPU, TCP RTT p50, µs | 167.0 | 163.7 | 87.72 |
+| One CPU, TCP RTT p99, µs | 969.6 | 930.8 | 1,076 |
+| One CPU, achieved background, MiB/s | 31.77 | 31.98 | 31.95 |
+
+The one-CPU p99 is 4.0% lower in this series, but the four-CPU p99 is 3.5%
+higher at lower achieved load. A uniform latency benefit is not established.
+Go still has substantially lower p50 on both, and lower p99 on four CPUs.
+These results justify only the narrow removal of known accounting work;
+they do not mean the load-dependent latency problem is solved. Logs are
+`tailfinal-*`; no other tests from this investigation ran during those
+latency samples. No WAN or remote-server measurement is claimed.
+
+The final source also passes the strict 20,000/20,000-reply matrix described
+above, including 16,000/16,000 through a cascade, with zero sampled owned UDP
+socket drops or duplicates. This is a separate rerun after the scheduling
+experiments were reverted; logs use `accounting-loss-*`. Actual background
+traffic is 123–126 MiB/s in the four-CPU paced cascade samples, 171–173 MiB/s
+at saturation, and approximately 31.7 MiB/s in the one-CPU cascade sample.
+UDP p99 is still variable: a paced 256-byte cascade sample reached 14.736 ms
+while receiving all 2,000 replies. Zero sampled losses do not establish a
+load-latency fix.
+
+A final accounting-only 1,000-session capacity check also completes all
+sessions, the 500 MiB transfer and heartbeats with a single-CPU server.
+Server peak RSS is 211.7 MiB, process CPU 4.492 seconds, transfer 147.14 MiB/s,
+and heartbeat p99 2,551.4 µs. This single capacity smoke sample remains slower
+than the baseline repetition medians and is not evidence of an improvement
+for large session counts. It uses the same diagnostics-enabled setup without
+a cgroup memory ceiling. Log: `accounting-capacity.log`.
+
+The final source passes both 96-test Rust engine/allocation-profile suites,
+Clippy with warnings denied, formatting, all 140 mask interoperability cases,
+both shared/socket cascade port-hopping cases, and Go race tests for
+`proxy/hysteria`, `transport/internet/xhysteria` and
+`transport/internet/hysteria`. Linux server and Android arm64/API 26 binaries
+were rebuilt. Android execution was not tested. Local linking again used
+temporary archive LLVM-bitcode section removal with backup/EXIT restoration;
+this is a local toolchain workaround, not a source-level build change.

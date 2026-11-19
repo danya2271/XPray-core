@@ -25,7 +25,7 @@ use std::{
     os::unix::net::{UnixDatagram, UnixStream},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -458,12 +458,16 @@ struct ReceiveWindow {
     budget: Arc<Semaphore>,
     process_budget: Arc<Semaphore>,
     received: AtomicU64,
+    expanded: AtomicBool,
     streams: AtomicU32,
     reservation: std::sync::Mutex<Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>>,
 }
 
 impl ReceiveWindow {
     fn observe(&self, bytes: usize) {
+        if self.expanded.load(Ordering::Relaxed) {
+            return;
+        }
         let previous = self.received.fetch_add(bytes as u64, Ordering::Relaxed);
         if previous / u64::from(SERVER_RECEIVE_WINDOW)
             == (previous + bytes as u64) / u64::from(SERVER_RECEIVE_WINDOW)
@@ -484,6 +488,7 @@ impl ReceiveWindow {
             *reservation = Some((listener_permit, process_permit));
             self.connection
                 .set_receive_window(SERVER_BULK_WINDOW.into());
+            self.expanded.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -1771,6 +1776,7 @@ async fn serve(
             .process_receive_budget
             .clone(),
         received: AtomicU64::new(0),
+        expanded: AtomicBool::new(false),
         streams: AtomicU32::new(0),
         reservation: std::sync::Mutex::new(None),
     });
