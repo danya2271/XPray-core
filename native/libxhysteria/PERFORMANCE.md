@@ -1923,3 +1923,30 @@ taskset -c 14-17 interop.test -test.run '^$' \
   -test.bench '^BenchmarkNativePacketParallelConnections$/native$' \
   -test.benchtime 8192x -test.cpu 4 -test.count 1
 ```
+
+## 2026-11-20: Bounded Shared-Server UDP Credit Wait
+
+Cascade sequence tracing confirmed shared-server receive-credit exhaustion:
+datagrams arrived on the first QUIC leg but were discarded before the second
+leg's sender. The existing one-yield retry could resume before Go returned
+the credit. An exhausted-credit delivery now awaits the semaphore with a
+two-millisecond timeout budget. The normal path and all queue sizes remain
+unchanged. Flow closure wakes the waiter; a genuinely unread flow still drops
+on timeout. Other UDP sessions on that connection can experience the bounded
+wait, so this change is not a general latency optimization.
+
+Three rotating fresh-process before/after/Go cascade comparisons at 128 MiB/s
+offered background load lost 7/12,000 replies before and zero after and on Go.
+Median native process CPU was 57.575 → 57.605 seconds per 24-second fixture;
+peak RSS was 51.80 → 51.01 MiB, with overlapping ranges. A saturated cascade
+received 4,000/4,000 at 180–182 MiB/s native versus 145–150 MiB/s Go. Native
+also received 4,000/4,000 on one CPU at 32 MiB/s offered background; Go missed
+70/4,000 there and reported kernel UDP drops. Including direct controls,
+the fixed-native validation delivered 24,000/24,000 replies.
+
+Do not infer a uniform tail-latency improvement: the matched 4 KiB median p99
+was 3.011 → 6.351 ms and an exploratory sample spiked higher. See
+[PACKET_LOSS.md](PACKET_LOSS.md#shared-server-credit-grace-november-20-2026)
+for full counts, resource scope, individual latency ranges, strict assertions,
+reproduction instructions and limitations. The new deterministic regression
+test fails on the old one-yield implementation and passes with the wait.

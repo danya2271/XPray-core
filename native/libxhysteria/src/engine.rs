@@ -688,8 +688,11 @@ impl Bus {
             && self.capacity.is_some()
             && self.shared.is_some()
         {
-            tokio::task::yield_now().await;
-            attempt = credit.try_acquire();
+            attempt = match tokio::time::timeout(Duration::from_millis(2), credit.acquire()).await {
+                Ok(Ok(permit)) => Ok(permit),
+                Ok(Err(_)) => Err(tokio::sync::TryAcquireError::Closed),
+                Err(_) => Err(tokio::sync::TryAcquireError::NoPermits),
+            };
             if attempt.is_ok() {
                 self.udp_credit_recovered.fetch_add(1, Ordering::Relaxed);
             }
@@ -2655,7 +2658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_server_udp_rechecks_credit_once_without_growing_queue() {
+    async fn shared_server_udp_waits_for_returned_credit_without_growing_queue() {
         let mut bus = capacity_bus();
         let bridge = shared::Bridge::new().unwrap();
         bus.shared = Some(bridge.clone());
@@ -2670,13 +2673,15 @@ mod tests {
             std::iter::once(b"recovered".as_slice()),
         );
         tokio::pin!(pending);
-        assert!(
-            poll_fn(|cx| {
-                use std::future::Future;
-                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
-            })
-            .await
-        );
+        for _ in 0..2 {
+            assert!(
+                poll_fn(|cx| {
+                    use std::future::Future;
+                    std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+                })
+                .await
+            );
+        }
         assert!(bridge.pop(false).unwrap().is_none());
         bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])));
         pending.await.unwrap();
@@ -2696,6 +2701,37 @@ mod tests {
         assert!(bridge.pop(false).unwrap().is_none());
         assert_eq!(bus.udp_credit_recovered.load(Ordering::Relaxed), 1);
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_server_udp_credit_wait_stops_when_flow_closes() {
+        let mut bus = capacity_bus();
+        let bridge = shared::Bridge::new().unwrap();
+        bus.shared = Some(bridge.clone());
+        let (_commands, credit) = bus.register(1, 1).await.unwrap();
+        let window = credit.available_permits();
+        credit.acquire_many(window as u32).await.unwrap().forget();
+        let pending = bus.udp_payload_with_credit(
+            1,
+            &credit,
+            b"target",
+            std::iter::once(b"closed".as_slice()),
+        );
+        tokio::pin!(pending);
+        assert!(
+            poll_fn(|cx| {
+                use std::future::Future;
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        bus.done(1, Ok(())).await;
+        pending.await.unwrap();
+        let (kind, id, _) = bridge.pop(false).unwrap().unwrap();
+        assert_eq!((kind, id), (CLOSE, 1));
+        assert!(bridge.pop(false).unwrap().is_none());
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(bus.udp_credit_recovered.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
