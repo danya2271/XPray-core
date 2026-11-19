@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -233,13 +234,28 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 					if backend == "native" && native.Stats().StartedEngines-before < minimumEngines {
 						t.Fatal("native packet-loss test silently fell back to Go")
 					}
-					received := make(chan int, 1)
+					type sample struct {
+						count      int
+						duplicates int
+						missing    []int
+						latency    []time.Duration
+					}
+					received := make(chan sample, 1)
+					sentAt := make([]atomic.Int64, packets)
+					epoch := time.Now()
 					workers.Go(func() {
 						buffer := make([]byte, size)
 						expected := bytes.Repeat([]byte{0xa5}, size-4)
 						seen := make([]bool, packets)
-						count := 0
-						defer func() { received <- count }()
+						result := sample{latency: make([]time.Duration, 0, packets)}
+						defer func() {
+							for sequence, present := range seen {
+								if !present && len(result.missing) < 16 {
+									result.missing = append(result.missing, sequence)
+								}
+							}
+							received <- result
+						}()
 						for {
 							if _, err := io.ReadFull(conn, buffer); err != nil {
 								return
@@ -251,7 +267,10 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 							}
 							if !seen[sequence] {
 								seen[sequence] = true
-								count++
+								result.count++
+								result.latency = append(result.latency, time.Since(epoch)-time.Duration(sentAt[sequence].Load()))
+							} else {
+								result.duplicates++
 							}
 						}
 					})
@@ -271,6 +290,7 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 							break
 						}
 						binary.BigEndian.PutUint32(payload, uint32(sequence))
+						sentAt[sequence].Store(time.Since(epoch).Nanoseconds())
 						if _, err := conn.Write(payload); err != nil {
 							t.Errorf("UDP send: %v", err)
 							break
@@ -287,10 +307,20 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 						}
 					}
 					conn.Close()
-					count := <-received
-					t.Logf("backend=%s packet_mask=%s cascade=%t payload=%d sent=%d received=%d loss_pct=%.3f background_mibps=%.2f kernel_udp_dropped=%d", backend, maskKind, cascade, size, sent, count, 100*float64(sent-count)/float64(max(1, sent)), backgroundRate, kernelDropped)
-					if count == 0 {
+					result := <-received
+					slices.Sort(result.latency)
+					percentile := func(percent int) time.Duration {
+						if len(result.latency) == 0 {
+							return 0
+						}
+						return result.latency[(len(result.latency)-1)*percent/100]
+					}
+					t.Logf("backend=%s packet_mask=%s cascade=%t payload=%d sent=%d received=%d loss_pct=%.3f background_mibps=%.2f kernel_udp_dropped=%d duplicates=%d rtt_p50_us=%.1f rtt_p99_us=%.1f rtt_max_us=%.1f missing=%v", backend, maskKind, cascade, size, sent, result.count, 100*float64(sent-result.count)/float64(max(1, sent)), backgroundRate, kernelDropped, result.duplicates, float64(percentile(50))/float64(time.Microsecond), float64(percentile(99))/float64(time.Microsecond), float64(percentile(100))/float64(time.Microsecond), result.missing)
+					if result.count == 0 {
 						t.Fatal("all application UDP packets lost")
+					}
+					if os.Getenv("XHYS_LOSS_REQUIRE_ZERO") == "1" && result.count != sent {
+						t.Errorf("application UDP packet loss: sent=%d received=%d", sent, result.count)
 					}
 				})
 			}

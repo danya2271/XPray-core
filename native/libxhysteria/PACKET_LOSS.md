@@ -359,3 +359,126 @@ recoveries. A separate run of the final build received 4,000/4,000 at
 150.92 MiB/s with one server credit recovery and zero sampled drops. The
 recovery confirms that a credit can arrive during the yield. Production
 loss rates still require measurements from the affected paths.
+
+## Shared-server credit grace: November 20, 2026
+
+Sequence-gap tracing localized another cascade loss to the shared-server
+Rust-to-Go bridge. The first leg received a datagram, but the middle node
+discarded it before the second leg's UDP sender. In two 2,000-packet,
+256-byte runs, the missing sequence counts (10 and six) exactly matched the
+middle server's `credit_dropped_total`. Sampled kernel, QUIC DATAGRAM queue,
+reassembly and send-MTU drop counters stayed zero. A single Tokio yield did
+not reliably give the Go consumer and credit-return path time to run.
+Temporary sequence tracing was removed after localization; it is not part
+of the production path or the performance comparison.
+
+When shared-server delivery has no receive credit, it now awaits the credit
+semaphore with a two-millisecond timeout budget. Credit arrival wakes it
+directly, without repeated polling. Closing a flow cancels the wait. An
+unread flow still drops after the timeout. The fast path, receive window,
+shared ring, payload slots, reassembly limits and socket buffers are unchanged.
+There is no new payload copy, additional payload queue or retransmission.
+`credit_recovered_total` now includes successful waits.
+
+The wait can briefly delay other UDP sessions on the same QUIC connection;
+TCP tasks and other connections continue to run. Timer granularity and
+scheduler delays mean the timeout budget is not a hard real-time bound.
+This is a bounded response to transient consumer delay, not reliable UDP
+delivery over a lossy network. Go and the native socket bridge are unchanged.
+
+The deterministic regression test polls an exhausted-credit delivery twice
+before returning a credit: the previous implementation already drops it on
+the second poll, while the fixed implementation waits and delivers it. The
+tests also cover timeout/drop behavior and flow closure while waiting.
+
+The loss harness now reports duplicate counts, the first 16 missing sequence
+numbers and application RTT p50/p99/max. Set `XHYS_LOSS_REQUIRE_ZERO=1` to fail
+on any missing reply; default mode continues to report partial loss without
+failing. Latencies describe received packets only and must be considered
+together with the loss count. The extra measurement storage is test-only.
+
+```sh
+XRAY_NET_DIAG=1 XHYS_LOSS_REQUIRE_ZERO=1 \
+  XHYS_LOSS_PACKET_MASK=header XHYS_LOSS_PACED_MIBPS=128 \
+  taskset -c 14-17 build_assets/mask-send-20261119/loss-after.test \
+  -test.run '^TestHysteriaPacketLossUnderLoad$/native$/cascade_true$' \
+  -test.v -test.timeout 90s
+```
+
+### Matched local validation
+
+The comparison uses fresh processes in rotating before/after/Go order,
+three samples per backend, affinity 14–17, Salamander plus WireGuard headers,
+four background TCP echoes offered 128 MiB/s, and 2,000 UDP packets per
+payload size at nominal 200/s followed by two seconds of drain. Both Hysteria
+legs, both directions and the echo/load generators run on the same host.
+Before is `a78c1e61` with the same updated measurement harness. Temporary
+sequence-tracing code is absent from both comparison binaries.
+
+Counts below aggregate all three samples; other values are medians of the
+three scenario/process measurements. CPU and RSS cover the whole fresh
+24-second process, including both payload scenarios, setup and drain. They
+are not isolated server costs or per-packet memory costs.
+
+| Metric | Native before | Native after | Go |
+| --- | ---: | ---: | ---: |
+| Missing replies / 12,000 | 7 | 0 | 0 |
+| TCP background, 256 B scenario, MiB/s | 125.86 | 125.74 | 127.87 |
+| TCP background, 4 KiB scenario, MiB/s | 126.08 | 125.59 | 127.84 |
+| UDP RTT p99, 256 B, ms | 3.022 | 2.922 | 2.457 |
+| UDP RTT p99, 4 KiB, ms | 3.011 | 6.351 | 2.954 |
+| Whole-process CPU, seconds | 57.575 | 57.605 | 80.889 |
+| Whole-process peak RSS, MiB | 51.80 | 51.01 | 43.26 |
+
+The fixed native receives every sampled reply with essentially unchanged
+CPU and achieved background traffic. Its memory samples overlap the old
+native range; the small median reduction is not evidence of a memory-saving
+optimization. Native still uses more RSS than Go in this fixture, while
+spending approximately 29% less process CPU at slightly lower achieved load.
+
+This change does not establish a latency improvement. In particular, the
+4 KiB after samples have p99 values of 3.084–9.864 ms versus 2.973–3.127 ms
+before. An exploratory after run also reached 80.705 ms. Those tail spikes
+remain a follow-up; they must not be hidden behind zero loss or a median RTT.
+
+A subsequent 4 KiB-only ABBA repeat also shows variable tails: after p99 was
+3.196/4.454 ms and before was 3.194/24.817 ms. The slow before sample lost
+one reply and reported one server credit drop. Both after samples received
+2,000/2,000, adding 4,000 lossless cascade replies beyond the main matrix.
+This does not establish a consistent p99 regression or improvement; the
+initial matched table and the outliers are retained rather than selecting
+only the favorable samples. Logs are `tail-{1,4}-after.log` and
+`tail-{2,3}-before.log` in the artifact directory below.
+
+Additional fixed-native strict checks delivered every reply:
+
+| Workload | Native received / sent | Go received / sent | Achieved TCP background, native / Go, MiB/s |
+| --- | ---: | ---: | ---: |
+| Four CPUs, saturated cascade, 256 B | 2,000 / 2,000 | 2,000 / 2,000 | 179.97 / 149.92 |
+| Four CPUs, saturated cascade, 4 KiB | 2,000 / 2,000 | 2,000 / 2,000 | 181.84 / 145.45 |
+| One CPU, 32 MiB/s offered, cascade, 256 B | 2,000 / 2,000 | 1,960 / 2,000 | 31.82 / 31.90 |
+| One CPU, 32 MiB/s offered, cascade, 4 KiB | 2,000 / 2,000 | 1,970 / 2,000 | 31.75 / 31.89 |
+| Four CPUs, direct, 256 B | 2,000 / 2,000 | — | 126.62 / — |
+| Four CPUs, direct, 4 KiB | 2,000 / 2,000 | — | 126.40 / — |
+
+The one-CPU Go control fails strict zero-loss assertions and records 19,715
+and 21,629 sampled kernel socket drops; that failure is retained in the logs,
+not treated as a passing lossless test. The native rows have zero sampled
+kernel drops. Backends retain their existing, different socket-buffer tuning;
+this is not a language-only or equal-socket-budget comparison. These checks
+plus the matched after samples total 24,000/24,000
+fixed-native replies, including 20,000/20,000 through the cascade. No remote
+server, WAN path or Android device was used for these measurements.
+
+Raw binaries, diagnostic/sequence logs, fresh-process resource samples and
+the ordered validation script are in ignored
+`build_assets/cascade-loss-20261120/` and
+`build_assets/mask-send-20261119/loss-{before,after}.test`.
+
+Engine and allocation-profile unit suites each pass 96 tests, all 140 packet
+mask interoperability cases pass, and the Go native-adapter/Hysteria race
+tests pass. Clippy with warnings denied and Rust formatting checks pass.
+Linux server and Android arm64/API 26 executables were rebuilt. Android
+validation is compilation/linking only. The local Go toolchain still requires
+temporary removal of Rust archive LLVM bitcode sections for linking; all
+archives are restored afterward by the build helpers' EXIT traps.
