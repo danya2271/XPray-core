@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/tls"
@@ -260,7 +261,10 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	var pktConn net.PacketConn
-	if streamSettings.FinalMask != nil {
+	ingress := generationFromContext(ctx)
+	if ingress != nil {
+		pktConn = ingress.packet
+	} else if streamSettings.FinalMask != nil {
 		pktConn, err = streamSettings.FinalMask.ListenPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)})
 	} else {
 		pktConn, err = internet.ListenSystemPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)}, streamSettings.SocketSettings)
@@ -276,6 +280,9 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO, StatelessResetKey: k}
+	if ingress != nil {
+		tr.ConnectionIDGenerator = generationCIDGenerator{codec: handoff.NewQUICCIDCodec(ingress.key), slot: ingress.slot}
+	}
 
 	listener, err := tr.Listen(tlsConfig.GetTLSConfig(tls.WithNextProto("h3")), quicConfig)
 	if err != nil {

@@ -14,6 +14,8 @@ mod allocation_profile;
 mod congestion;
 #[cfg(all(feature = "engine", unix))]
 pub mod engine;
+#[cfg(all(feature = "engine", unix))]
+mod generation_cid;
 #[cfg(feature = "engine")]
 mod h3_transport;
 #[cfg(feature = "engine")]

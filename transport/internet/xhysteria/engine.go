@@ -92,6 +92,7 @@ type Config struct {
 	PacketBridge              bool                                      `json:"packet_bridge,omitempty"`
 	PacketBatch               bool                                      `json:"packet_batch,omitempty"`
 	PacketLocal               string                                    `json:"packet_local,omitempty"`
+	QUICGeneration            *QUICGenerationConfig                     `json:"quic_generation,omitempty"`
 	Diagnostic                bool                                      `json:"diagnostic"`
 	ExternalAuth              bool                                      `json:"external_auth"`
 	UDPIdleTimeout            uint64                                    `json:"udp_idle_timeout"`
@@ -104,6 +105,11 @@ type Config struct {
 	ProcessSendBufferBytes    uint32                                    `json:"process_send_buffer_bytes"`
 	ProcessReceiveBufferBytes uint32                                    `json:"process_receive_buffer_bytes"`
 	Authenticate              func(string) (*protocol.MemoryUser, bool) `json:"-"`
+}
+
+type QUICGenerationConfig struct {
+	Key  [16]byte `json:"key"`
+	Slot byte     `json:"slot"`
 }
 
 type PortHoppingConfig struct {
