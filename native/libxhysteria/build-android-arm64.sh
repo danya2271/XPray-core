@@ -22,7 +22,7 @@ case "$(uname -s)" in
 esac
 toolchain="$ndk/toolchains/llvm/prebuilt/$host/bin"
 cc="$toolchain/aarch64-linux-android${api}-clang"
-if [[ ! -x "$cc" || ! -x "$toolchain/llvm-ar" ]]; then
+if [[ ! -x "$cc" || ! -x "$toolchain/llvm-ar" || ! -x "$toolchain/llvm-objcopy" ]]; then
     printf 'Android NDK toolchain not found: %s\n' "$cc" >&2
     exit 1
 fi
@@ -55,7 +55,8 @@ archive="$native_dir/target/$target/release/libxhysteria.a"
 native_hash=$(shasum -a 256 "$archive")
 native_hash=${native_hash%% *}
 mkdir -p -- "$(dirname -- "$output")"
-CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
+bash "$native_dir/link-go.sh" "$native_dir/target/$target/release" \
+    "$toolchain/llvm-objcopy" env CGO_ENABLED=1 GOOS=android GOARCH=arm64 \
     CGO_LDFLAGS="${CGO_LDFLAGS:-} -Wl,-z,max-page-size=16384" \
     "$go" build -tags xhysteria_native -buildmode=pie -trimpath -buildvcs=false \
     -ldflags="-s -w -checklinkname=0 -buildid=xhysteria-$native_hash" \

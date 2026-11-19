@@ -33,6 +33,14 @@ executable with CGO and `-tags xhysteria_native`. It does not use the Linux
 archive. `CARGO` and `GO` can select tool executables. Without `CARGO`, the script
 prefers `~/.cargo/bin/cargo` when available.
 
+The Linux and Android build scripts temporarily remove embedded `.llvmbc` and
+`.llvmcmd` metadata from every static archive in the linker search tree,
+including `release/deps`, before invoking Go. Go toolchains that reject LTO
+sections can then validate the native object code. The Android path uses the
+NDK's `llvm-objcopy`; Linux uses `objcopy` or `OBJCOPY`. Cargo's original archives
+are restored on success or failure. Rust's release optimization and thin LTO
+still run before this link-only normalization; Go's linker checks stay enabled.
+
 In the sibling `bypclient` checkout, `./gradlew :app:buildXrayAndroid` uses this
 script by default. The task accepts `-PandroidNdk=/path/to/ndk`, or uses the NDK
 environment variables, or finds the newest installed NDK in the Android SDK.
