@@ -55,9 +55,12 @@ func (w nativeWriter) Close() error { return w.connection.CloseWrite() }
 func (w nativeWriter) Interrupt()   { w.connection.Close() }
 
 func (w nativeWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if w.counter == nil {
+		return w.Writer.WriteMultiBuffer(mb)
+	}
 	n := mb.Len()
 	err := w.Writer.WriteMultiBuffer(mb)
-	if err == nil && w.counter != nil {
+	if err == nil {
 		w.counter.Add(int64(n))
 	}
 	return err
