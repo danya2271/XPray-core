@@ -2187,3 +2187,204 @@ both shared/socket cascade port-hopping cases, and Go race tests for
 were rebuilt. Android execution was not tested. Local linking again used
 temporary archive LLVM-bitcode section removal with backup/EXIT restoration;
 this is a local toolchain workaround, not a source-level build change.
+
+## 2026-11-20: Isolating Native Client Schedulers
+
+Outbound engines previously shared one multithread Tokio runtime. The final
+implementation divides the same total worker budget into single-worker
+runtime shards and assigns complete engines round-robin at startup. An
+engine's endpoint driver, connection drivers, bridge tasks and stream tasks
+use the selected shard. This removes cross-worker execution within that
+engine without creating a new runtime/thread for every connection. The
+server listener runtime and its worker override remain unchanged.
+
+Go still requests `min(4, max(1, GOMAXPROCS))` total outbound workers. The
+first shared engine fixes the process pool, as before; low-level zero means
+one worker and explicit values are limited to 16. Each shard adds reactor
+and scheduler state, so an unchanged worker count does not establish identical
+RSS or file-descriptor use. Engine assignment is not CPU affinity or dynamic
+load balancing. A single hot engine is limited to one Rust worker; uneven
+engine traffic can leave other shards underused. The original shared rings,
+mutex, notification generations, queue capacities, socket buffers and UDP
+credit grace are retained.
+
+The new `event=client_runtime` diagnostic reports shard selection, shard count,
+per-shard workers and the process total. A unit test checks 1/2/3/4/8/16 total
+workers, round-robin assignment, execution on the intended runtime and
+independent cancellation/join. The existing four-worker concurrent publication
+test now uses 64 publishers and 16,384 frames instead of eight publishers and
+2,048 frames, preserving ownership and per-producer ordering assertions.
+
+### Measuring Concurrent Latency
+
+`BenchmarkNativePacketParallelLatency` measures 64-byte TCP request/reply RTT
+for parallel flows through one pooled Hysteria connection.
+`BenchmarkNativePacketParallelConnectionLatency` disables pooling to measure
+independent client engines targeting the same server listener. Both collect
+RTT samples locally in each Go worker and merge once per worker. There is no
+sample-collection lock on each exchange. Reported process CPU includes engine
+setup, warmup and teardown within `RunParallel`; RTT samples time only measured
+exchanges. The fixtures report p50/p95/p99 and assert native engine use.
+
+Default parallelism is `4 * GOMAXPROCS`; `XHYS_BENCH_PARALLELISM=1..64` sets
+the multiplier. Thus four CPUs with multiplier 4 use 16 simultaneous flows;
+multiplier 16 uses 64 flows. Go's `ns/op` is aggregate wall time per completed
+exchange across workers, not per-flow RTT; compare the explicit percentiles.
+These benchmark RTTs and the existing loaded single-probe benchmark answer
+different questions and must not be interchanged.
+
+### Rejected Threading Trials
+
+The mutex/block profile of the four-CPU loaded fixture did not establish that
+the Go flow-table mutex alone dominates RTT; most recorded blocking was in
+ordinary channels/selects. Rust-side shared publication and runtime scheduling
+were investigated separately:
+
+* Waking one bridge publisher with a notification handoff passed correctness
+  tests but reduced the short ABBA parallel-transfer median from approximately
+  476 to 461 MB/s, with no consistent RTT gain.
+* Waking at most eight publishers, matching ring capacity, passed wake,
+  cancellation and 64-publisher tests. RTT changes were small and inconsistent.
+* A multi-producer event ring using atomic reservation and ordered publication
+  passed 100 unit tests, including out-of-order completion and wraparound. It
+  did not deliver a decisive concurrent RTT improvement and was removed.
+* Reducing the entire client pool from four workers to two improved the
+  16-flow pooled RTT but worsened 64-independent-engine p99 from approximately
+  3.36 to 4.09 ms. The original total worker budget was restored.
+* Two-worker runtime shards retained that total but did not improve the
+  independent-engine tail. Single-worker shards were selected for the final
+  comparison below.
+
+The rejected bridge algorithms and their new tests are not in the final
+source. Trial source patches, binaries, Go mutex/block profiles and raw logs
+are in ignored `build_assets/threading-20261120/`; corresponding binaries are
+`build_assets/mask-send-20261119/threading-*.test`. File names `handoff`,
+`bounded`, `mpsc`, `workers2`, `shards` and `single` identify intermediate
+experiments. Only `threading-final.test` matches the final source.
+
+### Final Four-CPU Comparison
+
+Baseline is `617bfbbf` with exactly the same new benchmark harness. Each
+before/after/Go row is the median of three fresh processes in rotating order,
+affinity 14–17, `GOMAXPROCS=4`, release Rust and the real Salamander plus
+WireGuard-header mask chain. Latency scenarios run four seconds per sample;
+bulk echo performs exactly 16,384 exchanges of 64 KiB in each direction.
+The entire local client, server and echo/load generator share that affinity.
+No other build/test from this investigation runs during these measurements;
+unrelated host load is uncontrolled.
+
+The Go backend retains its normal connection manager. Native
+`XRAY_HYSTERIA_POOL_SIZE=0` does not disable Go connection reuse, so the
+64-independent-native-engine and 16-engine bulk scenarios have different
+connection topologies between native and Go. Their Go columns are whole-
+configuration controls, not equal-connection or language-only comparisons.
+Before/after native uses identical engine counts. Pooled-flow native/Go
+scenarios exercise the usual shared-connection behavior on each backend.
+
+| Scenario / metric | Native before | Native after | Go |
+| --- | ---: | ---: | ---: |
+| 16 parallel flows, one pooled connection, RTT p50, µs | 506.8 | 423.1 | 241.0 |
+| 16 parallel flows, one pooled connection, RTT p99, µs | 1,052 | 960.9 | 536.4 |
+| 64 parallel flows, one pooled connection, RTT p99, µs | 3,113 | 2,936 | 1,591 |
+| 64 flows, native pooling disabled, RTT p99, µs | 3,479 | 3,514 | 1,673 |
+| Probe plus saturated TCP background, RTT p99, µs | 1,794 | 1,637 | 959.2 |
+| Saturated background, MiB/s | 310.5 | 335.6 | 225.4 |
+| Probe plus 32 MiB/s offered background, RTT p99, µs | 473.7 | 453.1 | 381.2 |
+| Paced achieved background, MiB/s | 31.95 | 31.74 | 31.96 |
+| Bulk echo, 16 native engines / normal Go reuse, MB/s | 477.15 | 475.03 | 237.61 |
+| Bulk process CPU, µs/exchange | 931.58 | 939.33 | 1,930.19 |
+
+Pooled 16-flow p99 is 8.7% lower, with p50 16.5% lower. Pooled 64-flow p99
+is 5.7% lower. Saturated probe p99 is 8.8% lower while achieved background
+traffic is 8.1% higher. Paced probe p99 is 4.3% lower at slightly lower actual
+load. These are workload-specific improvements, not a universal or multiple-
+times latency reduction. The independent-64-engine p99 does not improve.
+Native still has higher short-message RTT than Go in every four-CPU scenario
+in this table. Go's lower saturated background rate prevents treating that
+row as an equal-load latency comparison. Bulk native throughput in its
+different connection configuration remains about twice Go, but is essentially
+unchanged from before with 0.8% more CPU in this
+sample set. No generic throughput or CPU reduction is claimed.
+
+| Whole-process peak RSS, median, MiB | Native before | Native after | Go |
+| --- | ---: | ---: | ---: |
+| 16 pooled concurrent flows | 48.85 | 49.25 | 51.46 |
+| 64 pooled concurrent flows | 68.69 | 62.72 | 65.78 |
+| 64 flows, native pooling disabled / normal Go reuse | 408.13 | 422.27 | 67.51 |
+| Saturated probe | 43.73 | 43.16 | 38.82 |
+| Bulk echo, 16 native engines / normal Go reuse | 73.07 | 68.37 | 43.41 |
+
+RSS covers all endpoints, benchmark RTT samples, allocators and setup/teardown;
+it is not server-only or a native heap measurement. Runtime partitioning does
+not uniformly reduce memory. Explicitly disabling pooling with 64 engines
+has large existing per-engine costs and a higher after high-water mark; that
+case must not be presented as memory-efficient. Production pooling and flow
+windows are unchanged. Every raw observation and fresh-process resource sample
+is retained in `final-c*-p*-*.log`/`.rss`, with binary hashes in
+`final-binaries.sha256` and ordering in `compare-final.sh`.
+
+In the 16-flow pooled scenario, median process CPU per measured exchange is
+102.47 → 84.53 µs (17.5% lower), versus 50.35 µs Go. This includes concurrent
+fixture setup/warmup/teardown within `RunParallel`; it is not a transport-only
+cycle count. It does not contradict essentially unchanged CPU on the bulk
+transfer fixture, which has much larger payloads and different bottlenecks.
+
+One-CPU control, four concurrent pooled flows, three rotating fresh samples:
+before/after/Go RTT p99 is 621.4/602.9/377.4 µs, and process CPU is
+76.41/74.49/59.24 µs per exchange. Both native versions have one worker in
+this configuration; the small 3% RTT difference must not be attributed to
+cross-core isolation. It is control-run variation, not evidence of a new
+single-CPU scheduler improvement.
+
+For reproduction after rebuilding the tagged interop executable:
+
+```sh
+XHYS_BENCH_PARALLELISM=4 taskset -c 14-17 interop.test -test.run '^$' \
+  -test.bench '^BenchmarkNativePacketParallelLatency$/native$' \
+  -test.benchtime 4s -test.cpu 4 -test.count 1
+XHYS_BENCH_PARALLELISM=16 taskset -c 14-17 interop.test -test.run '^$' \
+  -test.bench '^BenchmarkNativePacketParallelConnectionLatency$/native$' \
+  -test.benchtime 4s -test.cpu 4 -test.count 1
+```
+
+### Final Loss, Capacity and Build Checks
+
+The strict `XHYS_LOSS_REQUIRE_ZERO=1` matrix receives 20,000/20,000 replies,
+including 16,000/16,000 over two Hysteria legs. It covers two paced cascade
+runs, saturated cascade, one-CPU cascade and direct control, each at 256 B
+and 4 KiB. Sampled owned kernel UDP drops and duplicate replies are zero.
+Diagnostic logs show all four runtime shards used with one worker each and
+`total_workers=4`; the one-CPU control retains one worker.
+
+Actual achieved background rates are approximately 125–126 MiB/s for most
+four-CPU paced cascade samples; one 256-byte sample achieves only 112.21
+MiB/s despite 128 MiB/s offered. Saturated cascade achieves 176–180 MiB/s;
+one-CPU paced cascade achieves 31.6–31.8 MiB/s. These are delivered rates,
+not assumptions based on the pacing target. UDP latency is not uniformly
+improved: two paced small-payload cascade samples have p99 around 10–11 ms,
+and the direct 4 KiB sample reaches 12.733 ms p99 while delivering all replies.
+The threading change does not solve every scheduler/outlier or WAN loss issue.
+
+The 500-user/1,000-session **cascade** capacity smoke completes a 500 MiB
+duplex transfer and twelve heartbeat rounds. The entry server subprocess is
+pinned to CPU 14 with `GOMAXPROCS=1`, one native server worker and
+`GOMEMLIMIT=128MiB`; the remaining endpoints/load generator use CPUs 14–17.
+No cgroup memory ceiling is imposed. Entry-server peak RSS is 350.7 MiB,
+process CPU 9.931 seconds, transfer 44.12 MiB/s and heartbeat p99 4.558 ms.
+This tests successful operation, not a measured capacity speedup against an
+old-version cascade; the earlier direct capacity tests are not comparable.
+RSS excludes the other cascade endpoint and kernel/node memory. No remote
+deployment or Android-device runtime measurement is included.
+
+Logs and the exact validation sequence are `loss-*.log`, `interop-final.log`,
+`capacity-cascade-final.log` and `validate-final.sh` under
+`build_assets/threading-20261120/`.
+
+The final engine and allocation-profile suites each pass 97 Rust tests;
+formatting and Clippy with warnings denied pass. All 140 mask interoperability
+cases and both shared/socket cascade port-hopping cases pass. Go race tests
+pass for `proxy/hysteria`, `transport/internet/xhysteria` and
+`transport/internet/hysteria`. Linux server and Android arm64/API 26 binaries
+were rebuilt. Android validation is compilation/linking only. The local Go
+toolchain's Rust-bitcode archive workaround again used backup and EXIT-trap
+restoration; no dependency, global toolchain or linker configuration changed.
