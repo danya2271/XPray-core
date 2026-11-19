@@ -1793,3 +1793,133 @@ of runnable delay, 43.7% of the aggregate Go scheduler delay. This profile
 attributes delay to the wake-up site and covers the Go scheduler. Measuring
 shared-ring residence and Rust-side dispatch requires timestamps at those
 stages. Raw traces and benchmark logs are in `build_assets/read-fast/`.
+
+## 2026-11-19: Contended Direct-Mask Sends and Scheduler Follow-up
+
+Direct Salamander/DNS/uTP/WireGuard chains first try the socket's send-state
+mutex. If another connection driver owns that state, the send uses reusable
+thread-local scratch instead of sleeping on the mutex. Scratch is initialized
+only on contention and shared between stateless chains on the same thread.
+Its wire vector remains bounded to 64 KiB, with a 4 KiB randomness cache and
+at most 16 counters. A borrowed thread-local state falls back to the original
+mutex path. DTLS, SRTP, WeChat and mixed chains containing them keep serialized,
+per-socket counters. Socket `WouldBlock` and other errors still propagate to
+Quinn; contention does not discard packets or introduce a production spin loop.
+
+An unconditional thread-local fast path was rejected. Its three-sample
+four-CPU parallel masked echo median was 275.64 versus 282.23 MB/s with the
+mutex, and its UDP transfer and idle p99 results were inconsistent. The shipped
+hybrid avoids initializing an extra send buffer without contention. This
+optimization removes waiting only for concurrent stateless masked sends; it
+does not remove payload encoding copies, QUIC connection locks or stateful
+mask synchronization. TLS scratch can retain up to approximately 68 KiB per
+thread that encounters contention, in addition to existing per-socket state.
+
+### Parallel Connections, CPU and Whole-Process RSS
+
+`BenchmarkNativePacketParallelConnections` uses the actual direct header +
+Salamander mask chain and starts `4 * GOMAXPROCS` workers. Pool size zero
+creates independent native client engines, all targeting one server socket.
+The final four-CPU smoke result reports 16 native client engines. The existing
+`BenchmarkNativeParallel` uses the legacy Salamander-only socket instead, so
+it is a control workload, not evidence of `MaskSocket` contention improvement.
+`BenchmarkNativePacketParallel` keeps one pooled connection for comparison.
+
+Native before is source at `015f9821` with the same benchmark harness; only
+the mask send path differs. Final medians below come from three rotating
+before/after/Go fresh-process runs, CPUs 14–17, `GOMAXPROCS=4`, release Rust,
+and exactly 8,192 exchanges of 64 KiB in each direction. RSS is each process's
+`wait4` high-water mark, including setup/teardown. Go and native each use their
+own backend for both client and server. This is loopback, not a WAN or
+server-only capacity measurement. Allocation metrics count only Go allocations.
+
+| Metric | Native mutex | Native hybrid | Go |
+| --- | ---: | ---: | ---: |
+| Bidirectional echo, MB/s | 398.56 | 420.03 | 213.05 |
+| Process CPU, µs / exchange | 1,090.30 | 1,030.47 | 2,131.03 |
+| Peak process RSS, MiB | 70.73 | 71.30 | 44.11 |
+| Go bytes / exchange | 5,191 | 5,166 | 37,786 |
+| Go allocations / exchange | 106 | 105 | 929 |
+
+Throughput improves **5.4%** with **5.5% less CPU per exchange**. RSS is
+0.8% higher, not a demonstrated memory reduction. Native is **1.97× Go
+throughput** with 51.6% less process CPU per exchange, but uses **1.62× Go
+peak RSS** in this fixture. It does not meet a universal 2.5× target.
+
+A preceding fixed-volume ABBA repeat measured 408.65 → 420.65 MB/s and
+1,065.30 → 1,029.06 µs CPU per exchange. A two-second ABBA run measured
+395.45 → 427.49 MB/s. These agree on direction for independent connections,
+not on the exact multiplier. One-CPU and single-pooled-connection throughput
+did not consistently improve.
+
+### Latency and Scheduler
+
+Three native samples per variant alternate in ABBA-style order, with three
+Go samples. One CPU uses affinity 14; four CPUs use 14–17. Samples last two
+seconds. Paced TCP echo offers 32 MiB/s across four background streams.
+
+| CPUs / workload | Native mutex p99, µs | Native hybrid p99, µs | Go p99, µs | Achieved background before / hybrid / Go, MiB/s |
+| --- | ---: | ---: | ---: | --- |
+| 1 / idle UDP | 206.6 | 209.7 | 143.2 | — |
+| 1 / paced TCP | 981.3 | 970.0 | 1,126.0 | 31.94 / 31.89 / 31.92 |
+| 4 / idle UDP | 227.1 | 259.0 | 221.1 | — |
+| 4 / paced TCP | 569.5 | 576.3 | 592.7 | 31.85 / 31.89 / 31.90 |
+
+**There is no consistent p99 improvement.** The four-CPU idle median is
+14.0% worse, and idle native latency still loses to Go. Unrelated workloads
+run on this machine and samples have substantial spread; these results do
+not prove an equal-load latency benefit from removing contended send waits.
+
+The separate one-CPU scheduler 7/7 versus 1/1 experiment was rejected:
+
+| Metric | 7/7 | 1/1 |
+| --- | ---: | ---: |
+| UDP echo, MB/s | 36.24 | 33.88 |
+| UDP CPU, µs / exchange | 208.64 | 223.35 |
+| Idle UDP p99, µs | 209.3 | 242.8 |
+| Paced TCP p99, µs | 1,093.0 | 1,504.0 |
+| Achieved paced background, MiB/s | 62.60 | 62.04 |
+
+These medians select only native rows in the mixed-backend logs. Scheduler
+intervals remain **7/7**; checking queues more frequently did not reduce
+latency at equal delivered load. Scheduler logs predate the final hybrid and
+are not the parallel-connection A/B above.
+
+### Packet Loss and Validation
+
+The final direct masked native cases each received 2,000/2,000 packets under
+four saturated TCP streams, at 283–284 MiB/s background throughput. The
+initial native cascade cases received 1,994/2,000 with 256-byte payloads and
+1,998/2,000 with 4 KiB payloads. Go received all packets in those samples,
+but at lower delivered background rates. Sampled kernel UDP drops were zero.
+
+The same-affinity cascade repeat received 1,997/2,000 and 2,000/2,000 on the
+mutex baseline at 162.20/159.45 MiB/s; the final hybrid received 2,000/2,000
+in both cases at 164.55/154.04 MiB/s. A separate offered-128-MiB/s cascade
+sample still received only 1,992/2,000 native 256-byte packets, at 125.54 MiB/s
+delivered background, while native 4 KiB and both Go sizes received all packets.
+**Intermittent application UDP loss remains unresolved**, including below
+saturation. Zero kernel drops do not rule out QUIC, bridge or application
+queue drops. The loss harness passes unless all packets are lost, so its PASS
+must not be interpreted as zero loss or as a fix for the VPS incidents.
+
+Engine and allocation-profile suites each passed 95 tests, including
+concurrent stateless sends, unique salts and scratch fallback. Clippy with
+`-D warnings` and Rust formatting passed. All 140 mask interop combinations
+passed. The final benchmark smoke verifies independent native engines.
+Go race tests for `transport/internet/xhysteria` and
+`transport/internet/hysteria` passed. Android arm64/API 26, Linux release
+interop and the Linux native server executable were rebuilt. Local
+Go 1.27 rejects Rust `.llvmbc` sections; linking used temporary archive
+sanitization with tar backup/EXIT restoration, not a source-level build fix.
+Android compilation is verified; execution on an Android device is not.
+
+Raw logs, source patches, binary hashes and fresh-process RSS samples are in
+ignored `build_assets/mask-send-20261119/`. To reproduce the new native
+parallel case with a rebuilt interop binary:
+
+```sh
+taskset -c 14-17 interop.test -test.run '^$' \
+  -test.bench '^BenchmarkNativePacketParallelConnections$/native$' \
+  -test.benchtime 8192x -test.cpu 4 -test.count 1
+```
