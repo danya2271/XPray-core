@@ -154,23 +154,25 @@ func BenchmarkNativeTransfer(b *testing.B) {
 }
 
 func BenchmarkNativeParallel(b *testing.B) {
-	benchmarkModes(b, func(b *testing.B, client *core.Instance, target xnet.Destination) {
-		b.SetBytes(2 * 65536)
-		b.ReportAllocs()
-		b.ResetTimer()
-		cpu := processCPU()
-		b.RunParallel(func(pb *testing.PB) {
-			conn := benchmarkDial(b, client, target)
-			defer conn.Close()
-			data, received := make([]byte, 65536), make([]byte, 65536)
-			conn.SetDeadline(time.Now().Add(time.Minute))
-			for pb.Next() {
-				benchmarkExchange(b, conn, data, received)
-			}
-		})
-		b.StopTimer()
-		b.ReportMetric(float64(processCPU()-cpu)/float64(b.N), "process-cpu-ns/op")
+	benchmarkModes(b, benchmarkParallel)
+}
+
+func benchmarkParallel(b *testing.B, client *core.Instance, target xnet.Destination) {
+	b.SetBytes(2 * 65536)
+	b.ReportAllocs()
+	b.ResetTimer()
+	cpu := processCPU()
+	b.RunParallel(func(pb *testing.PB) {
+		conn := benchmarkDial(b, client, target)
+		defer conn.Close()
+		data, received := make([]byte, 65536), make([]byte, 65536)
+		conn.SetDeadline(time.Now().Add(time.Minute))
+		for pb.Next() {
+			benchmarkExchange(b, conn, data, received)
+		}
 	})
+	b.StopTimer()
+	b.ReportMetric(float64(processCPU()-cpu)/float64(b.N), "process-cpu-ns/op")
 }
 
 func BenchmarkNativeUpload(b *testing.B) {

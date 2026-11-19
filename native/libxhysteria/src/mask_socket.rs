@@ -2,6 +2,7 @@ use crate::salamander::{SALT_LEN, Salamander};
 use quinn::{AsyncUdpSocket, Runtime, UdpPoller, udp};
 use serde::Deserialize;
 use std::{
+    cell::RefCell,
     fmt,
     io::{self, IoSliceMut},
     net::{SocketAddr, UdpSocket},
@@ -96,6 +97,10 @@ struct SendState {
     counters: Vec<Counter>,
 }
 
+thread_local! {
+    static MASK_SEND_STATE: RefCell<SendState> = RefCell::new(SendState::new(0));
+}
+
 impl SendState {
     fn new(layers: usize) -> Self {
         Self {
@@ -105,12 +110,17 @@ impl SendState {
             counters: (0..layers).map(|_| Counter::default()).collect(),
         }
     }
+
+    fn ensure_counters(&mut self, layers: usize) {
+        self.counters.resize_with(layers, Counter::default);
+    }
 }
 
 struct Chain {
     layers: Vec<Layer>,
     overhead: usize,
     random_size: usize,
+    stateless: bool,
 }
 
 impl Chain {
@@ -172,10 +182,17 @@ impl Chain {
             ));
         }
         let random_size = layers.iter().map(Layer::random_size).sum();
+        let stateless = layers.iter().all(|layer| {
+            matches!(
+                layer,
+                Layer::Salamander(_) | Layer::Dns(_) | Layer::Utp | Layer::Wireguard
+            )
+        });
         Ok(Self {
             layers,
             overhead,
             random_size,
+            stateless,
         })
     }
 
@@ -303,20 +320,16 @@ impl fmt::Debug for MaskSocket {
     }
 }
 
-impl AsyncUdpSocket for MaskSocket {
-    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
-        self.socket.clone().create_io_poller()
-    }
-
-    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
-        let mut state = self
-            .send
-            .lock()
-            .map_err(|_| io::Error::other("UDP mask send lock poisoned"))?;
+impl MaskSocket {
+    fn try_send_with_state(
+        &self,
+        transmit: &udp::Transmit,
+        state: &mut SendState,
+    ) -> io::Result<()> {
         if !self.chain.encode(
             transmit.contents,
             transmit.segment_size.unwrap_or(transmit.contents.len()),
-            &mut state,
+            state,
         )? {
             return Ok(());
         }
@@ -325,6 +338,38 @@ impl AsyncUdpSocket for MaskSocket {
             segment_size: transmit.segment_size.map(|size| size + self.chain.overhead),
             ..*transmit
         })
+    }
+}
+
+impl AsyncUdpSocket for MaskSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        self.socket.clone().create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+        if self.chain.stateless {
+            match self.send.try_lock() {
+                Ok(mut state) => return self.try_send_with_state(transmit, &mut state),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(io::Error::other("UDP mask send lock poisoned"));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let result = MASK_SEND_STATE.with(|state| {
+                        let mut state = state.try_borrow_mut().ok()?;
+                        state.ensure_counters(self.chain.layers.len());
+                        Some(self.try_send_with_state(transmit, &mut state))
+                    });
+                    if let Some(result) = result {
+                        return result;
+                    }
+                }
+            }
+        }
+        let mut state = self
+            .send
+            .lock()
+            .map_err(|_| io::Error::other("UDP mask send lock poisoned"))?;
+        self.try_send_with_state(transmit, &mut state)
     }
 
     fn poll_recv(
@@ -426,6 +471,160 @@ mod tests {
                 "wechat" => assert_eq!(&state.wire[2..6], &[0; 4]),
                 "dtls" => assert_eq!(&state.wire[7..11], &u32::MAX.to_be_bytes()),
                 _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn stateless_masks_are_safe_for_thread_local_send_buffers() {
+        for kind in ["salamander", "dns", "utp", "wireguard"] {
+            assert!(Chain::new(&[config(kind)]).unwrap().stateless);
+        }
+        for kind in ["dtls", "srtp", "wechat"] {
+            assert!(!Chain::new(&[config(kind)]).unwrap().stateless);
+            assert!(
+                !Chain::new(&[config("salamander"), config(kind), config("wireguard")])
+                    .unwrap()
+                    .stateless
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stateless_send_uses_thread_local_scratch_only_when_contended() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        for masks in [
+            vec![config("wireguard"), config("salamander")],
+            vec![config("dns")],
+            vec![config("utp"), config("salamander"), config("wireguard")],
+        ] {
+            let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+            raw.set_nonblocking(true).unwrap();
+            let sender = Arc::new(MaskSocket::new(raw, &masks).unwrap());
+            let transmit = udp::Transmit {
+                destination: receiver.local_addr().unwrap(),
+                contents: b"packet",
+                segment_size: None,
+                ecn: None,
+                src_ip: None,
+            };
+            send_masked(&sender, &transmit).await;
+            let state = sender.send.lock().unwrap();
+            assert!(!state.wire.is_empty());
+            send_masked_blocking(&sender, &transmit);
+            drop(state);
+            MASK_SEND_STATE.with(|state| {
+                let state = state.borrow_mut();
+                assert!(!state.wire.is_empty());
+                assert!(state.wire.capacity() <= 65536);
+                send_masked_blocking(&sender, &transmit);
+            });
+            for _ in 0..3 {
+                let mut packet = [0; 2048];
+                let length = receiver.recv(&mut packet).unwrap();
+                let mut metadata = udp::RecvMeta {
+                    len: length,
+                    stride: length,
+                    ..Default::default()
+                };
+                sender.chain.decode(&mut packet, &mut metadata);
+                assert_eq!(&packet[..metadata.len], b"packet");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_stateless_send_preserves_payloads_and_unique_salts() {
+        let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let sender =
+            Arc::new(MaskSocket::new(raw, &[config("wireguard"), config("salamander")]).unwrap());
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let mut poller = sender.clone().create_io_poller();
+        std::future::poll_fn(|context| poller.as_mut().poll_writable(context))
+            .await
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let sender = sender.clone();
+                let barrier = barrier.clone();
+                tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                    for sequence in 0..16 {
+                        let payload = [worker, sequence, 42];
+                        send_masked_blocking(
+                            &sender,
+                            &udp::Transmit {
+                                destination,
+                                contents: &payload,
+                                segment_size: None,
+                                ecn: None,
+                                src_ip: None,
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        let mut salts = std::collections::HashSet::new();
+        let mut payloads = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let mut packet = [0; 128];
+            let length = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                receiver.recv(&mut packet),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(salts.insert(packet[4..12].to_vec()));
+            let mut metadata = udp::RecvMeta {
+                len: length,
+                stride: length,
+                ..Default::default()
+            };
+            sender.chain.decode(&mut packet, &mut metadata);
+            assert_eq!(metadata.len, 3);
+            assert_eq!(packet[2], 42);
+            assert!(packet[0] < 4 && packet[1] < 16);
+            assert!(payloads.insert(packet[..metadata.len].to_vec()));
+        }
+        for worker in workers {
+            worker.await.unwrap();
+        }
+        assert!(sender.send.lock().unwrap().wire.capacity() <= 65536);
+    }
+
+    async fn send_masked(socket: &Arc<MaskSocket>, transmit: &udp::Transmit<'_>) {
+        let mut poller = socket.clone().create_io_poller();
+        loop {
+            match socket.try_send(transmit) {
+                Ok(()) => return,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::future::poll_fn(|context| poller.as_mut().poll_writable(context))
+                        .await
+                        .unwrap();
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    fn send_masked_blocking(socket: &MaskSocket, transmit: &udp::Transmit<'_>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match socket.try_send(transmit) {
+                Ok(()) => return,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("{error}"),
             }
         }
     }

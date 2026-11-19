@@ -14,10 +14,14 @@ import (
 )
 
 func benchmarkPacketModes(b *testing.B, run func(*testing.B, *core.Instance, xnet.Destination)) {
+	benchmarkPacketModesWithPool(b, "1", 1, run)
+}
+
+func benchmarkPacketModesWithPool(b *testing.B, pool string, parallelism int, run func(*testing.B, *core.Instance, xnet.Destination)) {
 	for _, mode := range []struct{ name, backend string }{{"go", "0"}, {"native", "1"}} {
 		b.Run(mode.name, func(b *testing.B) {
 			b.Setenv("XRAY_HYSTERIA_NATIVE", mode.backend)
-			b.Setenv("XRAY_HYSTERIA_POOL_SIZE", "1")
+			b.Setenv("XRAY_HYSTERIA_POOL_SIZE", pool)
 			b.Setenv("XRAY_HYSTERIA_BRIDGE", "shared")
 			before := native.Stats().StartedEngines
 			masks := packetMasks(b, "header")
@@ -55,9 +59,16 @@ func benchmarkPacketModes(b *testing.B, run func(*testing.B, *core.Instance, xne
 			if err != nil {
 				b.Fatal(err)
 			}
+			b.SetParallelism(parallelism)
 			run(b, client, target)
-			if mode.backend == "1" && native.Stats().StartedEngines-before != 2 {
-				b.Fatal("packet benchmark fell back to Go or opened extra engines")
+			if mode.backend == "1" {
+				engines := native.Stats().StartedEngines - before
+				if engines < 2 || (pool != "0" && engines != 2) {
+					b.Fatal("packet benchmark fell back to Go or opened extra engines")
+				}
+				if pool == "0" {
+					b.ReportMetric(float64(engines-1), "native-client-engines")
+				}
 			}
 		})
 	}
@@ -85,6 +96,14 @@ func BenchmarkNativePacketUpload(b *testing.B) {
 	benchmarkPacketModes(b, func(b *testing.B, client *core.Instance, _ xnet.Destination) {
 		benchmarkStreaming(b, client, true)
 	})
+}
+
+func BenchmarkNativePacketParallel(b *testing.B) {
+	benchmarkPacketModes(b, benchmarkParallel)
+}
+
+func BenchmarkNativePacketParallelConnections(b *testing.B) {
+	benchmarkPacketModesWithPool(b, "0", 4, benchmarkParallel)
 }
 
 func BenchmarkNativePacketDownload(b *testing.B) {
