@@ -645,13 +645,22 @@ to one datagram so batching cannot bypass its pacer. See
 ## Prototype boundaries
 
 The server uses one native engine per inbound listener, with a dedicated
-runtime and its explicit worker setting. Outbound engines share a process Rust
-runtime instead of each retaining a separate OS thread and reactor.
-Go configures up to four shared runtime workers from GOMAXPROCS; the first
-shared engine fixes that count. The low-level `process_workers` field accepts
-0..16; zero selects one worker.
+runtime and its explicit worker setting. Outbound engines share a process
+pool of single-worker Rust runtimes, assigned round-robin when an engine
+starts. An engine's QUIC driver, streams and bridge tasks stay in its selected
+runtime; distinct engines can run concurrently across the pool. This avoids
+cross-worker scheduling and connection-lock contention within one engine,
+but does not pin an OS thread to a particular CPU or provide load balancing
+between engines after assignment.
+Go configures up to four total pool workers from GOMAXPROCS; the first shared
+engine fixes that count. The low-level `process_workers` field accepts 0..16;
+zero selects one worker. Splitting the runtime does not add worker threads,
+but each shard owns a separate reactor and scheduler. A single hot engine
+uses one Rust worker; skewed engine workloads can leave other shards idle.
 Each engine has an independently joined task and owns its own UDP socket and
-bridge arena. The process runtime remains alive between engine lifetimes.
+bridge arena. The process pool remains alive between engine lifetimes.
+With `XRAY_NET_DIAG=1`, `event=client_runtime` reports the selected shard,
+shard count, per-shard workers and fixed total worker count.
 Endpoint ownership closes connections on early failure; authentication-driver
 tasks abort when startup is cancelled or their engine stops.
 TLS configuration prefers TLS 1.3 AES-128-GCM while retaining the other

@@ -25,7 +25,7 @@ use std::{
     os::unix::net::{UnixDatagram, UnixStream},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -186,11 +186,47 @@ fn runtime(config: &Config) -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+struct ClientRuntimes {
+    runtimes: Vec<tokio::runtime::Runtime>,
+    next: AtomicUsize,
+}
+
+impl ClientRuntimes {
+    fn new(workers: usize) -> io::Result<Self> {
+        if workers == 0 || workers > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid client worker count",
+            ));
+        }
+        let mut runtimes = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            runtimes.push(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("xhysteria-shared")
+                    .event_interval(7)
+                    .global_queue_interval(7)
+                    .enable_all()
+                    .build()?,
+            );
+        }
+        Ok(Self {
+            runtimes,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn select(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.runtimes.len()
+    }
+}
+
+static SHARED_RUNTIME: OnceLock<ClientRuntimes> = OnceLock::new();
 
 enum Worker {
     Dedicated(JoinHandle<()>),
-    Shared(tokio::task::JoinHandle<()>),
+    Shared(usize, tokio::task::JoinHandle<()>),
 }
 
 fn start_worker(
@@ -205,17 +241,23 @@ fn start_worker(
             .spawn(move || runtime.block_on(task))
             .map(Worker::Dedicated);
     }
-    let runtime = SHARED_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(usize::from(config.process_workers.max(1)))
-            .thread_name("xhysteria-shared")
-            .event_interval(7)
-            .global_queue_interval(7)
-            .enable_all()
-            .build()
-            .expect("native client runtime")
+    let pool = SHARED_RUNTIME.get_or_init(|| {
+        ClientRuntimes::new(usize::from(config.process_workers.max(1)))
+            .expect("native client runtimes")
     });
-    Ok(Worker::Shared(runtime.spawn(task)))
+    let shard = pool.select();
+    if config.diagnostic {
+        eprintln!(
+            "[XRAY_NET_DIAG][XHYSTERIA] event=client_runtime shard={shard} shards={} workers={} total_workers={}",
+            pool.runtimes.len(),
+            pool.runtimes[shard].metrics().num_workers(),
+            pool.runtimes
+                .iter()
+                .map(|runtime| runtime.metrics().num_workers())
+                .sum::<usize>(),
+        );
+    }
+    Ok(Worker::Shared(shard, pool.runtimes[shard].spawn(task)))
 }
 
 impl Worker {
@@ -224,8 +266,8 @@ impl Worker {
             Self::Dedicated(worker) => {
                 let _ = worker.join();
             }
-            Self::Shared(worker) => {
-                let _ = SHARED_RUNTIME.get().unwrap().block_on(worker);
+            Self::Shared(shard, worker) => {
+                let _ = SHARED_RUNTIME.get().unwrap().runtimes[shard].block_on(worker);
             }
         }
     }
@@ -3127,6 +3169,45 @@ mod tests {
         };
         assert_eq!(config.connection_limit(), 32);
         assert_eq!(config.flow_limit(), 64);
+    }
+
+    #[test]
+    fn client_runtime_shards_preserve_the_total_worker_budget() {
+        for workers in [1, 2, 3, 4, 8, 16] {
+            let pool = ClientRuntimes::new(workers).unwrap();
+            assert_eq!(pool.runtimes.len(), workers);
+            assert_eq!(
+                pool.runtimes
+                    .iter()
+                    .map(|runtime| runtime.metrics().num_workers())
+                    .sum::<usize>(),
+                workers
+            );
+            for runtime in &pool.runtimes {
+                assert_eq!(runtime.metrics().num_workers(), 1);
+                let task = runtime
+                    .spawn(async { tokio::runtime::Handle::current().metrics().num_workers() });
+                assert_eq!(
+                    runtime.block_on(task).unwrap(),
+                    runtime.metrics().num_workers()
+                );
+            }
+            for sequence in 0..workers * 3 {
+                assert_eq!(pool.select(), sequence % workers);
+            }
+            let blocked = pool.runtimes[0].spawn(std::future::pending::<()>());
+            let other = pool.runtimes[workers - 1].spawn(async { 17 });
+            assert_eq!(pool.runtimes[workers - 1].block_on(other).unwrap(), 17);
+            blocked.abort();
+            assert!(
+                pool.runtimes[0]
+                    .block_on(blocked)
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+        }
+        assert!(ClientRuntimes::new(0).is_err());
+        assert!(ClientRuntimes::new(17).is_err());
     }
 
     #[test]

@@ -766,7 +766,7 @@ mod tests {
     async fn concurrent_publishers_preserve_ownership_order_and_wakeups() {
         let bridge = Bridge::new().unwrap();
         let mut producers = tokio::task::JoinSet::new();
-        for producer in 0..8u64 {
+        for producer in 0..64u64 {
             let bridge = bridge.clone();
             producers.spawn(async move {
                 for sequence in 0..256u64 {
@@ -776,8 +776,8 @@ mod tests {
             });
         }
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut sequences = [0u64; 8];
-            for _ in 0..2048 {
+            let mut sequences = [0u64; 64];
+            for _ in 0..16384 {
                 loop {
                     if let Some((kind, id, data)) = bridge.pop(false).unwrap() {
                         let producer = (id / 256) as usize;
@@ -791,7 +791,7 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             }
-            assert_eq!(sequences, [256; 8]);
+            assert_eq!(sequences, [256; 64]);
             while let Some(result) = producers.join_next().await {
                 result.unwrap();
             }

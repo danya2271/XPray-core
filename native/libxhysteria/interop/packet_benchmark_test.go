@@ -3,8 +3,13 @@
 package interop_test
 
 import (
+	"fmt"
 	"os"
+	"slices"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/app/proxyman"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -104,6 +109,57 @@ func BenchmarkNativePacketParallel(b *testing.B) {
 
 func BenchmarkNativePacketParallelConnections(b *testing.B) {
 	benchmarkPacketModesWithPool(b, "0", 4, benchmarkParallel)
+}
+
+func BenchmarkNativePacketParallelLatency(b *testing.B) {
+	benchmarkConcurrentPacketModes(b, "1")
+}
+
+func BenchmarkNativePacketParallelConnectionLatency(b *testing.B) {
+	benchmarkConcurrentPacketModes(b, "0")
+}
+
+func benchmarkConcurrentPacketModes(b *testing.B, pool string) {
+	parallelism := 4
+	if value := os.Getenv("XHYS_BENCH_PARALLELISM"); value != "" {
+		var err error
+		parallelism, err = strconv.Atoi(value)
+		if err != nil || parallelism < 1 || parallelism > 64 {
+			b.Fatal("XHYS_BENCH_PARALLELISM must be 1..64")
+		}
+	}
+	benchmarkPacketModesWithPool(b, pool, parallelism, benchmarkConcurrentLatency)
+}
+
+func benchmarkConcurrentLatency(b *testing.B, client *core.Instance, target xnet.Destination) {
+	var mutex sync.Mutex
+	var samples []int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	cpu := processCPU()
+	b.RunParallel(func(iterations *testing.PB) {
+		connection := benchmarkDial(b, client, target)
+		defer connection.Close()
+		connection.SetDeadline(time.Now().Add(time.Minute))
+		payload, reply := make([]byte, 64), make([]byte, 64)
+		benchmarkExchange(b, connection, payload, reply)
+		local := make([]int64, 0, 1024)
+		for iterations.Next() {
+			started := time.Now()
+			benchmarkExchange(b, connection, payload, reply)
+			local = append(local, time.Since(started).Nanoseconds())
+		}
+		mutex.Lock()
+		samples = append(samples, local...)
+		mutex.Unlock()
+	})
+	b.StopTimer()
+	b.ReportMetric(float64(processCPU()-cpu)/float64(b.N), "process-cpu-ns/op")
+	slices.Sort(samples)
+	for _, percentile := range []int{50, 95, 99} {
+		index := min(len(samples)-1, len(samples)*percentile/100)
+		b.ReportMetric(float64(samples[index])/1000, fmt.Sprintf("p%d-us", percentile))
+	}
 }
 
 func BenchmarkNativePacketDownload(b *testing.B) {
