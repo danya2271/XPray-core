@@ -15,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -50,6 +51,7 @@ type AlwaysOnInboundHandler struct {
 	workers        []worker
 	mux            *mux.Server
 	tag            string
+	managed        bool
 }
 
 func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *proxyman.ReceiverConfig, proxyConfig interface{}) (*AlwaysOnInboundHandler, error) {
@@ -88,6 +90,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		proxy:          p,
 		mux:            mux.NewServer(ctx),
 		tag:            tag,
+		managed:        handoff.FromContext(ctx) != nil,
 	}
 
 	uplinkCounter, downlinkCounter := getStatCounter(core.MustFromContext(ctx), tag)
@@ -172,6 +175,9 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 
 // Start implements common.Runnable.
 func (h *AlwaysOnInboundHandler) Start() error {
+	if h.managed && len(h.workers) == 0 {
+		return errors.New("handoff is not supported for inbound without a managed worker ", h.tag)
+	}
 	// for inbound without worker (TUN)
 	if run, ok := h.proxy.(common.Runnable); ok {
 		if err := run.Start(); err != nil {

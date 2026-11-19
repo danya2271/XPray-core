@@ -16,6 +16,28 @@ import (
 
 const tcpProcessTestEnv = "XRAY_TEST_HANDOFF_TCP_CHILD"
 
+func TestRejectConnectedTCPDescriptor(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	conn, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	file, err := conn.File()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if gate, err := ImportTCPListener(file); err == nil {
+		gate.Close()
+		t.Fatal("a non-listening descriptor passed readiness validation")
+	}
+}
+
 func TestInheritedTCPListenerAcrossProcesses(t *testing.T) {
 	if value, ok := os.LookupEnv(tcpProcessTestEnv); ok {
 		runTCPChild(t, value)

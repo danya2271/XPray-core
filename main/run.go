@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/main/commands/base"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 )
 
 var cmdRun = &base.Command{
@@ -57,6 +59,7 @@ var (
 	dump        = cmdRun.Flag.Bool("dump", false, "Dump merged config only, without launching Xray server.")
 	test        = cmdRun.Flag.Bool("test", false, "Test config file only, without launching Xray server.")
 	format      = cmdRun.Flag.String("format", "auto", "Format of input file.")
+	handoffFile = cmdRun.Flag.String("handoff-manifest", "", "Start a paused generation using inherited listeners and a private local control socket.")
 	// TODO: Restore this flag and its help text when Lua privileged signature authorization is re-enabled.
 	// luaPrivilegedPublicKey = cmdRun.Flag.String("lua-privileged-pubkey", "", "Unpadded Base64URL Ed25519 public key for privileged local Lua scripts.")
 
@@ -79,8 +82,25 @@ func executeRun(cmd *base.Command, args []string) {
 		os.Exit(errCode)
 	}
 
+	ctx := context.Background()
+	var generation *handoff.Generation
+	var controlPath string
+	if *handoffFile != "" && !*test {
+		manifest, err := loadHandoffManifest(*handoffFile)
+		if err != nil {
+			log.Fatalf("Failed to read handoff manifest: %v", err)
+		}
+		generation, err = handoff.ImportGeneration(manifest)
+		if err != nil {
+			log.Fatalf("Failed to start handoff generation: %v", err)
+		}
+		defer generation.Close()
+		ctx = handoff.WithGeneration(ctx, generation)
+		controlPath = manifest.Control
+	}
+
 	printVersion()
-	server, err := startXray()
+	server, err := startXrayWithContext(ctx)
 	if err != nil {
 		fmt.Println("Failed to start:", err)
 		// Configuration error. Exit with a special value to prevent systemd from restarting.
@@ -101,12 +121,31 @@ func executeRun(cmd *base.Command, args []string) {
 	// Explicitly triggering GC to remove garbage from config loading.
 	runtime.GC()
 	debug.FreeOSMemory()
+	if generation != nil {
+		if err := generation.Ready(); err != nil {
+			log.Fatalf("Handoff generation not ready: %v", err)
+		}
+		listener, err := handoff.ListenControl(controlPath, generation)
+		if err != nil {
+			log.Fatalf("Failed to publish handoff control socket: %v", err)
+		}
+		defer listener.Close()
+	}
 
 	{
 		osSignals := make(chan os.Signal, 1)
 		signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
 		<-osSignals
 	}
+}
+
+func loadHandoffManifest(path string) (handoff.Manifest, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return handoff.Manifest{}, err
+	}
+	defer f.Close()
+	return handoff.ReadManifest(f)
 }
 
 func dumpConfig() int {
@@ -214,7 +253,7 @@ func getConfigFormat() string {
 	return f
 }
 
-func startXray() (core.Server, error) {
+func startXrayWithContext(ctx context.Context) (core.Server, error) {
 	// TODO: Restore public key initialization when Lua privileged signature authorization is re-enabled.
 	// if err := lua.SetPrivilegedPublicKey(*luaPrivilegedPublicKey); err != nil {
 	// 	return nil, errors.New("failed to configure Lua privileged authorization").Base(err)
@@ -227,7 +266,7 @@ func startXray() (core.Server, error) {
 		return nil, errors.New("failed to load config files: [", configFiles.String(), "]").Base(err)
 	}
 
-	server, err := core.New(c)
+	server, err := core.NewWithContext(ctx, c)
 	if err != nil {
 		return nil, errors.New("failed to create server").Base(err)
 	}

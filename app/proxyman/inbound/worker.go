@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/proxy"
 	hysteria_proxy "github.com/xtls/xray-core/proxy/hysteria"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"github.com/xtls/xray-core/transport/internet/hysteria"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tcp"
@@ -133,6 +134,28 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 
 func (w *tcpWorker) Start() error {
 	ctx := context.Background()
+	var managed *handoff.Generation
+	if generation := handoff.FromContext(w.ctx); generation != nil {
+		if w.stream.ProtocolName == "grpc" {
+			if (w.stream.FinalMask != nil && w.stream.FinalMask.HasTCPMasks()) || w.recvOrigDest ||
+				(w.stream.SocketSettings != nil && (w.stream.SocketSettings.AcceptProxyProtocol || w.stream.SocketSettings.Tproxy != internet.SocketConfig_Off)) {
+				return errors.New("unsupported listener options for managed gRPC inbound ", w.tag)
+			}
+			if w.address.Family().IsDomain() {
+				return errors.New("managed gRPC inbound requires a numeric IP: ", w.tag)
+			}
+			gate, err := generation.ClaimTCP(w.tag, w.address.IP(), int(w.port))
+			if err != nil {
+				return err
+			}
+			ctx = handoff.WithTCPListener(ctx, gate)
+			managed = generation
+		} else if w.tag != "api" || w.stream.ProtocolName != "tcp" || w.address.Family().IsDomain() || !w.address.IP().IsLoopback() {
+			// A private management API may be generation-local. Public
+			// transports must all have a real admission and drain mechanism.
+			return errors.New("handoff is not supported for TCP inbound ", w.tag, " (", w.stream.ProtocolName, ")")
+		}
+	}
 
 	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
 		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
@@ -143,6 +166,17 @@ func (w *tcpWorker) Start() error {
 	})
 	if err != nil {
 		return errors.New("failed to listen TCP on ", w.port).Base(err)
+	}
+	if managed != nil {
+		drainer, ok := hub.(interface{ Drain() })
+		if !ok {
+			hub.Close()
+			return errors.New("managed inbound has no drain operation ", w.tag)
+		}
+		if err := managed.AttachDrain(w.tag, int(w.port), drainer.Drain); err != nil {
+			hub.Close()
+			return err
+		}
 	}
 	w.hub = hub
 	return nil
@@ -411,6 +445,9 @@ func (w *udpWorker) clean() error {
 }
 
 func (w *udpWorker) Start() error {
+	if handoff.FromContext(w.ctx) != nil {
+		return errors.New("handoff is not supported for UDP inbound ", w.tag)
+	}
 	w.activeConn = make(map[connID]*udpConn, 16)
 	ctx := context.Background()
 	h, err := udp.ListenUDP(ctx, w.address, w.port, w.stream, udp.HubCapacity(256))
@@ -523,6 +560,9 @@ func (w *dsWorker) Port() net.Port {
 }
 
 func (w *dsWorker) Start() error {
+	if handoff.FromContext(w.ctx) != nil {
+		return errors.New("handoff is not supported for Unix inbound ", w.tag)
+	}
 	ctx := context.Background()
 	hub, err := internet.ListenUnix(ctx, w.address, w.stream, func(conn stat.Connection) {
 		go w.callback(conn)
