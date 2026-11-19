@@ -22,7 +22,6 @@ type Listener struct {
 	ctx                  context.Context
 	handler              internet.ConnHandler
 	local                net.Addr
-	config               *Config
 	trustedXForwardedFor []string
 
 	s *grpc.Server
@@ -47,42 +46,53 @@ func (l Listener) Close() error {
 	return nil
 }
 
+// Drain sends GOAWAY and waits for existing RPCs to end on their own. Only
+// call it after the replacement can serve new connections. Close remains the
+// immediate shutdown path, e.g. if systemd is stopping the entire service.
+func (l *Listener) Drain() {
+	l.s.GracefulStop()
+}
+
 func (l Listener) Addr() net.Addr {
 	return l.local
 }
 
 func Listen(ctx context.Context, address net.Address, port net.Port, settings *internet.MemoryStreamConfig, handler internet.ConnHandler) (internet.Listener, error) {
-	grpcSettings := settings.ProtocolSettings.(*Config)
-	var listener *Listener
-	if port == net.Port(0) { // unix
-		listener = &Listener{
-			handler: handler,
-			local: &net.UnixAddr{
-				Name: address.Domain(),
-				Net:  "unix",
-			},
-			config: grpcSettings,
-		}
-	} else { // tcp
-		listener = &Listener{
-			handler: handler,
-			local: &net.TCPAddr{
-				IP:   address.IP(),
-				Port: int(port),
-			},
-			config: grpcSettings,
-		}
+	var addr net.Addr
+	if port == 0 {
+		addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
+	} else {
+		addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
 	}
+	var streamListener net.Listener
+	var err error
+	if settings.FinalMask != nil {
+		streamListener, err = settings.FinalMask.Listen(ctx, addr)
+	} else {
+		streamListener, err = internet.ListenSystem(ctx, addr, settings.SocketSettings)
+	}
+	if err != nil {
+		return nil, errors.New("failed to listen on ", addr).Base(err)
+	}
+	return ServeListener(ctx, streamListener, settings, handler), nil
+}
 
-	listener.ctx = ctx
+// ServeListener attaches the gRPC transport to an already prepared listener.
+// Ownership of the listener is transferred to the gRPC server. The caller may
+// supply a paused handoff listener here to serve from a shared accept queue.
+func ServeListener(ctx context.Context, streamListener net.Listener, settings *internet.MemoryStreamConfig, handler internet.ConnHandler) *Listener {
+	grpcSettings := settings.ProtocolSettings.(*Config)
+	listener := &Listener{ctx: ctx, handler: handler, local: streamListener.Addr()}
 	if settings.SocketSettings != nil {
 		listener.trustedXForwardedFor = settings.SocketSettings.TrustedXForwardedFor
+		if settings.SocketSettings.AcceptProxyProtocol {
+			errors.LogWarning(ctx, "accepting PROXY protocol")
+		}
 	}
 
 	config := tls.ConfigFromStreamSettings(settings)
 
 	var options []grpc.ServerOption
-	var s *grpc.Server
 	if config != nil {
 		// gRPC server may silently ignore TLS errors
 		options = append(options, grpc.Creds(credentials.NewTLS(config.GetTLSConfig(tls.WithNextProto("h2")))))
@@ -94,44 +104,21 @@ func Listen(ctx context.Context, address net.Address, port net.Port, settings *i
 		}))
 	}
 
-	s = grpc.NewServer(options...)
+	s := grpc.NewServer(options...)
 	listener.s = s
-
-	if settings.SocketSettings != nil && settings.SocketSettings.AcceptProxyProtocol {
-		errors.LogWarning(ctx, "accepting PROXY protocol")
+	errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")
+	encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
+	if config := reality.ConfigFromStreamSettings(settings); config != nil {
+		streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
 	}
 
 	go func() {
-		var streamListener net.Listener
-		var err error
-		var addr net.Addr
-		if port == net.Port(0) { // unix
-			addr = &net.UnixAddr{Name: address.Domain(), Net: "unix"}
-		} else { // tcp
-			addr = &net.TCPAddr{IP: address.IP(), Port: int(port)}
-		}
-		if settings.FinalMask != nil {
-			streamListener, err = settings.FinalMask.Listen(ctx, addr)
-		} else {
-			streamListener, err = internet.ListenSystem(ctx, addr, settings.SocketSettings)
-		}
-		if err != nil {
-			errors.LogErrorInner(ctx, err, "failed to listen on ", address, ":", port)
-			return
-		}
-
-		errors.LogDebug(ctx, "gRPC listen for service name `"+grpcSettings.getServiceName()+"` tun `"+grpcSettings.getTunStreamName()+"` multi tun `"+grpcSettings.getTunMultiStreamName()+"`")
-		encoding.RegisterGRPCServiceServerX(s, listener, grpcSettings.getServiceName(), grpcSettings.getTunStreamName(), grpcSettings.getTunMultiStreamName())
-
-		if config := reality.ConfigFromStreamSettings(settings); config != nil {
-			streamListener = goreality.NewListener(streamListener, config.GetREALITYConfig())
-		}
-		if err = s.Serve(streamListener); err != nil {
+		if err := s.Serve(streamListener); err != nil {
 			errors.LogInfoInner(ctx, err, "Listener for gRPC ended")
 		}
 	}()
 
-	return listener, nil
+	return listener
 }
 
 func init() {
