@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -40,6 +41,7 @@ type requestHandler struct {
 	ln             *Listener
 	sessionMu      *sync.Mutex
 	sessions       sync.Map
+	peer           atomic.Pointer[handoffPeer]
 	localAddr      net.Addr
 	socketSettings *internet.SocketConfig
 }
@@ -49,18 +51,8 @@ type httpSession struct {
 	reapTimer   *time.Timer
 }
 
-func (h *requestHandler) upsertSession(sessionId string) *httpSession {
-	// fast path
+func (h *requestHandler) upsertSessionLocked(sessionId string) *httpSession {
 	currentSessionAny, ok := h.sessions.Load(sessionId)
-	if ok {
-		return currentSessionAny.(*httpSession)
-	}
-
-	// slow path
-	h.sessionMu.Lock()
-	defer h.sessionMu.Unlock()
-
-	currentSessionAny, ok = h.sessions.Load(sessionId)
 	if ok {
 		return currentSessionAny.(*httpSession)
 	}
@@ -69,11 +61,14 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 		uploadQueue: NewUploadQueue(h.ln.config.GetNormalizedScMaxBufferedPosts()),
 	}
 
-	h.sessions.Store(sessionId, s)
 	s.reapTimer = time.AfterFunc(30*time.Second, func() {
-		h.sessions.Delete(sessionId)
-		s.uploadQueue.Close()
+		h.sessionMu.Lock()
+		defer h.sessionMu.Unlock()
+		if h.sessions.CompareAndDelete(sessionId, s) {
+			s.uploadQueue.Close()
+		}
 	})
+	h.sessions.Store(sessionId, s)
 
 	return s
 }
@@ -144,6 +139,11 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 
+	currentSession, handled := h.resolveSession(writer, request, sessionId)
+	if handled {
+		return
+	}
+
 	var remoteAddr net.Addr
 	var err error
 	remoteAddr, err = net.ResolveTCPAddr("tcp", request.RemoteAddr)
@@ -165,10 +165,6 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	}
 	remoteAddr = http_proto.ApplyTrustedXForwardedFor(request.Header, trustedXFF, remoteAddr)
 
-	var currentSession *httpSession
-	if sessionId != "" {
-		currentSession = h.upsertSession(sessionId)
-	}
 	scMaxEachPostBytes := int(h.ln.config.GetNormalizedScMaxEachPostBytes().To)
 	isUplinkRequest := false
 
@@ -330,7 +326,7 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
 			currentSession.reapTimer.Stop()
-			defer h.sessions.Delete(sessionId)
+			defer h.sessions.CompareAndDelete(sessionId, currentSession)
 		}
 
 		// magic header instructs nginx + apache to not buffer response body
@@ -482,6 +478,7 @@ type Listener struct {
 	listener   net.Listener
 	h3listener http3.QUICListener
 	config     *Config
+	handler    *requestHandler
 	addConn    internet.ConnHandler
 	isH3       bool
 }
@@ -505,6 +502,7 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		sessions:       sync.Map{},
 		socketSettings: streamSettings.SocketSettings,
 	}
+	l.handler = handler
 	tlsConfig := getTLSConfig(streamSettings)
 	l.isH3 = len(tlsConfig.NextProtos) == 1 && tlsConfig.NextProtos[0] == "h3"
 
