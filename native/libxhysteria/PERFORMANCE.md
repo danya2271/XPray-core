@@ -1742,6 +1742,40 @@ The separate mixed-load smoke test delivered 4,000/4,000 4 KiB UDP
 datagrams at 154.69 MiB/s of TCP background traffic with zero sampled
 kernel UDP drops. Raw logs are in `build_assets/udp-header-20261119/`.
 
+## 2026-11-19 UDP Client Session Lookup
+
+The client session map now stores each UDP flow's receive-credit handle with
+its session ID. Incoming QUIC datagrams avoid a second flow-map mutex/hash
+lookup, and session-map reads no longer await an async mutex. No lock is held
+across an `.await`.
+
+The same loopback/header-mask benchmark ran three times per mode and revision
+at `-test.cpu=1`. This only limits Go `GOMAXPROCS`; it does not pin native worker
+threads to a CPU. Values below are medians. `Native before` is the parent
+revision immediately before this change; `Native after` is this patch. The
+published direct-header figures are an older native baseline; their scenario
+is similar, but should not be treated as a paired run.
+
+| Metric | Native before | Native after | Go current |
+|---|---:|---:|---:|
+| Idle UDP p50 / p95 / p99, µs | 104.7 / 162.5 / 215.0 | 96.2 / 142.8 / 192.4 | 84.2 / 113.3 / 150.3 |
+| 4 KiB UDP echo throughput, MB/s | 55.28 | 54.66 | 31.85 |
+| Process CPU per exchange, µs | 196.6 | 199.4 | 242.2 |
+| Go allocations per exchange, B / allocs | 671 / 28 | 671 / 28 | 57,682 / 149 |
+
+Versus this patch's native baseline, UDP p50/p95/p99 fall about 8%/12%/11%;
+throughput is effectively unchanged (-1.1%) and process CPU is effectively
+unchanged (+1.4%). Native remains slower than Go for idle UDP p50/p99 in this
+fixture (about 15%/28%), although echo throughput is 1.72× Go and Go-side
+allocations are 98.8% lower. These allocation figures exclude Rust, allocator
+retention, kernel buffers, and total RSS. The earlier published direct-header
+comparison recorded 39.13 MB/s native versus 32.54 MB/s Go and 205.2 versus
+151.7 µs UDP p99; the higher current throughput is from a later harness run and
+does not isolate this lock change. No WAN or packet-loss conclusion follows.
+
+Raw samples, benchmark binaries, archive hashes, and the source patch are in
+`build_assets/udp-session-lookup-20261119/`.
+
 ## 2026-11-19 Buffered Reads and Go Scheduling
 
 An ABBA experiment tried receiving a queued frame before acquiring the

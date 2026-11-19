@@ -33,7 +33,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
 
@@ -676,30 +676,6 @@ impl Bus {
         }
         Ok(total)
     }
-    async fn udp_payload(&self, id: u64, address: &[u8], payload: &[u8]) -> Result<()> {
-        self.udp_payload_parts(id, address, std::iter::once(payload))
-            .await
-    }
-    async fn udp_payload_parts<'a>(
-        &self,
-        id: u64,
-        address: &[u8],
-        payloads: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
-    ) -> Result<()> {
-        if address.is_empty() || address.len() > protocol::MAX_ADDRESS {
-            return Err("invalid bridge address".into());
-        }
-        let credit = self
-            .flows
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|flow| flow.receive_credit.clone());
-        let Some(credit) = credit else { return Ok(()) };
-        self.udp_payload_with_credit(id, &credit, address, payloads)
-            .await
-    }
-
     async fn udp_payload_with_credit<'a>(
         &self,
         id: u64,
@@ -1622,12 +1598,14 @@ where
     Ok(false)
 }
 
+type ClientSessions = Arc<std::sync::RwLock<HashMap<u32, (u64, Arc<Semaphore>)>>>;
+
 async fn client_udp(
     connection: quinn::Connection,
     bus: Arc<Bus>,
-    sessions: Arc<Mutex<HashMap<u32, u64>>>,
+    sessions: ClientSessions,
 ) -> Result<()> {
-    let start = Instant::now();
+    let reassembly_clock = Instant::now();
     let mut defrag = Defragger::new(128)?.with_stats(bus.udp_reassembly_drops.clone());
     loop {
         let data = connection.read_datagram().await?;
@@ -1637,8 +1615,8 @@ async fn client_udp(
         let assembled = if message.count == 1 {
             None
         } else {
-            let Ok(Some(datagram)) = defrag.feed_parts(start.elapsed().as_nanos() as u64, &message)
-            else {
+            let now_ns = reassembly_clock.elapsed().as_nanos() as u64;
+            let Ok(Some(datagram)) = defrag.feed_parts(now_ns, &message) else {
                 continue;
             };
             Some(datagram)
@@ -1646,14 +1624,23 @@ async fn client_udp(
         let session = assembled
             .as_ref()
             .map_or(message.session, |datagram| datagram.session);
-        let id = sessions.lock().await.get(&session).copied();
-        if let Some(id) = id {
+        let session_flow = sessions
+            .read()
+            .unwrap()
+            .get(&session)
+            .map(|(id, credit)| (*id, credit.clone()));
+        if let Some((id, credit)) = session_flow {
             if let Some(datagram) = &assembled {
-                bus.udp_payload_parts(id, &datagram.address, datagram.payloads())
+                bus.udp_payload_with_credit(id, &credit, &datagram.address, datagram.payloads())
                     .await?;
             } else {
-                bus.udp_payload(id, message.address, message.payload)
-                    .await?;
+                bus.udp_payload_with_credit(
+                    id,
+                    &credit,
+                    message.address,
+                    std::iter::once(message.payload),
+                )
+                .await?;
             }
         }
     }
@@ -2078,7 +2065,7 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     bridge_tasks(bridge, outgoing, incoming_tx, bus.clone(), &mut tasks);
     let mut client = None;
-    let sessions = Arc::new(Mutex::new(HashMap::new()));
+    let sessions = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let mut udp_enabled = false;
     let mut http_guard = None;
     let mut http_driver = None;
@@ -2161,11 +2148,14 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
                         if !udp_enabled { bus.send(Frame::new(ERROR, id, "server disabled UDP")).await?; continue; }
                         let session = next_session;
                         next_session = next_session.checked_add(1).ok_or("UDP session IDs exhausted")?;
-                        let Ok((mut commands, _)) = bus.register(id, 0).await else {
+                        let Ok((mut commands, receive_credit)) = bus.register(id, 0).await else {
                             bus.send(Frame::new(ERROR, id, "native flow capacity reached")).await?;
                             continue;
                         };
-                        sessions.lock().await.insert(session, id);
+                        sessions
+                            .write()
+                            .unwrap()
+                            .insert(session, (id, receive_credit));
                         bus.send(Frame::new(OPENED, id, Bytes::new())).await?;
                         let connection = connection.clone(); let bus = bus.clone(); let sessions = sessions.clone();
                         tasks.spawn(async move {
@@ -2177,7 +2167,7 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
                                 if send_udp(&connection, session, packet, &command.data, &bus.udp_send_mtu_dropped).await.is_err() { break; }
                                 packet = packet.wrapping_add(1);
                             }
-                            sessions.lock().await.remove(&session);
+                            sessions.write().unwrap().remove(&session);
                             bus.done(id, Ok(())).await;
                             Ok(())
                         });
@@ -2673,7 +2663,12 @@ mod tests {
         let window = credit.available_permits();
         credit.acquire_many(window as u32).await.unwrap().forget();
 
-        let pending = bus.udp_payload(1, b"target", b"recovered");
+        let pending = bus.udp_payload_with_credit(
+            1,
+            &credit,
+            b"target",
+            std::iter::once(b"recovered".as_slice()),
+        );
         tokio::pin!(pending);
         assert!(
             poll_fn(|cx| {
@@ -2690,7 +2685,14 @@ mod tests {
         assert_eq!(parse_address(&data).unwrap().1, b"recovered");
         assert_eq!(credit.available_permits(), 0);
 
-        bus.udp_payload(1, b"target", b"dropped").await.unwrap();
+        bus.udp_payload_with_credit(
+            1,
+            &credit,
+            b"target",
+            std::iter::once(b"dropped".as_slice()),
+        )
+        .await
+        .unwrap();
         assert!(bridge.pop(false).unwrap().is_none());
         assert_eq!(bus.udp_credit_recovered.load(Ordering::Relaxed), 1);
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
@@ -2705,10 +2707,24 @@ mod tests {
         let (_, readable) = bus.register(2, 1).await.unwrap();
         let window = blocked.available_permits();
         blocked.acquire_many(window as u32).await.unwrap().forget();
-        bus.udp_payload(1, b"target", b"dropped").await.unwrap();
+        bus.udp_payload_with_credit(
+            1,
+            &blocked,
+            b"target",
+            std::iter::once(b"dropped".as_slice()),
+        )
+        .await
+        .unwrap();
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
         assert!(receiver.try_recv().is_err());
-        bus.udp_payload(2, b"target", b"delivered").await.unwrap();
+        bus.udp_payload_with_credit(
+            2,
+            &readable,
+            b"target",
+            std::iter::once(b"delivered".as_slice()),
+        )
+        .await
+        .unwrap();
         let frame = receiver.try_recv().unwrap();
         assert_eq!(frame.id, 2);
         assert_eq!(
@@ -2719,7 +2735,14 @@ mod tests {
         assert_eq!(blocked.available_permits(), 0);
         assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
         bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])));
-        bus.udp_payload(1, b"target", b"resumed").await.unwrap();
+        bus.udp_payload_with_credit(
+            1,
+            &blocked,
+            b"target",
+            std::iter::once(b"resumed".as_slice()),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             parse_address(&receiver.try_recv().unwrap().data).unwrap().1,
             b"resumed"
@@ -2983,9 +3006,14 @@ mod tests {
                 let (_commands, credit) = bus.register(1, 1).await.unwrap();
                 let window = credit.available_permits();
                 let fragments: Vec<_> = (0..count).map(|index| vec![index as u8; 8]).collect();
-                bus.udp_payload_parts(1, b"target", fragments.iter().map(Vec::as_slice))
-                    .await
-                    .unwrap();
+                bus.udp_payload_with_credit(
+                    1,
+                    &credit,
+                    b"target",
+                    fragments.iter().map(Vec::as_slice),
+                )
+                .await
+                .unwrap();
                 let data = if shared {
                     let (kind, id, data) = bridge.pop(false).unwrap().unwrap();
                     assert_eq!((kind, id), (DATAGRAM, 1));
@@ -2999,9 +3027,14 @@ mod tests {
                 assert_eq!(address, b"target");
                 assert_eq!(payload, fragments.concat());
                 assert_eq!(credit.available_permits(), window - 1);
-                bus.udp_payload_parts(1, b"target", fragments.iter().map(Vec::as_slice))
-                    .await
-                    .unwrap();
+                bus.udp_payload_with_credit(
+                    1,
+                    &credit,
+                    b"target",
+                    fragments.iter().map(Vec::as_slice),
+                )
+                .await
+                .unwrap();
                 assert_eq!(credit.available_permits(), window - 2);
             }
         }
