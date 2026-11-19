@@ -10,6 +10,7 @@ license = "MPL-2.0"
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
+aes = { version = "=0.8.4", optional = true }
 blake2b_simd = "=1.0.5"
 libc = "=0.2.191"
 getrandom = "=0.4.3"
@@ -37,7 +38,7 @@ h3-quinn = { path = "vendor/h3-quinn" }
 
 [features]
 probe = ["dep:bytes", "dep:h3", "dep:h3-quinn", "dep:http", "dep:quinn", "dep:rustls", "dep:rustls-pemfile", "dep:tokio"]
-engine = ["probe", "dep:serde", "dep:serde_json", "dep:webpki-roots", "dep:quinn-proto", "dep:httpdate"]
+engine = ["probe", "dep:aes", "dep:serde", "dep:serde_json", "dep:webpki-roots", "dep:quinn-proto", "dep:httpdate"]
 allocation-profile = ["engine"]
 
 [[bin]]

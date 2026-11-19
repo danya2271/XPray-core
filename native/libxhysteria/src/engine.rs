@@ -103,6 +103,8 @@ pub struct Config {
     pub packet_batch: bool,
     #[serde(default)]
     pub packet_local: String,
+    #[serde(default)]
+    pub quic_generation: Option<crate::generation_cid::Config>,
     pub diagnostic: bool,
     #[serde(default)]
     pub external_auth: bool,
@@ -1134,8 +1136,20 @@ fn endpoint(config: &Config, socket: NetworkSocket) -> Result<quinn::Endpoint> {
     } else {
         None
     };
+    let mut endpoint_config = quinn::EndpointConfig::default();
+    if let Some(generation) = config.quic_generation.clone() {
+        if !config.server || generation.key == [0; 16] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid QUIC generation config",
+            )
+            .into());
+        }
+        endpoint_config
+            .cid_generator(move || Box::new(crate::generation_cid::Generator::new(&generation)));
+    }
     let mut ep = quinn::Endpoint::new_with_abstract_socket(
-        quinn::EndpointConfig::default(),
+        endpoint_config,
         server,
         udp,
         runtime,

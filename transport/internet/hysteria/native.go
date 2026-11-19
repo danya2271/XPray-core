@@ -612,7 +612,13 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 		return nil, hy.Auth != "" && subtle.ConstantTimeCompare([]byte(auth), []byte(hy.Auth)) == 1
 	}
 	var raw net.PacketConn
-	if config.PacketBridge && settings.FinalMask != nil {
+	if ingress := generationFromContext(ctx); ingress != nil {
+		config.QUICGeneration = &native.QUICGenerationConfig{Key: ingress.key, Slot: ingress.slot}
+		config.PacketBridge = true
+		config.Salamander = ""
+		config.UDPMasks = nil
+		raw = ingress.packet
+	} else if config.PacketBridge && settings.FinalMask != nil {
 		masks := settings.FinalMask.WithPacketConnSetup(func(packet stdnet.PacketConn) { native.TunePacketSocket(packet, true, config.Diagnostic) })
 		raw, err = masks.ListenPacket(ctx, &net.UDPAddr{IP: address.IP(), Port: int(port)})
 	} else {
