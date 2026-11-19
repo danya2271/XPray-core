@@ -7,6 +7,7 @@ import (
 	"errors"
 	stdnet "net"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -58,6 +59,9 @@ var pooledNative = nativePools{entries: make(map[nativePoolKey]*nativePool)}
 
 func nativePoolLimit(config native.Config) (int, error) {
 	limit := 2
+	if config.ProcessWorkers > 4 || runtime.GOMAXPROCS(0) >= 8 {
+		limit = max(2, min(8, int(config.ProcessWorkers)))
+	}
 	if value := os.Getenv("XRAY_HYSTERIA_POOL_SIZE"); value != "" {
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 0 || n > 8 {

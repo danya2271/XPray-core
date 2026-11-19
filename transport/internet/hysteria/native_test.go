@@ -164,6 +164,17 @@ func TestNativeDisableGSOIsForwarded(t *testing.T) {
 	}
 }
 
+func TestNativeSharedConfigIgnoresClientWorkerOverride(t *testing.T) {
+	t.Setenv("XRAY_HYSTERIA_CLIENT_WORKERS", "invalid")
+	_, err := nativeConfig(&internet.MemoryStreamConfig{
+		SecuritySettings: &tls.Config{},
+		QuicParams:       &internet.QuicParams{DisableChromeParrot: true},
+	})
+	if err != nil {
+		t.Fatalf("client-only worker setting affected shared server config: %v", err)
+	}
+}
+
 func TestNativeRemotePortHopping(t *testing.T) {
 	for _, test := range []struct {
 		name      string

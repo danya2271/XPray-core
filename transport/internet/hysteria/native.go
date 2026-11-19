@@ -84,7 +84,6 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	c.KeepAlivePeriod = uint64(q.KeepAlivePeriod)
 	c.LossCompensation = !q.BrutalDisableLossCompensation
 	c.Diagnostic = os.Getenv("XRAY_NET_DIAG") == "1"
-	c.ProcessWorkers = uint8(min(4, max(1, runtime.GOMAXPROCS(0))))
 	memoryBytes, _ := nativeServerMemory()
 	c.SendBufferBytes = 8 << 20
 	c.ReceiveBufferBytes = uint32(min(uint64(8<<20), max(uint64(2<<20), memoryBytes/512)))
@@ -196,6 +195,20 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 		}
 	}
 	return c, nil
+}
+
+func nativeClientWorkers() (uint8, error) {
+	workers := min(4, max(1, runtime.GOMAXPROCS(0)))
+	if value := os.Getenv("XRAY_HYSTERIA_CLIENT_WORKERS"); value != "" {
+		configured, err := strconv.Atoi(value)
+		if err != nil || configured < 0 || configured > 16 {
+			return 0, fmt.Errorf("XRAY_HYSTERIA_CLIENT_WORKERS must be 0..16")
+		}
+		if configured != 0 {
+			workers = configured
+		}
+	}
+	return uint8(workers), nil
 }
 
 func nativeServerLimit(name string, fallback, maximum uint32) (uint32, error) {
@@ -426,6 +439,10 @@ func nativeDial(ctx context.Context, dest net.Destination, settings *internet.Me
 		}()
 	}
 	config, err := nativeConfig(settings)
+	if err != nil {
+		return nil, err
+	}
+	config.ProcessWorkers, err = nativeClientWorkers()
 	if err != nil {
 		return nil, err
 	}

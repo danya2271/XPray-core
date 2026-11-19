@@ -63,6 +63,17 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 	if testing.Short() {
 		t.Skip("packet-loss sampling takes twelve seconds per scenario")
 	}
+	pool := os.Getenv("XHYS_LOSS_POOL_SIZE")
+	switch pool {
+	case "":
+		pool = "1"
+	case "auto":
+		pool = ""
+	default:
+		if size, err := strconv.Atoi(pool); err != nil || size < 0 || size > 8 {
+			t.Fatal("XHYS_LOSS_POOL_SIZE must be auto or 0..8")
+		}
+	}
 	packets := 2000
 	if value := os.Getenv("XHYS_LOSS_PACKETS"); value != "" {
 		var err error
@@ -121,7 +132,7 @@ func TestHysteriaPacketLossUnderLoad(t *testing.T) {
 						t.Setenv("XRAY_HYSTERIA_NATIVE", "0")
 					}
 					t.Setenv("XRAY_HYSTERIA_BRIDGE", "shared")
-					t.Setenv("XRAY_HYSTERIA_POOL_SIZE", "1")
+					t.Setenv("XRAY_HYSTERIA_POOL_SIZE", pool)
 					before := native.Stats().StartedEngines
 					exit, caPath, _ := xrayServerWithConfig(t, true, configureMasks)
 					ca, err := os.ReadFile(caPath)
