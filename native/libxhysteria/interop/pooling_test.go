@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -18,8 +19,20 @@ import (
 )
 
 func TestNativePoolReusesSessionsAndStopsWithInstance(t *testing.T) {
-	for _, bridge := range []string{"shared", "socket"} {
-		t.Run(bridge, func(t *testing.T) {
+	for _, test := range []struct {
+		name, bridge, pool, workers string
+		cpus, sessions              int
+	}{
+		{"shared", "shared", "2", "", 4, 2},
+		{"socket", "socket", "2", "", 4, 2},
+		{"auto_single_cpu", "shared", "", "", 1, 2},
+		{"auto_four_cpus", "shared", "", "", 4, 2},
+		{"auto_eight_cpus", "shared", "", "", 8, 4},
+		{"eight_workers", "shared", "", "8", 8, 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			previous := runtime.GOMAXPROCS(test.cpus)
+			t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
 			t.Setenv("XRAY_HYSTERIA_NATIVE", "0")
 			server, caPath := xrayServer(t, true)
 			ca, err := os.ReadFile(caPath)
@@ -27,8 +40,9 @@ func TestNativePoolReusesSessionsAndStopsWithInstance(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("XRAY_HYSTERIA_NATIVE", "1")
-			t.Setenv("XRAY_HYSTERIA_BRIDGE", bridge)
-			t.Setenv("XRAY_HYSTERIA_POOL_SIZE", "2")
+			t.Setenv("XRAY_HYSTERIA_BRIDGE", test.bridge)
+			t.Setenv("XRAY_HYSTERIA_POOL_SIZE", test.pool)
+			t.Setenv("XRAY_HYSTERIA_CLIENT_WORKERS", test.workers)
 			before := native.Stats()
 			client := embeddedClient(t, server, ca, true)
 			tcp, udp := echoTargets(t)
@@ -60,10 +74,10 @@ func TestNativePoolReusesSessionsAndStopsWithInstance(t *testing.T) {
 				}
 			}
 			stats := native.Stats()
-			if stats.StartedEngines-before.StartedEngines != 2 {
-				t.Fatalf("expected two native engines for 12 live flows: before=%+v after=%+v", before, stats)
+			if stats.StartedEngines-before.StartedEngines != int64(test.sessions) {
+				t.Fatalf("expected %d native engines for 12 live flows: before=%+v after=%+v", test.sessions, before, stats)
 			}
-			// Releasing one stream cannot close either multiplexed session.
+			// Releasing one stream cannot close the remaining multiplexed flows.
 			connections[0].Close()
 			payload := []byte("other streams stay alive")
 			connections[1].Write(payload)

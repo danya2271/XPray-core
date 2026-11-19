@@ -495,9 +495,14 @@ credit promptly. `CloseWrite` still sends FIN and allows the response to finish.
 The server classifies bidirectional streams before passing HTTP requests to
 HTTP/3; TCP streams do not accumulate in HTTP/3's request-completion table.
 
-Each outbound lazily opens up to two QUIC sessions, sharing them across TCP and
-UDP flows with the same Xray instance, transport settings, and peer. Closing a
-flow preserves the session. There are 64 reserved flows per pooled session,
+Each outbound lazily opens QUIC sessions shared across TCP and UDP flows with
+the same Xray instance, transport settings, and peer. Automatic sizing retains
+two sessions below eight Go CPUs and selects four with eight or more CPUs.
+An explicit client worker budget above four raises that limit to the worker
+budget, capped at eight. The two-session floor preserves the previous 128-flow
+capacity on small CPUs. A single flow still opens only one session; extra sessions require
+concurrently live flows. Closing a flow preserves the session. There are
+64 reserved flows per pooled session,
 a global limit of 16 pooled outbound sessions including handshakes in progress,
 and a 30-second idle timeout. A full pool waits for capacity with cancellation
 and a 12-second timeout. The native handshake/auth timeout is ten seconds; the
@@ -511,7 +516,8 @@ also covers an advertised RX limit when the local controller is BBR or Reno.
 | --- | --- | --- |
 | `XRAY_HYSTERIA_NATIVE` | unset | `1` forces native, `0` forces Go; unset uses JSON selection |
 | `XRAY_HYSTERIA_BRIDGE` | shared on amd64/arm64 | `socket` restores socket IPC |
-| `XRAY_HYSTERIA_POOL_SIZE` | `2` | `1..8` sessions per outbound; `0` restores per-flow engines |
+| `XRAY_HYSTERIA_POOL_SIZE` | auto | Two/four automatically; explicit client workers above four allow up to eight; `1..8` overrides sessions per outbound; `0` restores per-flow engines |
+| `XRAY_HYSTERIA_CLIENT_WORKERS` | `0` | `0`: automatic (up to four from `GOMAXPROCS`); `1..16`: explicit total client Rust workers, fixed by the first engine |
 | `XRAY_HYSTERIA_SERVER_WORKERS` | `0` | `0`: automatic (up to four); `1..16`: explicit server runtime threads |
 | `XRAY_HYSTERIA_SERVER_CONNECTIONS` | auto | Override native server QUIC connection cap (`1..4096`) |
 | `XRAY_HYSTERIA_SERVER_FLOWS` | auto | Override native server TCP/UDP flow cap (`1..16384`) |
@@ -653,7 +659,15 @@ cross-worker scheduling and connection-lock contention within one engine,
 but does not pin an OS thread to a particular CPU or provide load balancing
 between engines after assignment.
 Go configures up to four total pool workers from GOMAXPROCS; the first shared
-engine fixes that count. The low-level `process_workers` field accepts 0..16;
+engine fixes that count. `XRAY_HYSTERIA_CLIENT_WORKERS=8` enables eight client
+workers and, unless separately overridden, up to eight sessions per outbound.
+Set the variable before the first client engine starts. The eight-physical-core
+client fixture confirms that all eight Rust workers process traffic with eight
+active sessions. It also measures higher CPU per exchange and peak RSS than the
+four-worker automatic mode; eight workers are an explicit throughput/latency
+tradeoff rather than a CPU-saving default. See `PERFORMANCE.md` for the isolated
+client measurements. A single flow stays on one QUIC connection and cannot use
+eight QUIC drivers at once. The low-level `process_workers` field accepts 0..16;
 zero selects one worker. Splitting the runtime does not add worker threads,
 but each shard owns a separate reactor and scheduler. A single hot engine
 uses one Rust worker; skewed engine workloads can leave other shards idle.

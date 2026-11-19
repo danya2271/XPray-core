@@ -2388,3 +2388,243 @@ pass for `proxy/hysteria`, `transport/internet/xhysteria` and
 were rebuilt. Android validation is compilation/linking only. The local Go
 toolchain's Rust-bitcode archive workaround again used backup and EXIT-trap
 restoration; no dependency, global toolchain or linker configuration changed.
+
+## Eight-Physical-Core Client Concurrency (2026-11-20)
+
+The Linux-only `client_benchmark_test.go` fixture separates the client from
+the server and echo targets. The client is restricted to CPUs 8–15, eight
+distinct physical cores on the measured Xeon E5-2698 v3. A child process runs
+the native server and TCP/UDP echo targets on CPUs 0–3, four different physical
+cores with no SMT-sibling overlap. `GOMAXPROCS` is eight for the client and four
+for the server; the server has four native workers in every comparison. The
+process cgroup and its parents have no CPU or memory limit; the host has about
+62.6 GiB of RAM. A 1 GiB memory-pressure environment is not simulated.
+Unrelated host workloads remain uncontrolled, so these are local loopback samples, not isolated-host,
+WAN or Android-device results.
+
+Both native and Go clients connect to the same native server implementation,
+with Salamander and WireGuard-header masks enabled. The Go column is therefore
+Go/native interoperability, not a Go/Go transport comparison. The native pool
+uses multiple QUIC connections, whereas Go uses its normal connection reuse;
+the result includes session topology and cannot be attributed solely to the
+implementation language. All client connections are opened and warmed before
+timing. Eight and 32 concurrent TCP flows exchange either 64-byte messages or
+64 KiB in each direction. Reported MB/s sums both directions in decimal units.
+The table does not measure first-dial latency; extra sessions also add initial
+handshakes and setup allocations.
+
+Client CPU is the difference of `getrusage(RUSAGE_SELF)` around timed work,
+excluding the child server. CPU per exchange is normalized by completed echo
+exchanges; CPU cores is CPU time divided by elapsed wall time. Rust worker
+activity comes from individual `/proc/self/task/*/schedstat` deltas. An active
+worker used more than 1% of the interval; the hottest-worker percentage is one
+thread's CPU time divided by wall time, not a whole-process or per-CPU sample.
+Client peak RSS also uses `RUSAGE_SELF`, includes benchmark samples, calibration,
+Go and native allocators, and excludes the server and kernel socket memory.
+Go benchmark allocation counters do not count native allocations.
+
+The before executable has the `edbef502` transport behavior, four shared client
+workers and the previous two-session pool, plus the identical measurement
+fixture and explicit worker override. The automatic candidate retains four
+workers on eight CPUs and allows four concurrent sessions. Below eight Go
+CPUs, the previous two-session default is retained, including the one-CPU
+128-flow pool capacity. Explicit
+`XRAY_HYSTERIA_CLIENT_WORKERS=8` allows eight workers and an eight-session pool.
+The existing `XRAY_HYSTERIA_POOL_SIZE` override, global 16-session budget,
+64-flow session cap and fixed negotiated-rate single-session protection remain
+effective. Sessions are still opened lazily. Extra workers alone do not split
+a single QUIC connection, and a single TCP flow remains on one connection.
+
+The initial sweep also tested four workers with eight sessions and eight
+workers with four sessions. Eight workers with only four sessions left four
+Rust workers idle. Eight sessions with four workers reduced bulk tail latency
+in that sweep but consumed substantially more RSS than the four-session mode.
+A separate two-repeat experiment increased client scheduler event/global queue
+intervals from seven to 31. It showed no consistent CPU or latency benefit and
+was reverted; the final Rust runtime code is unchanged.
+
+### Isolated Client Results
+
+Medians of three fresh-process samples per configuration, three seconds per
+benchmark, with configuration order reversed for the second repetition:
+
+| Workload | Client | MB/s, both ways | Echo RTT p99, µs | Client CPU, µs/exchange | Client peak RSS, MiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 8 flows, 64 B | Before, 4 workers / 2 sessions | — | 441.6 | 54.81 | 41.08 |
+| 8 flows, 64 B | Automatic, 4 / 4 | — | 420.7 | 67.05 | 42.51 |
+| 8 flows, 64 B | Explicit 8 / 8 | — | 380.3 | 72.31 | 44.75 |
+| 8 flows, 64 B | Go client | — | 468.0 | 46.28 | 38.72 |
+| 8 flows, 64 KiB | Before, 4 / 2 | 578.47 | 5754 | 454.09 | 53.30 |
+| 8 flows, 64 KiB | Automatic, 4 / 4 | 688.44 | 3428 | 513.68 | 65.57 |
+| 8 flows, 64 KiB | Explicit 8 / 8 | 751.06 | 3276 | 567.00 | 92.03 |
+| 8 flows, 64 KiB | Go client | 209.52 | 12121 | 1282.23 | 38.72 |
+| 32 flows, 64 B | Before, 4 / 2 | — | 1232 | 39.40 | 47.96 |
+| 32 flows, 64 B | Automatic, 4 / 4 | — | 1228 | 50.75 | 50.23 |
+| 32 flows, 64 B | Explicit 8 / 8 | — | 1343 | 64.13 | 51.43 |
+| 32 flows, 64 B | Go client | — | 1282 | 32.74 | 45.59 |
+| 32 flows, 64 KiB | Before, 4 / 2 | 572.78 | 26255 | 466.62 | 64.63 |
+| 32 flows, 64 KiB | Automatic, 4 / 4 | 653.82 | 17135 | 522.11 | 73.64 |
+| 32 flows, 64 KiB | Explicit 8 / 8 | 715.48 | 11058 | 566.74 | 100.70 |
+| 32 flows, 64 KiB | Go client | 178.15 | 51857 | 1445.65 | 48.51 |
+
+At 32 bulk flows, automatic sizing improves delivered throughput by 14.1% and
+reduces p99 by 34.7% against the previous native default, while CPU per exchange
+rises 11.9% and client peak RSS rises about 9 MiB. It delivers 3.67 times the
+Go client's bulk rate with about 64% less client CPU per exchange in this
+particular topology. Explicit 8 / 8 delivers 4.02 times that Go rate and cuts
+the previous native bulk p99 by 57.9%, at a higher memory and CPU cost.
+
+This is not a universal CPU or memory optimization. For 32 concurrent 64-byte
+flows, automatic p99 is effectively unchanged from before, while CPU per
+exchange rises 28.8%; Go uses less CPU than either native configuration. The
+eight-worker mode has worse small-message p99 than automatic in that case.
+It is not selected automatically. `XRAY_HYSTERIA_POOL_SIZE=2` restores the
+previous session count when short-message CPU efficiency matters more than
+parallel bulk throughput. Four workers with an explicit eight-session pool
+are also available, with the same higher per-session memory costs.
+
+At 32 bulk flows, the hottest Rust thread uses 72.38% of one core before,
+48.45% with automatic sizing and 29.23% with explicit 8 / 8. There are two,
+four and eight active Rust workers respectively. Whole-client CPU time is
+2.039, 2.595 and 3.096 core-seconds per wall second. All eight workers therefore
+perform useful work in 8 / 8; extra parallelism also costs additional total CPU.
+There is no affinity pinning or live migration of already assigned engines.
+Fixed-rate single-session configurations retain their single-connection
+parallelism limitation to preserve the negotiated bandwidth allowance.
+
+Raw sweep, rejected interval experiment and final samples are under
+`build_assets/client8-20261120/`. Final logs are `final-r*-p*-*.log`; each holds
+both small-message and bulk measurements. Reproduce one automatic sample
+after building the tagged interop executable:
+
+```sh
+XHYS_CLIENT_SERVER_CPUS=0-3 XHYS_BENCH_PARALLELISM=4 \
+  taskset -c 8-15 interop.test -test.run '^$' \
+  -test.bench '^BenchmarkIsolatedClientParallel(Latency|Transfer)$' \
+  -test.benchtime 3s -test.cpu 8 -test.count 1
+```
+
+Use CPU sets appropriate to the host's actual physical-core/SMT topology and
+unset inherited pool/worker overrides for the automatic case. Add
+`XRAY_HYSTERIA_CLIENT_WORKERS=8` for 8 / 8 or `XHYS_CLIENT_BACKEND=go` for Go.
+`XHYS_BENCH_PARALLELISM=1` selects eight flows with `-test.cpu 8`.
+
+### Single-Flow, One-CPU and Correctness Controls
+
+With one 64-byte flow and eight client CPUs, three repetitions per process
+have before/automatic/8-worker/Go p99 of 195.0/198.3/197.7/180.8 µs and client
+CPU of 69.16/69.77/68.41/68.62 µs per exchange. Every native variant creates
+one session and has one active Rust worker. Additional workers do not improve
+a single flow here; Go's single-flow tail is lower. Raw logs are
+`sequential-*.log`.
+
+An initial one-CPU experiment allowed just one automatic session. It slightly
+reduced sampled CPU and RSS, but also halved the default pool's reserved flow
+capacity from 128 to 64. That change was rejected. Final automatic sizing
+retains two sessions on one CPU, matching the previous admission capacity.
+The initial experiment's `cpu1-r*-*.log` and `loss-cpu1.log` are not final
+one-CPU results.
+
+Final two-session one-CPU controls are `control-release-r*-*.log`. Their
+three-sample 64-byte medians are 390.6 → 390.4 µs p99 and 50.44 → 50.48 µs
+CPU per exchange. Bulk tails varied more, so an additional four fresh samples
+per variant alternated ordering, measured only bulk and used three-second
+intervals (`control-cpu1-abba-*.log`). Before/after medians are 326.93/324.53
+MB/s, 377.55/381.02 µs CPU per exchange, 39.96/40.94 MiB client peak RSS and
+3379/3703 µs p99. Individual p99 ranges overlap: 2774–3953 µs before and
+2984–4925 µs after. No one-CPU tail-latency improvement is claimed. A final
+eight-CPU automatic control delivers 642.62 MB/s with 523.85 µs CPU per bulk
+exchange, four sessions and four active workers; its p99 is 18.645 ms
+(`control-release-cpu8-auto.log`).
+
+The single-session strict control matrix receives 20,000/20,000 sequence-checked
+application UDP replies, with zero sampled owned kernel UDP drops and no duplicates. It
+covers 256 B and 4 KiB payloads in eight-CPU paced cascade, saturated cascade,
+explicit-eight-worker saturated cascade, direct control and final one-CPU
+paced cascade. This fixture originally forced `XRAY_HYSTERIA_POOL_SIZE=1`,
+so these controls do not validate the new multi-session topology, even when
+eight runtime workers are configured. Eight-CPU cases use the measured
+`client8-final.test`;
+`client8-release.test` adds only the one-CPU session floor and its tests, and
+is used for the final single-session one-CPU control (`loss-cpu1-release.log`).
+Eight-CPU session policies are identical in both executables. Binary SHA-256
+hashes are retained in `binaries.sha256`.
+
+Achieved background traffic is about 126 MiB/s in paced eight-CPU cases,
+264–271 MiB/s in saturated cascades, and 31.7–31.8 MiB/s in the final one-CPU
+case. Single-session cascade UDP p99 is 1.98–2.82 ms with four configured client
+workers and 2.32–3.44 ms with eight configured workers. Final single-session
+one-CPU UDP p99 is 6.29–6.45 ms.
+Some eight-CPU maximum RTTs still reach approximately 27 ms despite zero
+application loss. This does not establish zero loss or bounded jitter on a
+production WAN, nor does it equate QUIC's retransmitted-packet counters with
+application UDP loss.
+
+Final pool integration tests cover shared/socket bridges, one/eight Go CPUs,
+an explicit eight-worker pool, retirement on instance close and fixed Brutal
+rate protection. Worker parsing and auto sizing, rate clamps, cancellation and
+server independence from the client-only override pass the Go race run in
+`proxy/hysteria`, `transport/internet/xhysteria` and
+`transport/internet/hysteria`. All 140 packet-mask interoperability cases and
+both cascade port-hopping cases pass on the final release executable.
+Linux native server and Android arm64/API 26 binaries were linked successfully;
+Android is compilation/linking validation, not a device measurement. The
+existing native archive bitcode workaround again restored both target archive
+sets after linking. Final logs are `pool-release.log`, `interop-release.log`,
+`validate-go-release.log` and `validate-android-release.log` in the same artifact
+directory. No protocol, runtime scheduling, bridge capacity or payload-copy
+implementation changed in this iteration.
+
+### Scaled Session Loss Matrix
+
+The loss fixture now accepts `XHYS_LOSS_POOL_SIZE=auto` to test production
+session sizing, or `0..8` for an explicit value. Its default remains one to
+preserve older comparisons. The scaled tests run each payload size in a fresh
+process so delayed pool retirement cannot consume the next case's global
+session slots. Unlike the isolated client benchmarks, these tests place the
+client, both cascade endpoints and echo targets together on the selected CPU
+set; their RTT includes scheduling of the entire cascade.
+
+The scaled matrix delivers 20,000/20,000 UDP replies without sampled owned
+kernel UDP drops or duplicates:
+
+| Case | Client session limit per outbound | Delivered TCP background, MiB/s | UDP p99 across 256 B / 4 KiB, ms |
+| --- | ---: | ---: | ---: |
+| Eight CPUs, paced cascade | Automatic four | 126.30–126.78 | 11.642–14.334 |
+| Eight CPUs, saturated cascade | Automatic four | 308.57–309.20 | 1.905–13.058 |
+| Eight CPUs, saturated cascade, eight workers | Eight | 304.99–305.09 | 1.598–1.793 |
+| One CPU, paced cascade | Automatic two | 31.79–31.84 | 6.200–6.925 |
+| Eight CPUs, direct paced control | Automatic four | 127.70–127.91 | 1.064–1.188 |
+
+The workload has one UDP and four TCP flows per leg, so the eight-session limit
+opens five sessions per leg, ten globally; diagnostics show engines assigned
+to all eight client shards. The separate eight-flow client benchmark opens
+all eight sessions and measures activity on all eight workers.
+
+Because the first scaled paced samples had high tails, three additional fresh
+4 KiB cascade runs per configuration compare the previous two-session limit
+with automatic four, reversing order for the second pair. Every one of these
+12,000 additional replies is delivered with zero sampled kernel UDP drops and
+no duplicates. Delivered background medians are 126.85 and 126.79 MiB/s;
+median per-run UDP p99 is 1.933 and 1.742 ms, respectively. However, individual
+p99 values range from 1.920 to 13.416 ms with two sessions and from 1.519 to
+43.596 ms with four; the latter's maximum RTT reaches 116.483 ms. These samples
+do not establish a bounded-jitter or uniform UDP-latency improvement. The bulk
+TCP table must not be presented as evidence that every UDP tail improved.
+
+Raw logs are `loss-scaled-*.log` and `loss-paired-*.log`. The scaled and paired
+matrices total 32,000/32,000 replies. Their `client8-validated.test` has the
+final one/eight-CPU policy; `client8-complete.test` additionally retains the
+previous two-session policy on two through seven CPUs. The final pool tests
+explicitly verify one, four and eight CPUs, and the final Go race/Linux and
+Android links are `pool-complete.log`, `validate-go-complete.log` and
+`validate-android-complete.log`. No extra runtime threads are added on small
+CPUs. One scaled sample can be reproduced with:
+
+```sh
+XHYS_LOSS_POOL_SIZE=auto XHYS_LOSS_REQUIRE_ZERO=1 \
+  XHYS_LOSS_PACKET_MASK=header XHYS_LOSS_LOAD=1 XHYS_LOSS_PACED_MIBPS=128 \
+  taskset -c 8-15 interop.test \
+  -test.run '^TestHysteriaPacketLossUnderLoad$/native$/cascade_true$/size_4096$' \
+  -test.v -test.timeout 90s
+```
