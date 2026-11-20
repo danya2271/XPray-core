@@ -152,6 +152,9 @@ func (reader *QUICRouteReader) Route(datagram []byte, now time.Time) (byte, bool
 	if n < 8 || (!isInitial && !isEarlyData) {
 		return 0, false
 	}
+	if now.IsZero() {
+		now = time.Now() // Only client-chosen Initial/0-RTT needs a clock read.
+	}
 	key := initialKey{version: version, length: uint8(n)}
 	copy(key.cid[:], dcid)
 	r.mu.Lock()

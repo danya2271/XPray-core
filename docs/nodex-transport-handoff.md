@@ -1,14 +1,14 @@
 # NodeX transport handoff
 
-This branch provides transport building blocks and a managed-process pilot
-for gRPC and XHTTP. Normal `xray run` does not enable managed mode. Do not install this
-with the expectation that restarting the service will preserve a session.
+This branch provides a managed-process pilot for gRPC, XHTTP and Hysteria. It
+does not enable managed mode for a normal `xray run` or make a service restart
+seamless. Automatic retirement of a generation with Hysteria is not enabled.
 
 | Transport | Building block | Coverage |
 | --- | --- | --- |
 | gRPC | A paused `handoff.TCPListener` imports a duplicate of the same listen socket. `grpc.ServeListener` serves an existing listener and `Drain` waits for its accepted RPCs. | Two actual `xray run` processes are tested over gRPC and gRPC/REALITY on the same TCP port. Existing RPCs survive cutover and a failed-probe rollback on both processes. |
 | XHTTP | Managed processes share TCP or Unix listeners without rebinding. `SetHandoffPeer` seals the previous generation against new IDs. Only requests received by the wrong generation go over its private Unix socket. The retiring process counts both unfinished sessions and active or forwarded requests. | Two processes over XHTTP/REALITY and a shared Unix origin. A response forwarded through A keeps it in drain even if B owns that session. Transport tests also cover header IDs, `stream-up`, uplink-before-downlink, and loss of the lookup socket. A mixed roll through production Nginx is not tested here. |
-| Hysteria | `ListenGeneration` accepts a demultiplexed packet socket. Go and Rust issue opaque generation-aware QUIC IDs. `QUICRoutes` pins retransmitted Initials and routes established packets by server CID, independent of the peer address. `GenerationConnections` distinguishes live accepted QUIC connections from streams and distinguishes a stopped engine from a healthy idle one. | A live Hysteria stream stays on A while a new connection reaches B on the same UDP port. Tested with Go, Rust, and Salamander. Closing an old stream does not count its QUIC connection as closed. The test demultiplexer is not production ingress; tests do not exercise port hopping or a rolling process restart. |
+| Hysteria | A shared `UDPIngress` sends datagrams to independently launched Xray processes over connected Unix datagram sockets. It applies the public socket's mask once and keeps established QUIC CIDs with their owner. Rust reads the existing native packet wire without a second Go relay. | Go and Rust on IPv4 and IPv6; Salamander and Linux IPv4 `REDIRECT` port hops. An existing TCP stream and an application UDP flow keep exchanging data on A after cutover. New connections after a failed probe go back to A without closing sessions on B. |
 
 ## Managed-process pilot
 
@@ -27,8 +27,9 @@ Xray never rebinds a managed port in a new process:
 The supervisor must create the parent directory (mode `0700`) and configure a
 separate private API port for each generation. The pilot accepts managed gRPC
 TCP inbounds, XHTTP over TCP or Unix stream sockets, and a regular `api` on
-loopback. Other transports (including Hysteria and XHTTP/3) and unclaimed
-bindings prevent readiness. The supervisor owns both the socket file and its
+loopback, plus inherited Hysteria datagram channels (`udp` bindings with tag,
+numeric address, port, FD, 16-byte routing key and generation slot). XHTTP/3,
+unsupported transports, and unclaimed bindings prevent readiness. The supervisor owns both the socket file and its
 permissions; disposing of one process cannot unlink the public Unix origin.
 
 The private socket takes one newline-delimited command per connection and
@@ -47,12 +48,32 @@ For XHTTP, issue `unlink` on the active generation before stopping the old
 one. The API refuses to unlink a peer that hasn't settled. During a failed
 cutover keep both generations while established work survives.
 
+For Hysteria verify `quic-status` on each generation and drive the external
+selector with `handoff.SwitchWithIngress`. A process's `paused` state does not
+change UDP routing by itself. The relay currently requires an explicitly
+bound address, not a wildcard (per-packet local destination metadata for
+multihomed nodes is not wired yet). The relay adds one Unix datagram hop per
+direction. `BenchmarkManagedUDPIngressRoundTrip` measures that overhead on an
+unmasked loopback path, not throughput or latency on a VPS. Retain the old process: `drain` refuses to
+declare completion when UDP bindings are present. `quic-status` counts accepted
+QUIC connections, not application streams, and is not a handshake/queue fence.
+
 Test with real processes from the checkout:
 
 ```sh
 CGO_ENABLED=0 go build -tags xray_server -o /tmp/xray-generation ./main
 XRAY_TEST_GENERATION_BINARY=/tmp/xray-generation \
   go test -race -run '^TestManaged(Xray|XHTTP)Processes$' ./transport/internet/{grpc,splithttp}
+```
+
+To run the Hysteria process test with real IPv4 port redirects, use a private
+network namespace, and point `XRAY_TEST_GENERATION_BINARY` at a native-enabled
+Xray from this branch:
+
+```sh
+export XRAY_TEST_UDP_NAT_HOST_NS=$(readlink /proc/self/ns/net)
+export XRAY_TEST_ISOLATED_UDP_NAT=1 XRAY_TEST_MANAGED_NATIVE=1
+unshare -Urn sh -c 'ip link set lo up && go test -race -run "^TestManagedHysteriaProcesses$" ./transport/internet/hysteria'
 ```
 
 ## Before enabling NodeX activation
@@ -63,8 +84,9 @@ XRAY_TEST_GENERATION_BINARY=/tmp/xray-generation \
   descriptors (rather than creating competing listeners on the same port).
 - The supervisor must link, switch, and unlink XHTTP peers as described above.
   A public HTTP server must not expose `HandoffHandler`.
-- The UDP ingress must process any masks once, preserve addressing information,
-  and provide per-generation socket views without closing unrelated generations.
+- The supervisor must configure the shared UDP ingress from the validated node
+  config, preserve local destination metadata for wildcard binds, and own all
+  associated port redirects without changing the live rule set during a switch.
   CID keys and slot identity must survive supervisor reconnects; slots cannot be
   reused until their old CIDs cannot be received. Retiring a generation requires
   accounting for live QUIC connections, not just currently open proxy streams.

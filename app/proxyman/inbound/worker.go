@@ -134,9 +134,31 @@ func (w *tcpWorker) Proxy() proxy.Inbound {
 
 func (w *tcpWorker) Start() error {
 	ctx := context.Background()
+	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
+		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
+	}
 	var managed *handoff.Generation
 	if generation := handoff.FromContext(w.ctx); generation != nil {
-		if w.stream.ProtocolName == "grpc" || w.stream.ProtocolName == "splithttp" {
+		if w.stream.ProtocolName == "hysteria" {
+			if w.address.Family().IsDomain() || w.recvOrigDest {
+				return errors.New("managed Hysteria inbound needs a numeric IP and no original destination socket option")
+			}
+			return generation.AttachUDP(w.tag, int(w.port), w.address.IP(), func(packet net.PacketConn, key [16]byte, slot byte) (func() (uint64, bool), error) {
+				hub, err := hysteria.ListenGeneration(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
+					go w.callback(conn)
+				}, packet, key, slot)
+				if err != nil {
+					return nil, err
+				}
+				listener, ok := hub.(hysteria.GenerationListener)
+				if !ok {
+					hub.Close()
+					return nil, errors.New("managed Hysteria listener does not report generation connections")
+				}
+				w.hub = listener
+				return listener.GenerationConnections, nil
+			})
+		} else if w.stream.ProtocolName == "grpc" || w.stream.ProtocolName == "splithttp" {
 			if (w.stream.FinalMask != nil && w.stream.FinalMask.HasTCPMasks()) || w.recvOrigDest ||
 				(w.stream.SocketSettings != nil && (w.stream.SocketSettings.AcceptProxyProtocol || w.stream.SocketSettings.Tproxy != internet.SocketConfig_Off)) {
 				return errors.New("unsupported listener options for managed stream inbound ", w.tag)
@@ -155,10 +177,6 @@ func (w *tcpWorker) Start() error {
 			// transports must all have a real admission and drain mechanism.
 			return errors.New("handoff is not supported for TCP inbound ", w.tag, " (", w.stream.ProtocolName, ")")
 		}
-	}
-
-	if v, ok := w.proxy.(*hysteria_proxy.Server); ok {
-		ctx = hysteria.ContextWithValidator(ctx, v.HysteriaInboundValidator())
 	}
 
 	hub, err := internet.ListenTCP(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,10 +30,20 @@ type UnixBinding struct {
 	FD   int    `json:"fd"`
 }
 
+type UDPBinding struct {
+	Tag     string   `json:"tag"`
+	Address string   `json:"address"`
+	Port    int      `json:"port"`
+	FD      int      `json:"fd"`
+	Key     [16]byte `json:"key"`
+	Slot    byte     `json:"slot"`
+}
+
 type Manifest struct {
 	Control string        `json:"control"`
 	TCP     []TCPBinding  `json:"tcp"`
 	Unix    []UnixBinding `json:"unix,omitempty"`
+	UDP     []UDPBinding  `json:"udp,omitempty"`
 }
 
 type bindingKey struct {
@@ -45,6 +56,12 @@ type binding struct {
 	claimed  bool
 	drain    func() error
 	xhttp    XHTTP
+}
+
+type udpBinding struct {
+	spec   UDPBinding
+	packet net.PacketConn
+	count  func() (uint64, bool)
 }
 
 // XHTTP participates in the admission transaction in addition to having
@@ -62,6 +79,7 @@ type Generation struct {
 	mu       sync.Mutex
 	state    string
 	bindings map[bindingKey]*binding
+	udp      map[bindingKey]*udpBinding
 	control  string
 }
 
@@ -87,15 +105,16 @@ func ReadManifest(file io.Reader) (Manifest, error) {
 }
 
 func ImportGeneration(manifest Manifest) (*Generation, error) {
-	count := len(manifest.TCP) + len(manifest.Unix)
+	count := len(manifest.TCP) + len(manifest.Unix) + len(manifest.UDP)
 	if count == 0 || count > 128 {
-		return nil, errors.New("handoff requires 1–128 stream bindings")
+		return nil, errors.New("handoff requires 1–128 transport bindings")
 	}
 	if err := PrivateSocketDirectory(filepath.Dir(manifest.Control)); err != nil {
 		return nil, err
 	}
 	seen := make(map[int]bool, count)
 	g := &Generation{state: "starting", control: manifest.Control, bindings: make(map[bindingKey]*binding, count)}
+	g.udp = make(map[bindingKey]*udpBinding, len(manifest.UDP))
 	add := func(key bindingKey, fd int, path string) error {
 		if key.tag == "" || fd < 3 || seen[fd] || g.bindings[key] != nil {
 			return fmt.Errorf("invalid or duplicate handoff binding for %q port %d", key.tag, key.port)
@@ -140,7 +159,60 @@ func ImportGeneration(manifest Manifest) (*Generation, error) {
 			return nil, err
 		}
 	}
+	for _, spec := range manifest.UDP {
+		key := bindingKey{spec.Tag, spec.Port}
+		ip, err := netip.ParseAddr(spec.Address)
+		if spec.Port < 1 || spec.Port > 65535 || spec.Tag == "" || spec.FD < 3 || seen[spec.FD] ||
+			spec.Key == [16]byte{} || err != nil || ip.IsUnspecified() || ip.Zone() != "" || g.udp[key] != nil {
+			g.Close()
+			return nil, fmt.Errorf("invalid or duplicate inherited UDP binding for %q", spec.Tag)
+		}
+		seen[spec.FD] = true
+		file := os.NewFile(uintptr(spec.FD), "xray-inherited-packet-channel")
+		packet, err := importUDPPacket(file, net.UDPAddr{IP: ip.Unmap().AsSlice(), Port: spec.Port})
+		file.Close()
+		if err != nil {
+			g.Close()
+			return nil, fmt.Errorf("importing handoff datagram socket for %q: %w", spec.Tag, err)
+		}
+		g.udp[key] = &udpBinding{spec: spec, packet: packet}
+	}
 	return g, nil
+}
+
+func (g *Generation) AttachUDP(tag string, port int, address net.IP,
+	start func(net.PacketConn, [16]byte, byte) (func() (uint64, bool), error),
+) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	b := g.udp[bindingKey{tag, port}]
+	if b == nil || b.count != nil || g.state != "starting" {
+		return fmt.Errorf("no unclaimed UDP handoff binding for %q port %d", tag, port)
+	}
+	actual := b.packet.LocalAddr().(*net.UDPAddr).IP
+	if !actual.Equal(address) && !(address.IsUnspecified() && (actual.To4() != nil) == (address.To4() != nil)) {
+		return fmt.Errorf("handoff UDP address %s does not match inbound %s", actual, address)
+	}
+	count, err := start(b.packet, b.spec.Key, b.spec.Slot)
+	if err != nil {
+		return err
+	}
+	b.count = count
+	return nil
+}
+
+func (g *Generation) UDPStatus() (string, map[string]UDPConnectionStatus) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	result := make(map[string]UDPConnectionStatus, len(g.udp))
+	for key, b := range g.udp {
+		status := UDPConnectionStatus{}
+		if b.count != nil {
+			status.Count, status.Known = b.count()
+		}
+		result[fmt.Sprintf("%s:%d", key.tag, key.port)] = status
+	}
+	return g.state, result
 }
 
 type generationContextKey struct{}
@@ -235,6 +307,14 @@ func (g *Generation) Ready() error {
 			return fmt.Errorf("handoff binding for %q port %d was not started", key.tag, key.port)
 		}
 	}
+	for key, b := range g.udp {
+		if b.count == nil {
+			return fmt.Errorf("handoff UDP binding for %q port %d was not started", key.tag, key.port)
+		}
+		if _, known := b.count(); !known {
+			return fmt.Errorf("handoff UDP transport for %q port %d is not ready", key.tag, key.port)
+		}
+	}
 	g.state = "paused"
 	return nil
 }
@@ -290,6 +370,9 @@ func (g *Generation) Command(command string) (string, error) {
 		}
 		if g.state != "paused" {
 			return g.state, fmt.Errorf("cannot drain a generation in %s", g.state)
+		}
+		if len(g.udp) != 0 {
+			return g.state, errors.New("cannot prove UDP ingress and handshake retirement; retaining the old generation")
 		}
 		g.state = "draining"
 		drain := make([]func() error, 0, len(g.bindings))
@@ -358,5 +441,8 @@ func (g *Generation) Close() {
 	g.state = "closed"
 	for _, b := range g.bindings {
 		b.listener.Close()
+	}
+	for _, b := range g.udp {
+		b.packet.Close()
 	}
 }

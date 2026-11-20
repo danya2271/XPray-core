@@ -13,9 +13,16 @@ import (
 const ProtocolVersion = 1
 
 type Response struct {
-	Protocol int    `json:"protocol"`
-	State    string `json:"state"`
-	Error    string `json:"error,omitempty"`
+	Protocol   int                            `json:"protocol"`
+	State      string                         `json:"state"`
+	Error      string                         `json:"error,omitempty"`
+	UDP        map[string]UDPConnectionStatus `json:"udp,omitempty"`
+	UDPManaged bool                           `json:"udp_managed,omitempty"`
+}
+
+type UDPConnectionStatus struct {
+	Known bool   `json:"known"`
+	Count uint64 `json:"connections"`
 }
 
 // ListenControl never replaces an existing socket. The caller must create a
@@ -69,8 +76,13 @@ func serveControl(conn net.Conn, generation *Generation) {
 	if !input.Scan() {
 		return
 	}
+	if input.Text() == "quic-status" {
+		state, counts := generation.UDPStatus()
+		json.NewEncoder(conn).Encode(Response{Protocol: ProtocolVersion, State: state, UDP: counts, UDPManaged: len(counts) != 0})
+		return
+	}
 	state, err := generation.Command(input.Text())
-	response := Response{Protocol: ProtocolVersion, State: state}
+	response := Response{Protocol: ProtocolVersion, State: state, UDPManaged: len(generation.udp) != 0}
 	if err != nil {
 		response.Error = err.Error()
 	}
