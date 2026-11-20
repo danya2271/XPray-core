@@ -4,6 +4,10 @@ This branch provides a managed-process pilot for gRPC, XHTTP and Hysteria. It
 does not enable managed mode for a normal `xray run` or make a service restart
 seamless. Automatic retirement of a generation with Hysteria is not enabled.
 
+The [opt-in TCP supervisor canary](nodex-supervisor-pilot.md) drives this API
+for isolated gRPC/XHTTP configs without installing or replacing the NodeX
+production service.
+
 | Transport | Building block | Coverage |
 | --- | --- | --- |
 | gRPC | A paused `handoff.TCPListener` imports a duplicate of the same listen socket. `grpc.ServeListener` serves an existing listener and `Drain` waits for its accepted RPCs. | Two actual `xray run` processes are tested over gRPC and gRPC/REALITY on the same TCP port. Existing RPCs survive cutover and a failed-probe rollback on both processes. |
