@@ -266,6 +266,31 @@ fn frame_shape(
     Ok((count, header))
 }
 
+// Each public batch is already routed to one generation and local destination.
+// Pack interleaved peers into contiguous groups without changing per-peer
+// ordering, queue bounds, wire ABI, or waiting for more datagrams.
+fn group_ring_packets<'a>(
+    packets: &[(SocketAddr, &'a [u8])],
+    grouped: &mut [(SocketAddr, &'a [u8]); BATCH],
+) {
+    debug_assert!(packets.len() <= BATCH);
+    let mut consumed = 0u32;
+    let mut written = 0;
+    for (index, &(address, _)) in packets.iter().enumerate() {
+        if consumed & (1 << index) != 0 {
+            continue;
+        }
+        for (peer_index, &packet) in packets.iter().enumerate().skip(index) {
+            if consumed & (1 << peer_index) == 0 && packet.0 == address {
+                grouped[written] = packet;
+                written += 1;
+                consumed |= 1 << peer_index;
+            }
+        }
+    }
+    debug_assert_eq!(written, packets.len());
+}
+
 fn send_messages(
     socket: &tokio::net::UnixDatagram,
     messages: &mut [libc::mmsghdr],
@@ -375,6 +400,16 @@ impl Peer {
         health: &Health,
         destination: Option<IpAddr>,
     ) {
+        if packets.is_empty() {
+            return;
+        }
+        let mut grouped = [(packets[0].0, &[][..]); BATCH];
+        let packets = if self.ring.is_some() && packets.len() <= BATCH {
+            group_ring_packets(packets, &mut grouped);
+            &grouped[..packets.len()]
+        } else {
+            packets
+        };
         let sent = if self.queue.is_empty() {
             match self.try_forward(packets, destination) {
                 Ok(sent) => sent,
@@ -1144,6 +1179,82 @@ pub unsafe extern "C" fn xhys_ingress_join(handle: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ring_grouping_preserves_interleaved_peer_order() {
+        let a = "127.0.0.1:123".parse().unwrap();
+        let b = "[::1]:456".parse().unwrap();
+        let payloads: Vec<_> = (0..BATCH).map(|index| vec![index as u8; 1200]).collect();
+        let packets: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| (if index % 2 == 0 { a } else { b }, payload.as_slice()))
+            .collect();
+        let mut grouped = [(a, &[][..]); BATCH];
+        group_ring_packets(&packets, &mut grouped);
+        for (index, &(address, payload)) in grouped.iter().enumerate() {
+            assert_eq!(address, if index < BATCH / 2 { a } else { b });
+            let expected = if index < BATCH / 2 {
+                index * 2
+            } else {
+                (index - BATCH / 2) * 2 + 1
+            };
+            assert_eq!(payload[0] as usize, expected);
+        }
+        assert_eq!(frame_shape(&grouped, BATCH).unwrap().0, BATCH / 2);
+        assert_eq!(frame_shape(&grouped[BATCH / 2..], BATCH).unwrap().0, BATCH / 2);
+        group_ring_packets(&[], &mut grouped);
+    }
+
+    #[tokio::test]
+    async fn ring_forward_groups_peers_without_reordering_or_extra_slots() {
+        let (mut peer, _) = peer();
+        let sender = packet_ring::Sender::new().unwrap();
+        let descriptors = sender.export().unwrap();
+        let mut receiver = packet_ring::Receiver::import(
+            descriptors[0].as_raw_fd(),
+            descriptors[1].as_raw_fd(),
+            descriptors[2].as_raw_fd(),
+        )
+        .unwrap();
+        peer.ring = Some(sender);
+        let a: SocketAddr = "127.0.0.1:123".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:456".parse().unwrap();
+        let payloads: Vec<_> = (0..BATCH).map(|index| vec![index as u8; 1200]).collect();
+        let packets: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| (if index % 2 == 0 { a } else { b }, payload.as_slice()))
+            .collect();
+        let health = Health::default();
+        let destination = "127.0.0.2".parse().unwrap();
+        peer.forward_with_destination(&[], &health, Some(destination));
+        peer.forward_with_destination(&packets, &health, Some(destination));
+        assert!(peer.queue.is_empty());
+        assert_eq!(health.forwarded.load(Ordering::Relaxed), BATCH as u64);
+        let mut storage = [vec![0; 65535], vec![0; 65535]];
+        let mut buffers: Vec<_> = storage
+            .iter_mut()
+            .map(|buffer| IoSliceMut::new(buffer))
+            .collect();
+        let mut metadata = [udp::RecvMeta::default(); 2];
+        let count = poll_fn(|cx| receiver.poll_recv(cx, &mut buffers, &mut metadata, a))
+            .await
+            .unwrap();
+        assert_eq!(count, 2); // Alternation used to consume 32 ring slots.
+        for index in 0..2 {
+            assert_eq!(metadata[index].addr, if index == 0 { a } else { b });
+            assert_eq!(metadata[index].dst_ip, Some(destination));
+            assert_eq!(metadata[index].stride, 1200);
+            assert_eq!(metadata[index].len, BATCH / 2 * 1200);
+            for (sequence, segment) in buffers[index][..metadata[index].len]
+                .chunks(1200)
+                .enumerate()
+            {
+                assert!(segment.iter().all(|&byte| byte as usize == sequence * 2 + index));
+            }
+        }
+    }
 
     #[test]
     fn receive_adoption_preserves_pending_initial_routes_after_activation() {

@@ -83,6 +83,43 @@ direct baselines on one/four cores. Do not increase queues, weaken strict
 loss assertions, or confuse QUIC retransmission with preserving every
 application datagram.
 
+## Grouping interleaved peers within an existing receive batch
+
+Native ingress now groups packets for the same peer within a batch already
+routed to one generation/local destination. Per-peer order is unchanged;
+no wait timer, heap allocation, wire ABI change or queue enlargement is added.
+The fixed 32-element stack batch lets the existing segmented ring frame
+represent interleaved peer bursts without consuming a separate slot for each
+packet. Tests prove 32 alternating packets for two peers occupy two slots,
+retain sequence/destination metadata, and do not change the Unix relay path.
+
+An interleaved three-round **fresh-B overlap** comparison against the previous
+lifecycle binary used 32 TCP flows, 64 KiB exchanges, 8192 exchanges per run,
+server CPU sets 0–3 / 0 and client 8–15. Both drivers/generations were built
+with the respective native archive. Medians:
+
+| Cores | Native ring variant | MB/s | Exchange p99, ms | Ingress drops | Server CPU, µs/exchange |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4 | Before grouping | 525.36 | 29.785 | 257 | 790.21 |
+| 4 | Grouped peers | 525.95 | 29.349 | 68 | 783.93 |
+| 1 | Before grouping | 201.18 | 54.424 | 4456 | 596.71 |
+| 1 | Grouped peers | 198.14 | 57.595 | 2061 | 606.48 |
+
+The four-core drop median is ~74% lower, the one-core median ~54% lower.
+But every grouped saturated run still dropped packets (4 cores: 60–81;
+1 core: 1889–2329). One-core throughput is ~1.5% lower and CPU/exchange ~1.6%
+higher. This is a measured trade-off, **not saturated loss-free acceptance**.
+Raw logs: `/tmp/nodex-ring-grouping-20261120/`.
+
+The grouped build also delivered 6000/6000 paced UDP replies over three
+runs on each of four/one server cores, with zero counted ingress drops and
+both generations live. The lifecycle/recovery test ran concurrently with
+these paced checks; do not use their latency values as an isolated performance
+comparison. The saturated matrix ran sequentially without builds in flight.
+Local evidence copies and binary hashes are retained under
+`build_assets/handoff-lifecycle-20261120/` in the Android workspace; logs are
+not committed. Loss-free paced traffic does not cancel the saturation failures.
+
 ## Historical experiments
 
 The original managed Hysteria relay is not suitable for enabling native NodeX
