@@ -739,15 +739,14 @@ impl Bus {
         payloads: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
     ) -> Result<()> {
         let mut attempt = credit.try_acquire();
-        if matches!(attempt, Err(tokio::sync::TryAcquireError::NoPermits))
-            && self.capacity.is_some()
-            && self.shared.is_some()
-        {
-            attempt = match tokio::time::timeout(Duration::from_millis(2), credit.acquire()).await {
-                Ok(Ok(permit)) => Ok(permit),
-                Ok(Err(_)) => Err(tokio::sync::TryAcquireError::Closed),
-                Err(_) => Err(tokio::sync::TryAcquireError::NoPermits),
-            };
+        if matches!(attempt, Err(tokio::sync::TryAcquireError::NoPermits)) {
+            // Retain this already-received datagram until Go returns its
+            // bounded flow credit. A scheduling delay is not packet loss.
+            // Dropping/closing the flow closes the semaphore and wakes us.
+            attempt = credit
+                .acquire()
+                .await
+                .map_err(|_| tokio::sync::TryAcquireError::Closed);
             if attempt.is_ok() {
                 self.udp_credit_recovered.fetch_add(1, Ordering::Relaxed);
             }
@@ -756,8 +755,7 @@ impl Bus {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::Closed) => return Ok(()),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                self.udp_credit_dropped.fetch_add(1, Ordering::Relaxed);
-                return Ok(());
+                unreachable!("credit acquisition must wait or close")
             }
         };
         permit.forget();
@@ -3080,17 +3078,30 @@ mod tests {
         assert_eq!(parse_address(&data).unwrap().1, b"recovered");
         assert_eq!(credit.available_permits(), 0);
 
-        bus.udp_payload_with_credit(
+        let pending = bus.udp_payload_with_credit(
             1,
             &credit,
             b"target",
-            std::iter::once(b"dropped".as_slice()),
-        )
-        .await
-        .unwrap();
+            std::iter::once(b"delayed".as_slice()),
+        );
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pending.as_mut())
+                .await
+                .is_err()
+        );
         assert!(bridge.pop(false).unwrap().is_none());
-        assert_eq!(bus.udp_credit_recovered.load(Ordering::Relaxed), 1);
-        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 0);
+        bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])));
+        pending.await.unwrap();
+        assert_eq!(
+            parse_address(&bridge.pop(false).unwrap().unwrap().2)
+                .unwrap()
+                .1,
+            b"delayed"
+        );
+        assert_eq!(bus.udp_credit_recovered.load(Ordering::Relaxed), 2);
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3125,7 +3136,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_udp_flow_counts_credit_drops_without_blocking_other_flows() {
+    async fn unread_udp_flow_retains_payload_while_another_flow_can_progress() {
         let mut bus = capacity_bus();
         let (events, mut receiver) = mpsc::channel(1);
         bus.events = events;
@@ -3133,15 +3144,19 @@ mod tests {
         let (_, readable) = bus.register(2, 1).await.unwrap();
         let window = blocked.available_permits();
         blocked.acquire_many(window as u32).await.unwrap().forget();
-        bus.udp_payload_with_credit(
+        let pending = bus.udp_payload_with_credit(
             1,
             &blocked,
             b"target",
-            std::iter::once(b"dropped".as_slice()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
+            std::iter::once(b"delayed".as_slice()),
+        );
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pending.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 0);
         assert!(receiver.try_recv().is_err());
         bus.udp_payload_with_credit(
             2,
@@ -3159,21 +3174,14 @@ mod tests {
         );
         assert_eq!(readable.available_permits(), window - 1);
         assert_eq!(blocked.available_permits(), 0);
-        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 0);
         bus.route(Frame::new(CREDIT, 1, Bytes::from_static(&[1])));
-        bus.udp_payload_with_credit(
-            1,
-            &blocked,
-            b"target",
-            std::iter::once(b"resumed".as_slice()),
-        )
-        .await
-        .unwrap();
+        pending.await.unwrap();
         assert_eq!(
             parse_address(&receiver.try_recv().unwrap().data).unwrap().1,
-            b"resumed"
+            b"delayed"
         );
-        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(bus.udp_credit_dropped.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
