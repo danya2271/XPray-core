@@ -186,6 +186,9 @@ func testHysteriaHandoff(t *testing.T, nativeA, nativeB, masked bool) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if n, ok := l.(hysteria.GenerationListener).GenerationConnections(); !ok || n != 0 {
+			t.Fatalf("new generation: expected a known zero, got %d (%v)", n, ok)
+		}
 		t.Cleanup(func() { l.Close() })
 		return l
 	}
@@ -220,13 +223,36 @@ func testHysteriaHandoff(t *testing.T, nativeA, nativeB, masked bool) {
 			t.Fatalf("got %v, %v; expected generation %d with %q", got, err, slot, pulse)
 		}
 	}
-	start(0, nativeA)
+	previous := start(0, nativeA).(hysteria.GenerationListener)
 	a := open()
 	check(a, 0, 'a')
-	start(1, nativeB)
+	if n, ok := previous.GenerationConnections(); !ok || n != 1 {
+		t.Fatalf("old generation: live connection not visible: %d (%v)", n, ok)
+	}
+	candidate := start(1, nativeB).(hysteria.GenerationListener)
 	routes.Activate(1)
 	b := open()
 	check(b, 1, 'b')
 	check(a, 0, 'c')
 	check(b, 1, 'd')
+	if n, ok := candidate.GenerationConnections(); !ok || n != 1 {
+		t.Fatalf("new generation: live connection not visible: %d (%v)", n, ok)
+	}
+	// A closed stream is not a closed QUIC connection. The client can still
+	// open another stream on it until the QUIC endpoint closes naturally.
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := previous.GenerationConnections(); !ok || n != 1 {
+		t.Fatalf("retirement would lose an idle QUIC connection: %d (%v)", n, ok)
+	}
+	// This is a forced test teardown, not a verified drain. Never report a
+	// trustworthy zero after losing the listener or the worker.
+	if err := previous.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := previous.GenerationConnections(); ok {
+		t.Fatal("closed generation reported a trustworthy connection count")
+	}
+	check(b, 1, 'e')
 }

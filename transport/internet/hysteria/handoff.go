@@ -12,6 +12,14 @@ import (
 
 type generationKey struct{}
 
+// GenerationListener reports live accepted QUIC transports, including those
+// that currently have zero open streams. This is only one retirement check:
+// the supervisor must separately fence packets and Initial retransmissions.
+type GenerationListener interface {
+	internet.Listener
+	GenerationConnections() (uint64, bool)
+}
+
 type generationIngress struct {
 	packet net.PacketConn
 	key    [16]byte

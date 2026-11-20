@@ -493,6 +493,22 @@ func (e *Engine) stop() {
 	})
 }
 
+// GenerationConnections returns false if the server was not configured for
+// handoff or the native worker has stopped. Close protects the C handle with
+// the same lock, so a status read cannot race join and free.
+func (e *Engine) GenerationConnections() (uint64, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.handle == nil {
+		return 0, false
+	}
+	count := int64(C.xhys_engine_generation_connections(e.handle))
+	if count < 0 {
+		return 0, false
+	}
+	return uint64(count), true
+}
+
 func (e *Engine) Close() error {
 	e.stop()
 	e.wg.Wait()
