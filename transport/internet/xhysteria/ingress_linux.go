@@ -19,10 +19,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// NativeIngress is an experimental Linux packet relay. The public descriptor
+// NativeIngress is an opt-in Linux packet relay. The public descriptor
 // is duplicated; this wrapper never transfers ownership of the caller's socket.
 // Masks are configured in their physical wire order (outermost first). It has
-// no crash recovery or retirement certificate and must not enable node updates.
+// no independent QUIC retirement certificate. Its recovery methods require
+// supervisor-owned proofs of producer death and stable direct public reception.
 type NativeIngress struct {
 	mu     sync.Mutex
 	handle unsafe.Pointer
@@ -176,6 +177,49 @@ func (i *NativeIngress) Activate(slot byte) error {
 	defer i.mu.Unlock()
 	if i.handle == nil || !bool(C.xhys_ingress_activate(i.handle, C.uint8_t(slot))) {
 		return errors.New("native ingress admission change was not acknowledged")
+	}
+	return nil
+}
+
+// ExportDirect retains the producer-side socket and ring without taking public
+// receive ownership. The caller must independently confirm a stable direct
+// generation and keep these files only for recovery after producer death.
+func (i *NativeIngress) ExportDirect(slot byte) ([]*os.File, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil {
+		return nil, errors.New("native ingress is closed")
+	}
+	var ring C.XhysPacketRingDescriptors
+	peer := C.xhys_ingress_export_direct(i.handle, C.uint8_t(slot), &ring)
+	if peer < 0 {
+		return nil, errors.New("ingress does not own a stable dormant direct generation")
+	}
+	return []*os.File{
+		os.NewFile(uintptr(peer), "recovery-ring-peer"),
+		os.NewFile(uintptr(ring.file), "recovery-ring"),
+		os.NewFile(uintptr(ring.wake), "recovery-ring-wake"),
+		os.NewFile(uintptr(ring.space), "recovery-ring-space"),
+	}, nil
+}
+
+// RestoreDirect requires proof that the prior producer died. It reuses the
+// empty existing ring, never reinitializing the consumer or rebinding UDP.
+func (i *NativeIngress) RestoreDirect(slot byte, files []*os.File) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil || i.used[slot] || len(files) != 4 {
+		return errors.New("invalid direct ingress recovery descriptors")
+	}
+	for _, file := range files {
+		if file == nil {
+			return errors.New("missing direct ingress recovery descriptor")
+		}
+	}
+	i.used[slot] = true // An uncertain acknowledgement never permits reattachment.
+	if !bool(C.xhys_ingress_restore_direct(i.handle, C.uint8_t(slot), C.int32_t(files[0].Fd()),
+		C.int32_t(files[1].Fd()), C.int32_t(files[2].Fd()), C.int32_t(files[3].Fd()))) {
+		return errors.New("direct ingress restoration was not acknowledged")
 	}
 	return nil
 }

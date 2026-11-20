@@ -72,6 +72,9 @@ typedef struct {
 bool xhys_ingress_add_ring(void *ingress, uint8_t slot, int32_t worker_fd,
                           bool direct_transmit,
                           XhysPacketRingDescriptors *out);
+int32_t xhys_ingress_export_direct(void *ingress, uint8_t slot, XhysPacketRingDescriptors *out);
+bool xhys_ingress_restore_direct(void *ingress, uint8_t slot, int32_t peer_fd,
+                                int32_t ring_fd, int32_t wake_fd, int32_t space_fd);
 bool xhys_ingress_activate(void *ingress, uint8_t slot);
 bool xhys_ingress_abandon(void *ingress, uint8_t slot);
 bool xhys_ingress_fence(void *ingress, uint8_t slot, const uint8_t *token);

@@ -164,6 +164,7 @@ pub struct Sender {
     _file: OwnedFd,
     wake: OwnedFd,
     space: AsyncFd<OwnedFd>,
+    preserve_on_drop: bool,
 }
 
 pub struct Batch<'a> {
@@ -280,6 +281,53 @@ impl Drop for Batch<'_> {
 }
 
 impl Sender {
+    /// Reattach an empty ring after the previous producer's death was proven.
+    /// This never initializes indices or changes the live consumer's ownership.
+    pub fn import_empty(file: i32, wake: i32, space: i32) -> io::Result<Self> {
+        if file == wake || file == space || wake == space {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let file = duplicate(file)?;
+        let wake = duplicate(wake)?;
+        let space = duplicate(space)?;
+        check_event(&wake)?;
+        check_event(&space)?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0
+            || stat.st_size != LENGTH as libc::off_t
+            || seals < 0
+            || seals & SEALS != SEALS
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mapping = Mapping::map(file.as_raw_fd())?;
+        let h = mapping.header();
+        if h.magic != MAGIC
+            || h.version != VERSION
+            || h.capacity != CAPACITY
+            || h.stride != STRIDE as u32
+            || h.length != LENGTH as u64
+            || h.reserved != 0
+            || h.closed.load(Ordering::Acquire) != 0
+            || h.consumer.load(Ordering::Acquire) != 1
+            || h.head.value.load(Ordering::Acquire) != h.tail.value.load(Ordering::Acquire)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recovery requires an open empty packet ring",
+            ));
+        }
+        Ok(Self {
+            mapping,
+            _file: file,
+            wake,
+            space: unsafe { AsyncFd::register(space) }?,
+            // A rejected recovery must not poison the live receiver's ring.
+            preserve_on_drop: true,
+        })
+    }
+
     pub fn new() -> io::Result<Self> {
         let fd = unsafe {
             libc::memfd_create(
@@ -326,6 +374,7 @@ impl Sender {
             wake: eventfd()?,
             // OwnedFd cannot close or replace the descriptor while registered.
             space: unsafe { AsyncFd::register(eventfd()?) }?,
+            preserve_on_drop: false,
         })
     }
 
@@ -376,6 +425,7 @@ impl Sender {
 
 impl Drop for Sender {
     fn drop(&mut self) {
+        if self.preserve_on_drop { return; }
         self.mapping.header().closed.store(1, Ordering::Release);
         notify(self.wake.as_raw_fd());
     }
@@ -571,6 +621,61 @@ impl Drop for Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn restored_producer_preserves_live_consumer_and_rejects_pending_or_closed_ring() {
+        let mut sender = Sender::new().unwrap();
+        let files = sender.export().unwrap();
+        let mut receiver = import(&sender);
+        let address: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let payload = [0x71; 1200];
+        let header = packet_socket::encode_header(address, payload.len()).unwrap();
+        sender.push(&header, &[(address, &payload)]).unwrap();
+        assert!(
+            Sender::import_empty(
+                files[0].as_raw_fd(),
+                files[1].as_raw_fd(),
+                files[2].as_raw_fd()
+            )
+            .is_err()
+        );
+        let mut buffer = [0u8; 2048];
+        let mut buffers = [IoSliceMut::new(&mut buffer)];
+        let mut metadata = [udp::RecvMeta::default()];
+        poll_fn(|cx| receiver.poll_recv(cx, &mut buffers, &mut metadata, address))
+            .await
+            .unwrap();
+        assert_eq!(&buffers[0][..1200], &payload);
+        // Model SIGKILL: it does not run the producer's closing destructor.
+        sender.preserve_on_drop = true;
+        drop(sender);
+        let restore = || {
+            Sender::import_empty(
+                files[0].as_raw_fd(),
+                files[1].as_raw_fd(),
+                files[2].as_raw_fd(),
+            )
+        };
+        let mut recovered = restore().unwrap();
+        assert_eq!(
+            recovered.mapping.header().consumer.load(Ordering::Acquire),
+            1
+        );
+        drop(recovered);
+        // Rejected/aborted recovery must not mark the existing ring closed.
+        recovered = restore().unwrap();
+        recovered.push(&header, &[(address, &payload)]).unwrap();
+        poll_fn(|cx| receiver.poll_recv(cx, &mut buffers, &mut metadata, address))
+            .await
+            .unwrap();
+        assert_eq!(&buffers[0][..1200], &payload);
+        recovered
+            .mapping
+            .header()
+            .closed
+            .store(1, Ordering::Release);
+        assert!(restore().is_err());
+    }
     use std::future::poll_fn;
 
     fn import(sender: &Sender) -> Receiver {
