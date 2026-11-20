@@ -176,6 +176,25 @@ fn adopt_receive(
             return Err(io::ErrorKind::InvalidInput.into());
         }
     }
+    // A generation reacquiring direct RX did not receive the broker's Initial
+    // table. Keep its still-live broker-created pins across the next release:
+    // replacing the table would route an in-flight handshake to generation C.
+    // Validate the whole merge first so rejection never mutates ownership.
+    for (&cid, &(slot, until)) in &routes.pins {
+        if now >= until || !live[slot as usize] {
+            continue;
+        }
+        match pins.get_mut(&cid) {
+            Some((owner, expiry)) if *owner == slot => *expiry = (*expiry).min(until),
+            Some(_) => return Err(io::ErrorKind::InvalidInput.into()),
+            None => {
+                if pins.len() >= PIN_LIMIT {
+                    return Err(io::ErrorKind::OutOfMemory.into());
+                }
+                pins.insert(cid, (slot, until));
+            }
+        }
+    }
     routes.pins = pins;
     routes.leases[snapshot.slot as usize] = snapshot.lease;
     Ok(())
@@ -1299,6 +1318,110 @@ mod tests {
         assert_eq!(routes.route(&initial, &live), Some(0));
         initial[6..14].copy_from_slice(b"new-work");
         assert_eq!(routes.route(&initial, &live), Some(1));
+    }
+
+    #[test]
+    fn repeated_receive_adoption_preserves_broker_initials_without_extending_expiry() {
+        let mut routes = Routes {
+            codec: generation_cid::Generator::new(&generation_cid::Config {
+                key: [1; 16],
+                slot: 1,
+            }),
+            current: 1,
+            pins: HashMap::new(),
+            next_gc: Instant::now(),
+            leases: [0; 256],
+        };
+        let live = [true; 256];
+        let mut initial = [0u8; 1200];
+        initial[0] = 0xc0;
+        initial[4] = 1;
+        initial[5] = 8;
+        initial[6..14].copy_from_slice(b"broker-b");
+        assert_eq!(routes.route(&initial, &live), Some(1));
+        let mut cid = [0; 20];
+        cid[..8].copy_from_slice(b"broker-b");
+        let pin_key = (1, 8, cid);
+        let before = routes.pins[&pin_key];
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "lease":1,"key":vec![1u8;16],"local":"127.0.0.1:443","slot":1,
+            "pins":[{"version":1,"cid":b"direct-b".to_vec(),"remaining_ms":1000}]
+        }))
+        .unwrap();
+        adopt_receive(
+            &mut routes,
+            &live,
+            [1; 16],
+            "127.0.0.1:443".parse().unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(routes.pins[&pin_key], before);
+        routes.current = 2;
+        assert_eq!(routes.route(&initial, &live), Some(1));
+        initial[0] = 0xd0;
+        assert_eq!(routes.route(&initial, &live), Some(1));
+        initial[6..14].copy_from_slice(b"direct-b");
+        assert_eq!(routes.route(&initial, &live), Some(1));
+    }
+
+    #[test]
+    fn receive_adoption_rejects_conflicting_or_oversized_merge_atomically() {
+        let now = Instant::now();
+        let mut routes = Routes {
+            codec: generation_cid::Generator::new(&generation_cid::Config {
+                key: [1; 16],
+                slot: 1,
+            }),
+            current: 1,
+            pins: HashMap::new(),
+            next_gc: now + Duration::from_secs(1),
+            leases: [0; 256],
+        };
+        let mut live = [true; 256];
+        for nonce in 0..PIN_LIMIT {
+            let mut cid = [0;20];
+            cid[..8].copy_from_slice(&(nonce as u64).to_be_bytes());
+            routes.pins.insert((1,8,cid),(1,now+Duration::from_secs(30)));
+        }
+        let snapshot = |cid: &[u8]| {
+            serde_json::to_vec(&serde_json::json!({
+                "lease":1,"key":vec![1u8;16],"local":"127.0.0.1:443","slot":1,
+                "pins":[{"version":1,"cid":cid,"remaining_ms":30000}]
+            }))
+            .unwrap()
+        };
+        let original = routes.pins.clone();
+        assert!(adopt_receive(&mut routes,&live,[1;16],"127.0.0.1:443".parse().unwrap(),&snapshot(b"new-work")).is_err());
+        assert_eq!(routes.pins,original);
+        assert_eq!(routes.leases[1],0);
+        let key = (1,8,[0;20]);
+        routes.pins.get_mut(&key).unwrap().0 = 0;
+        let original = routes.pins.clone();
+        assert!(
+            adopt_receive(
+                &mut routes,
+                &live,
+                [1; 16],
+                "127.0.0.1:443".parse().unwrap(),
+                &snapshot(&[0; 8])
+            )
+            .is_err()
+        );
+        assert_eq!(routes.pins, original);
+        assert_eq!(routes.leases[1], 0);
+        live[0] = false;
+        routes.pins.get_mut(&key).unwrap().1 = now - Duration::from_secs(1);
+        adopt_receive(
+            &mut routes,
+            &live,
+            [1; 16],
+            "127.0.0.1:443".parse().unwrap(),
+            &snapshot(b"new-work"),
+        )
+        .unwrap();
+        assert_eq!(routes.pins.len(), PIN_LIMIT);
+        assert!(!routes.pins.contains_key(&key));
     }
 
     #[test]

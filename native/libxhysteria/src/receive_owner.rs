@@ -321,6 +321,141 @@ mod tests {
     use std::future::poll_fn;
     use std::{net::UdpSocket, os::unix::net::UnixDatagram};
 
+    #[derive(Debug)]
+    struct BatchSocket {
+        public: Arc<dyn AsyncUdpSocket>,
+        batch: Mutex<Option<Vec<(Vec<u8>, usize)>>>,
+    }
+
+    impl AsyncUdpSocket for BatchSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+            self.public.clone().create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+            self.public.try_send(transmit)
+        }
+
+        fn poll_recv(
+            &self,
+            _: &mut Context<'_>,
+            buffers: &mut [IoSliceMut<'_>],
+            metadata: &mut [udp::RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            let Some(batch) = self.batch.lock().unwrap().take() else {
+                return Poll::Pending;
+            };
+            assert!(batch.len() <= buffers.len().min(metadata.len()));
+            for (index, (wire, stride)) in batch.iter().enumerate() {
+                buffers[index][..wire.len()].copy_from_slice(wire);
+                metadata[index] = udp::RecvMeta {
+                    addr: "127.0.0.1:12345".parse().unwrap(),
+                    dst_ip: Some("127.0.0.2".parse().unwrap()),
+                    len: wire.len(),
+                    stride: *stride,
+                    ecn: None,
+                };
+            }
+            Poll::Ready(Ok(batch.len()))
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.public.local_addr()
+        }
+
+        fn max_receive_segments(&self) -> usize {
+            32
+        }
+    }
+
+    fn owner_with_batch(batch: Vec<(Vec<u8>, usize)>) -> ReceiveOwner {
+        let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local = raw.local_addr().unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let public = quinn::TokioRuntime.wrap_udp_socket(raw).unwrap();
+        let socket = Arc::new(BatchSocket {
+            public,
+            batch: Mutex::new(Some(batch)),
+        });
+        let (worker, _bridge) = UnixDatagram::pair().unwrap();
+        worker.set_nonblocking(true).unwrap();
+        ReceiveOwner::new(
+            Arc::new(PacketSocket::new(worker, local, true).unwrap()),
+            socket,
+            &generation_cid::Config {
+                key: [1; 16],
+                slot: 7,
+            },
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn established_batch_preserves_gro_and_destination_without_pins() {
+        let mut payload = vec![0x40; 2400];
+        payload[1200..].fill(0x41);
+        let owner = owner_with_batch(vec![(payload.clone(), 1200), (vec![0x42; 25], 25)]);
+        let mut storage = [vec![0; 4096], vec![0; 4096]];
+        let mut buffers: Vec<_> = storage
+            .iter_mut()
+            .map(|buffer| IoSliceMut::new(buffer))
+            .collect();
+        let mut metadata = [udp::RecvMeta::default(); 2];
+        let count = poll_fn(|cx| owner.poll_recv(cx, &mut buffers, &mut metadata))
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(&buffers[0][..2400], &payload);
+        assert_eq!(&buffers[1][..25], &[0x42; 25]);
+        assert_eq!(metadata[0].len, 2400);
+        assert_eq!(metadata[0].stride, 1200);
+        assert_eq!(metadata[1].len, 25);
+        assert_eq!(metadata[1].stride, 25);
+        for meta in metadata {
+            assert_eq!(meta.dst_ip, Some("127.0.0.2".parse().unwrap()));
+        }
+        let state = owner.state.lock().unwrap();
+        assert!(state.pins.is_empty());
+        assert!(state.waker.is_some());
+    }
+
+    #[tokio::test]
+    async fn short_first_segment_cannot_bypass_initial_and_zero_rtt_tracking() {
+        let mut wire = vec![0x40; 3600];
+        let initial = &mut wire[1200..2400];
+        initial.fill(0);
+        initial[0] = 0xc0;
+        initial[4] = 1;
+        initial[5] = 8;
+        initial[6..14].copy_from_slice(b"new-work");
+        let early = &mut wire[2400..];
+        early.fill(0);
+        early[0] = 0xd0;
+        early[4] = 1;
+        early[5] = 8;
+        early[6..14].copy_from_slice(b"unpinned");
+        let owner = owner_with_batch(vec![(wire.clone(), 1200), (vec![0x41; 1200], 1200)]);
+        let mut storage = [vec![0; 4096], vec![0; 4096]];
+        let mut buffers: Vec<_> = storage
+            .iter_mut()
+            .map(|buffer| IoSliceMut::new(buffer))
+            .collect();
+        let mut metadata = [udp::RecvMeta::default(); 2];
+        let count = poll_fn(|cx| owner.poll_recv(cx, &mut buffers, &mut metadata))
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(&buffers[0][..2400], &wire[..2400]);
+        assert_eq!(metadata[0].len, 2400); // Unpinned 0-RTT was not admitted.
+        assert_eq!(metadata[0].stride, 1200);
+        assert_eq!(metadata[1].len, 1200);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&owner.release().unwrap()).unwrap();
+        let pins = snapshot["pins"].as_array().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0]["cid"], serde_json::json!(b"new-work".to_vec()));
+    }
+
     #[tokio::test]
     async fn release_fences_reads_and_exports_initials_idempotently() {
         let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
