@@ -3,7 +3,7 @@
 `cmd/nodex-xray-supervisor` manages independent Linux Xray generations.
 It is opt-in: installing these binaries does not import an unmanaged process,
 enable the managed systemd unit, or make an ordinary restart seamless.
-**Production acceptance remains incomplete**, particularly broker failure during
+**Production acceptance remains incomplete**, particularly UDP receive-owner failure during
 relay/overlap and the full failure/network matrix. The November 20 lossless
 backpressure checks passed saturated TCP/response-window UDP workloads, not
 arbitrary flood or WAN qualification. This document supersedes lifecycle
@@ -15,11 +15,15 @@ restrictions in the historical TCP pilot and relay experiment notes.
   there is no permanent TCP data proxy. gRPC retains accepted RPCs. XHTTP pins
   session IDs and forwards only requests received by the wrong generation.
 - Native Hysteria begins with exclusive direct UDP RX/TX. A separate persistent
-  broker retains descriptors, CID keys, generation slots and Initial pins.
+  UDP receive owner retains descriptors, CID keys, generation slots and Initial pins.
   During overlap it receives UDP and forwards to fixed, bounded shared rings.
   After verified retirement the active native generation reacquires direct RX;
   the dormant broker unregisters its public receive reactor. Go Hysteria uses
   the compatible Unix-datagram relay and does not reacquire direct RX.
+- The replaceable broker controller owns only management requests. It forwards
+  commands/SCM_RIGHTS to the receive owner, never public datagrams. Its failure
+  during overlap does not discard Initial pins, ring state, held receive
+  batches, relay queues or egress in the surviving owner.
 - Each binary and exact config is snapshotted privately in its generation
   directory. Launch is gated by a pipe until the PID identity is journaled.
   Readiness is followed by a real, candidate-only public tunnel probe.
@@ -95,7 +99,65 @@ The companion NodeX service uses `KillMode=process`,
 recovery exits 23 and retains live processes instead of repeatedly retrying an
 uncertain transition. An **explicit SIGTERM/service stop intentionally stops
 generations**: do not restart this service to update Xray or the supervisor.
-### Broker failure in stable native direct mode
+
+### Controller recovery during overlap
+
+`broker` still identifies the UDP receive owner; `broker_control` identifies its
+replaceable controller. A controller is recreated on the next management
+request only after pidfd/start ticks prove its previous process died. The
+receive owner and both generations remain alive, and data reception does not
+wait for controller reconstruction. Commands then reuse the owner's existing
+idempotent add/activate/adopt/fence/retire contracts. A failed or lost reply
+from a **live** process is not permission to launch a competing controller.
+
+Controller PID/sequence is journaled before its startup gate opens. A separate
+private lock serializes reconstruction across replacement supervisor clients.
+Corrupt/regressed state or altered owner/binary/manifest identities are rejected;
+an unsuccessful reconstruction is latched rather than repeatedly restarted.
+Supervisor recovery reconnects to the same receive owner even if its controller
+also died. The controller holds no public socket/ring and adds no per-packet
+relay hop, timer or filesystem polling. It does add one process and management
+IPC: this is not zero memory/startup overhead.
+Controller capability is negotiated with the immutable receive-owner daemon.
+Recovering a pre-controller owner retains its old control route, with no claim
+of new controller protection. Installing a newer supervisor does not silently
+upgrade the already-running packet owner.
+
+Local tests cover controller SIGKILLs during Go/native overlap, concurrent
+supervisor/controller death with the owner surviving, lost ACK after `add`,
+concurrent controller reconstruction, corrupt journals, and delivery/order of
+128 temporarily blocked old-generation datagrams plus Initial-pin preservation.
+An application UDP fixture uses distinct A/B clients and validates every
+1200-byte response without retransmission. Its optional 32-flow unpaced TCP
+background checks relay/public-socket drops separately.
+
+The six repeated local saturated-TCP checks (three per server backend) each
+delivered **4000/4000 UDP replies on each of A and B**, through three controller
+SIGKILLs, with zero relay and public-socket drops. The 32 TCP flows were split
+16/16 across generations and continuously exchanged 64 KiB; native client
+selection was asserted instead of permitting silent Go fallback. Duplex TCP
+medians were 589.93 MiB/s native and 279.53 MiB/s Go. All fixture/server processes
+shared CPU set `8-15`; this is a shared local loopback workload, not isolated
+server/client-core or WAN throughput qualification. UDP used an eight-response
+window, serial B responses and 200 µs pacing, not saturated UDP flood.
+
+Earlier failed fixture runs are retained. Certificate pinning unexpectedly
+selected the Go client; the overloaded native-server/Go-client run stalled
+with zero counted relay/kernel drops. Another Go-server/native-client run used
+the untuned managed public socket and reported 775826 kernel drops before the
+first injected failure. Those failures are not successes or proof of recovery
+under every client/backend combination. The final fixture uses a verified test
+CA/native client and the common managed socket policy; logs and hashes are local
+`build_assets/broker-control-20261121/`.
+
+Managed Go's masked public socket now receives the existing native server buffer
+policy (4 MiB receive request, 1 MiB send request, kernel limits still apply).
+Previously masks hid it from QUIC socket tuning and a saturated control fixture
+overflowed the system-default buffer. Larger preconfigured buffers are preserved.
+Private queue/ring capacities are unchanged. Failure of the **receive owner**
+during Go relay or native overlap is still not losslessly recovered.
+
+### UDP receive-owner failure in stable native direct mode
 
 The supervisor retains a checkpoint of the public UDP socket and existing
 producer-side Unix socket/ring/eventfd descriptors while exactly one native
@@ -111,7 +173,7 @@ replacement keeps the old CID key/current slot and reserves all previous
 attempted slots. The supervisor checkpoints it again for subsequent failure.
 The startup gate is released only after its process identity is journaled.
 
-The checkpoint is invalidated before a new generation starts. Go relay,
+The checkpoint is invalidated before a new generation starts. Receive-owner loss in Go relay,
 native relay/overlap, mixed Go/native bindings, or simultaneous loss of broker
 and supervisor are **not** recovered by this direct-only path. A dead broker
 without a valid checkpoint blocks further updates without signalling live
@@ -141,6 +203,19 @@ XRAY_TEST_GENERATION_BINARY=/path/to/xray-native XRAY_TEST_MANAGED_NATIVE=1 \
 XRAY_TEST_GENERATION_BINARY=/path/to/xray-native /path/to/native-supervisor.test \
   -test.run '^TestNativeDirectBrokerRecoveryPreservesApplicationUDP$' \
   -test.v -test.count 3 -test.timeout 60s
+```
+
+Controller qualification commands (native-tagged supervisor driver):
+
+```sh
+XRAY_TEST_GENERATION_BINARY=/path/to/xray-native XRAY_TEST_MANAGED_NATIVE=1 \
+  NODEX_TEST_PUBLIC_PROBE=/path/to/nodex-xray-probe \
+  /path/to/native-supervisor.test \
+  -test.run '^TestSupervisorHysteriaBrokerControlOverlapRecovery$' -test.v -test.timeout 240s
+XRAY_TEST_GENERATION_BINARY=/path/to/xray-native NODEX_TEST_CONTROL_SATURATED=1 \
+  /path/to/native-supervisor.test \
+  -test.run '^TestBrokerControlOverlapPreservesApplicationUDP$' \
+  -test.v -test.count 3 -test.timeout 300s
 ```
 
 ## Management API and metrics
@@ -266,7 +341,7 @@ python3 cmd/nodex-xray-supervisor/nginx_canary_test.py \
 
 Before enabling by default: extend loss-free overlap checks to sustained UDP/WAN,
 reduce the remaining one-core overhead, qualify public probes and systemd
-privileges/assets, exercise every ownership failure boundary and UDP broker
+privileges/assets, exercise every ownership failure boundary and UDP receive-owner
 failure during relay/overlap, extend the network/mask matrix, and provide a deliberate initial
 migration/slot-rotation procedure. See
 `nodex-managed-hysteria-performance.md` for measurements.

@@ -53,6 +53,7 @@ type packetIngress interface {
 	Retire(byte, [16]byte) (bool, error)
 	Abandon(byte) error
 	Close() error
+	Dropped() uint64
 }
 
 type nativePacketIngress interface {
@@ -97,13 +98,15 @@ type brokerRequest struct {
 }
 
 type brokerResponse struct {
-	Error      string         `json:"error,omitempty"`
-	Ready      bool           `json:"ready"`
-	PID        int            `json:"pid"`
-	StartTicks uint64         `json:"start_ticks"`
-	Current    byte           `json:"current"`
-	Direct     bool           `json:"direct"`
-	Binding    *brokerBinding `json:"binding,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	Ready          bool           `json:"ready"`
+	PID            int            `json:"pid"`
+	StartTicks     uint64         `json:"start_ticks"`
+	Current        byte           `json:"current"`
+	Direct         bool           `json:"direct"`
+	Binding        *brokerBinding `json:"binding,omitempty"`
+	Drops          uint64         `json:"drops,omitempty"`
+	ControlCapable bool           `json:"control_capable,omitempty"`
 }
 
 func newPacketBroker(config brokerConfig, files []*os.File) (*packetBroker, error) {
@@ -138,6 +141,9 @@ func newPacketBroker(config brokerConfig, files []*os.File) (*packetBroker, erro
 		}
 		endpoint := &brokerEndpoint{config: binding, public: public, peers: make(map[byte]*brokerPeer), direct: binding.Native}
 		b.endpoints[binding.Tag] = endpoint
+		if err := tuneManagedPacketSocket(public); err != nil {
+			return nil, err
+		}
 		if binding.Native {
 			endpoint.ingress, err = makeNativePacketIngress(public, binding)
 		} else {
@@ -195,6 +201,33 @@ func newPacketBroker(config brokerConfig, files []*os.File) (*packetBroker, erro
 	return b, nil
 }
 
+// Match the existing native server public-socket policy before masks hide the
+// descriptor from Go QUIC. Keep larger operator-provisioned buffers intact.
+// This runs at bind/recovery only; private relay queue capacities do not change.
+func tuneManagedPacketSocket(public *net.UDPConn) error {
+	raw, err := public.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var setupErr error
+	err = raw.Control(func(fd uintptr) {
+		for _, option := range []struct{ name, bytes int }{{unix.SO_RCVBUF, 4 << 20}, {unix.SO_SNDBUF, 1 << 20}} {
+			current, err := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, option.name)
+			if err != nil {
+				setupErr = err
+				return
+			}
+			if current < option.bytes*2 {
+				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, option.name, option.bytes); err != nil {
+					setupErr = err
+					return
+				}
+			}
+		}
+	})
+	return errors.Join(err, setupErr)
+}
+
 func (b *packetBroker) close() {
 	for _, endpoint := range b.endpoints {
 		if endpoint.ingress != nil {
@@ -220,6 +253,7 @@ func (b *packetBroker) command(ctx context.Context, request brokerRequest) (brok
 	}
 	if request.Operation == "ping" {
 		response.Ready = true
+		response.ControlCapable = true
 		return response, nil
 	}
 	e := b.endpoints[request.Tag]
@@ -232,6 +266,9 @@ func (b *packetBroker) command(ctx context.Context, request brokerRequest) (brok
 	switch request.Operation {
 	case "status":
 		response.Ready = true
+	case "stats":
+		response.Ready = true
+		response.Drops = e.ingress.Dropped()
 	case "checkpoint-direct":
 		if !e.config.Native || !e.direct || e.current != request.Slot || peer == nil || peer.retired || peer.fence != [16]byte{} {
 			return fail(errors.New("broker checkpoint requires stable native direct receive"))
@@ -373,6 +410,13 @@ func peerCredentials(socket *net.UnixConn) (*unix.Ucred, error) {
 }
 
 func (b *packetBroker) serve(ctx context.Context, path string) error {
+	return serveBrokerCommands(ctx, path, func(ctx context.Context, request brokerRequest) (brokerResponse, []*os.File, bool) {
+		response, files := b.command(ctx, request)
+		return response, files, request.Operation == "checkpoint-direct"
+	})
+}
+
+func serveBrokerCommands(ctx context.Context, path string, command func(context.Context, brokerRequest) (brokerResponse, []*os.File, bool)) error {
 	if err := handoff.PrivateSocketDirectory(filepath.Dir(path)); err != nil {
 		return err
 	}
@@ -386,6 +430,9 @@ func (b *packetBroker) serve(ctx context.Context, path string) error {
 	}
 	stop := context.AfterFunc(ctx, func() { listener.Close() })
 	defer stop()
+	// Commands are serialized; reuse the bounded request buffer instead of
+	// allocating a MiB for every drain/status poll.
+	wire := make([]byte, 1<<20)
 	for {
 		socket, err := listener.AcceptUnix()
 		if err != nil {
@@ -402,7 +449,6 @@ func (b *packetBroker) serve(ctx context.Context, path string) error {
 			if err != nil || peer.Uid != uint32(os.Geteuid()) {
 				return
 			}
-			wire := make([]byte, 1<<20)
 			n, _, flags, _, err := socket.ReadMsgUnix(wire, nil)
 			if err != nil || flags&unix.MSG_TRUNC != 0 {
 				return
@@ -413,8 +459,8 @@ func (b *packetBroker) serve(ctx context.Context, path string) error {
 			if decoder.Decode(&request) != nil {
 				return
 			}
-			response, files := b.command(ctx, request)
-			if request.Operation == "checkpoint-direct" {
+			response, files, owned := command(ctx, request)
+			if owned {
 				defer func() {
 					for _, file := range files {
 						file.Close()
@@ -443,9 +489,20 @@ type brokerClient struct {
 	nonce      [32]byte
 	pid        int
 	startTicks uint64
+	control    *brokerControl
 }
 
 func (c brokerClient) command(ctx context.Context, request brokerRequest) (brokerResponse, []*os.File, error) {
+	if c.control != nil {
+		if c.pid != c.control.owner.pid || c.startTicks != c.control.owner.startTicks || c.nonce != c.control.owner.nonce {
+			return brokerResponse{}, nil, errors.New("broker control packet-owner identity mismatch")
+		}
+		return c.control.command(ctx, request)
+	}
+	return c.commandOnce(ctx, request)
+}
+
+func (c brokerClient) commandOnce(ctx context.Context, request brokerRequest) (brokerResponse, []*os.File, error) {
 	var response brokerResponse
 	connection, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unixpacket", c.path)
 	if err != nil {

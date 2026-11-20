@@ -202,6 +202,12 @@ func TestSupervisorHysteriaBrokerDirectRecovery(t *testing.T) {
 	TestSupervisorHysteriaGenerations(t)
 }
 
+func TestSupervisorHysteriaBrokerControlOverlapRecovery(t *testing.T) {
+	t.Setenv("NODEX_TEST_CRASH_BROKER_CONTROL", "1")
+	t.Setenv("NODEX_TEST_REPEAT_UPDATE", "1")
+	TestSupervisorHysteriaGenerations(t)
+}
+
 func TestSupervisorHysteriaGenerations(t *testing.T) {
 	binary := os.Getenv("XRAY_TEST_GENERATION_BINARY")
 	if binary == "" {
@@ -420,10 +426,69 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			defer stopNext()
 			hysteriaPulse(t, old, 'A', 'b')
 			hysteriaPulse(t, next, 'B', 'c')
+			if os.Getenv("NODEX_TEST_CRASH_BROKER_CONTROL") == "1" {
+				if before.BrokerControl == nil {
+					t.Fatal("missing control identity")
+				}
+				for round := 0; round < 2; round++ {
+					current := state()
+					fd, err := unix.PidfdOpen(current.BrokerControl.PID, 0)
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+					unix.Close(fd)
+					if err != nil {
+						t.Fatal(err)
+					}
+					deadline := time.Now().Add(8 * time.Second)
+					for {
+						hysteriaPulse(t, old, 'A', 'k')
+						hysteriaPulse(t, next, 'B', 'k')
+						after := state()
+						if after.Phase == "blocked" || after.Phase == "admission-unknown" {
+							t.Fatalf("overlap control recovery blocked: %+v", after)
+						}
+						if after.BrokerControl != nil && after.BrokerControl.PID != current.BrokerControl.PID {
+							if after.Broker.PID != before.Broker.PID || after.Active.PID != before.Active.PID || after.Other.PID != before.Other.PID {
+								t.Fatal("control recovery replaced packet owner or generation")
+							}
+							t.Logf("control_recovered=%d->%d owner_pid=%d unchanged=true", current.BrokerControl.PID, after.BrokerControl.PID, after.Broker.PID)
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("control did not recover during drain")
+						}
+						time.Sleep(20 * time.Millisecond)
+					}
+				}
+			}
 			if err := first.Process.Kill(); err != nil {
 				t.Fatal(err)
 			}
 			first.Wait()
+			if os.Getenv("NODEX_TEST_CRASH_BROKER_CONTROL") == "1" {
+				identity := state().BrokerControl // Management is down; use the last journal.
+				if identity == nil {
+					data, err := os.ReadFile(filepath.Join(runtime, "broker", "control", "state.json"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					identity = &brokerControlIdentity{}
+					if err := json.Unmarshal(data, identity); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fd, err := unix.PidfdOpen(identity.PID, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+				unix.Close(fd)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			hysteriaPulse(t, old, 'A', 'x')
 			hysteriaPulse(t, next, 'B', 'y')
 			if switchCrash {

@@ -36,7 +36,6 @@ func makeNativePacketIngress(public *net.UDPConn, binding brokerBinding) (packet
 	if err != nil {
 		return nil, err
 	}
-	native.TunePacketSocket(public, true, false)
 	i, err := native.NewDormantNativeIngress(public, binding.Key, 0, masks)
 	if err != nil {
 		return nil, err
