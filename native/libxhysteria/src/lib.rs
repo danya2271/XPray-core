@@ -28,6 +28,8 @@ mod mask_socket;
 mod masquerade;
 #[cfg(all(feature = "engine", unix))]
 mod packet_socket;
+#[cfg(all(feature = "engine", target_os = "linux"))]
+mod packet_ring;
 #[cfg(all(feature = "engine", any(target_os = "linux", target_os = "android")))]
 mod shared;
 #[cfg(feature = "probe")]

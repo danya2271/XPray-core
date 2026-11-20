@@ -106,6 +106,8 @@ pub struct Config {
     #[serde(default)]
     pub packet_transmit_fd: i32,
     #[serde(default)]
+    pub packet_ring_fds: [i32; 3],
+    #[serde(default)]
     pub quic_generation: Option<crate::generation_cid::Config>,
     pub diagnostic: bool,
     #[serde(default)]
@@ -1111,11 +1113,25 @@ fn endpoint(config: &Config, socket: NetworkSocket) -> Result<quinn::Endpoint> {
             if config.port_hopping.is_some() {
                 return Err("packet bridge cannot own port hopping".into());
             }
-            let receive = Arc::new(PacketSocket::new(
+            let receive = PacketSocket::new(
                 socket,
                 config.packet_local.parse()?,
                 config.packet_batch,
-            )?);
+            )?;
+            #[cfg(target_os = "linux")]
+            let receive = if config.packet_ring_fds != [0; 3] {
+                if !config.server || !config.packet_batch || config.quic_generation.is_none() {
+                    return Err("packet ring requires a managed native batch server".into());
+                }
+                receive.with_ring(config.packet_ring_fds)?
+            } else {
+                receive
+            };
+            #[cfg(not(target_os = "linux"))]
+            if config.packet_ring_fds != [0; 3] {
+                return Err("packet ring requires Linux".into());
+            }
+            let receive = Arc::new(receive);
             if config.packet_transmit_fd != 0 {
                 if config.packet_transmit_fd < 3 || !config.server || config.quic_generation.is_none() {
                     return Err("direct packet transmit requires a managed server generation".into());

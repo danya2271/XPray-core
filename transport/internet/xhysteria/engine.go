@@ -93,6 +93,7 @@ type Config struct {
 	PacketBatch               bool                                      `json:"packet_batch,omitempty"`
 	PacketLocal               string                                    `json:"packet_local,omitempty"`
 	PacketTransmitFD          int                                       `json:"packet_transmit_fd,omitempty"`
+	PacketRingFDs             [3]int                                    `json:"packet_ring_fds,omitempty"`
 	QUICGeneration            *QUICGenerationConfig                     `json:"quic_generation,omitempty"`
 	Diagnostic                bool                                      `json:"diagnostic"`
 	ExternalAuth              bool                                      `json:"external_auth"`

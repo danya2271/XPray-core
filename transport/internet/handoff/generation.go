@@ -39,6 +39,7 @@ type UDPBinding struct {
 	Slot        byte     `json:"slot"`
 	PacketBatch bool     `json:"packet_batch,omitempty"`
 	TransmitFD  int      `json:"transmit_fd,omitempty"`
+	RingFDs     []int    `json:"ring_fds,omitempty"`
 }
 
 type Manifest struct {
@@ -185,6 +186,26 @@ func ImportGeneration(manifest Manifest) (*Generation, error) {
 			}
 			seen[spec.TransmitFD] = true
 			if err := attachUDPTransmit(packet, spec.TransmitFD); err != nil {
+				packet.Close()
+				g.Close()
+				return nil, err
+			}
+		}
+		if len(spec.RingFDs) != 0 {
+			if !spec.PacketBatch || len(spec.RingFDs) != 3 {
+				packet.Close()
+				g.Close()
+				return nil, errors.New("packet ring requires explicit batch capability")
+			}
+			for _, fd := range spec.RingFDs {
+				if fd < 3 || seen[fd] {
+					packet.Close()
+					g.Close()
+					return nil, errors.New("invalid or duplicate packet ring descriptor")
+				}
+				seen[fd] = true
+			}
+			if err := attachPacketRing(packet, [3]int(spec.RingFDs)); err != nil {
 				packet.Close()
 				g.Close()
 				return nil, err

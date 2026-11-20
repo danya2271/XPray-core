@@ -132,6 +132,7 @@ type PacketEndpoint struct {
 	rxOffset, rxLength, rxStride int
 	rxPeer                       netip.AddrPort
 	transmit                     *net.UDPConn
+	ring                         [3]*os.File
 }
 
 func importUDPPacket(fd *os.File, local net.UDPAddr) (net.PacketConn, error) {
@@ -153,11 +154,44 @@ func ImportPacketEndpoint(fd *os.File, local net.UDPAddr) (*PacketEndpoint, erro
 
 func (e *PacketEndpoint) File() (*os.File, error) { return e.conn.File() }
 func (e *PacketEndpoint) Close() error {
+	for _, file := range e.ring {
+		if file != nil {
+			file.Close()
+		}
+	}
 	if e.transmit != nil {
 		e.transmit.Close()
 	}
 	return e.conn.Close()
 }
+
+func attachPacketRing(packet net.PacketConn, descriptors [3]int) error {
+	e := packet.(*PacketEndpoint)
+	for index, fd := range descriptors {
+		e.ring[index] = os.NewFile(uintptr(fd), "xray-inherited-packet-ring")
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(descriptors[0], &stat); err != nil {
+		return err
+	}
+	seals, err := unix.FcntlInt(uintptr(descriptors[0]), unix.F_GET_SEALS, 0)
+	required := unix.F_SEAL_GROW | unix.F_SEAL_SHRINK | unix.F_SEAL_SEAL
+	if err != nil || seals&required != required || stat.Size < 192 || stat.Size > 4<<20 {
+		return errors.New("packet ring requires a bounded sealed memfd")
+	}
+	for _, fd := range descriptors[1:] {
+		target, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+		flags, flagErr := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+		if err != nil || flagErr != nil || target != "anon_inode:[eventfd]" || flags&unix.O_NONBLOCK == 0 {
+			return errors.New("packet ring requires nonblocking eventfds")
+		}
+	}
+	return nil
+}
+
+// RingFiles belongs to this endpoint. The native setup duplicates the files
+// before Close. Go QUIC must reject a ring rather than waiting on its empty RX.
+func (e *PacketEndpoint) RingFiles() [3]*os.File { return e.ring }
 
 func attachUDPTransmit(packet net.PacketConn, descriptor int) error {
 	f := os.NewFile(uintptr(descriptor), "xray-inherited-udp-transmit")

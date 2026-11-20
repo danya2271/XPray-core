@@ -146,15 +146,35 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		arguments := []string{"run", "-config", configPath}
 		var file *os.File
 		var transmit *os.File
+		var inherited []*os.File
 		control := handoff.ControlSocket(filepath.Join(directory, "control.sock"))
 		if managed {
-			file, err = ingress.Add(slot)
+			if os.Getenv("XHYS_HANDOFF_SHARED_RX") == "1" {
+				relay, ok := ingress.(*native.NativeIngress)
+				if !ok || os.Getenv("XHYS_HANDOFF_PACKET_BATCH") != "1" || os.Getenv("XHYS_HANDOFF_BACKEND") == "go" {
+					t.Fatal("shared receive requires native ingress, batch and native server")
+				}
+				inherited, err = relay.AddRing(slot)
+				if err == nil {
+					file = inherited[0]
+				}
+			} else {
+				file, err = ingress.Add(slot)
+				inherited = []*os.File{file}
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer file.Close()
+			defer func() {
+				for _, file := range inherited {
+					file.Close()
+				}
+			}()
 			manifest := handoff.Manifest{Control: string(control), UDP: []handoff.UDPBinding{{Tag: "hy", Address: "127.0.0.1", Port: local.Port, FD: 3, Key: key, Slot: slot,
 				PacketBatch: os.Getenv("XHYS_HANDOFF_PACKET_BATCH") == "1"}}}
+			if len(inherited) == 4 {
+				manifest.UDP[0].RingFDs = []int{4, 5, 6}
+			}
 			if os.Getenv("XHYS_HANDOFF_DIRECT_TX") == "1" {
 				if os.Getenv("XHYS_HANDOFF_NATIVE_INGRESS") != "1" || os.Getenv("XHYS_HANDOFF_BACKEND") == "go" {
 					t.Fatal("direct transmit requires native ingress and server")
@@ -163,8 +183,8 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer transmit.Close()
-				manifest.UDP[0].TransmitFD = 4
+				manifest.UDP[0].TransmitFD = 3 + len(inherited)
+				inherited = append(inherited, transmit)
 			}
 			data, _ := json.Marshal(manifest)
 			manifestPath := filepath.Join(directory, "manifest.json")
@@ -184,10 +204,7 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		}
 		command.Stdout, command.Stderr = log, log
 		if file != nil {
-			command.ExtraFiles = []*os.File{file}
-			if transmit != nil {
-				command.ExtraFiles = append(command.ExtraFiles, transmit)
-			}
+			command.ExtraFiles = inherited
 		}
 		if err := command.Start(); err != nil {
 			log.Close()

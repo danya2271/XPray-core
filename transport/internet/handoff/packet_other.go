@@ -15,3 +15,7 @@ func importUDPPacket(*os.File, net.UDPAddr) (net.PacketConn, error) {
 func attachUDPTransmit(net.PacketConn, int) error {
 	return errors.New("managed UDP transmit requires Linux")
 }
+
+func attachPacketRing(net.PacketConn, [3]int) error {
+	return errors.New("managed packet ring requires Linux")
+}
