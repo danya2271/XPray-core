@@ -63,6 +63,10 @@ marker, unregisters public receive and acknowledges release;
 `acquire-receive TAG:PORT TOKEN_HEX` lets the active generation reclaim RX.
 Stale leases/tokens are rejected. Keys/snapshots are private; do not log them.
 Never let two generations receive from the public socket simultaneously.
+On repeated release, adoption merges still-live broker Initial pins with the
+worker snapshot instead of discarding the broker table. Existing expiry is
+not extended; conflicting owners or a merged table above the fixed limit
+reject adoption without changing routes or lease state.
 
 The fixed sealed SPSC ring is ~2 MiB per live generation. ABI 2 stores a
 17-byte local destination in existing slot padding. It copies into the ring
@@ -77,6 +81,12 @@ then reconnects to the existing listeners and broker without rebinding.
 The journal supports preparing, switching, draining and retiring states as
 well as a single active generation. Unprovable transitions remain blocked;
 never delete a runtime marker to bypass this protection.
+The generation's saved `config.json` must exist and match its hash: a missing
+snapshot is not accepted merely because the caller supplied another copy.
+Rejected recovery retains the live generation. If recovery finds B already
+active but its new public probe fails, it verifies rollback to A and drains B
+without terminating work previously accepted by B. A failed rollback/probe
+retains both generations in `admission-unknown`, never claims success.
 
 The companion NodeX service uses `KillMode=process`,
 `RuntimeDirectoryPreserve=yes` and `RestartPreventExitStatus=23`. Rejected
@@ -182,6 +192,12 @@ origins, including the built-in candidate-only probe when
 `NODEX_TEST_PUBLIC_PROBE` is set. Focused Go lifecycle race tests, native
 engine tests and Clippy pass.
 These are not a complete production qualification.
+Explicit live tests also interrupt `switching` after real candidate traffic,
+recover the same generations/broker, and inject a failed recovery probe to
+verify fresh work returns to A while old A/B sessions remain live. TCP recovery
+tests reject missing/tampered generation snapshots without disrupting a held
+session. Focused Rust tests check GRO metadata and a long-header Initial/0-RTT
+behind a short first segment; these are regressions, not a new fast-path.
 
 ```sh
 XRAY_TEST_GENERATION_BINARY=/tmp/xray-managed \

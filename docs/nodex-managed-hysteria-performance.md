@@ -1,5 +1,46 @@
 # Managed Hysteria performance investigation
 
+## Loss accounting and rejected direct-RX experiment, November 20, 2026
+
+The load fixture now snapshots Linux public-socket `sk_drops` and receive queue
+bytes separately from relay drops. It resolves the exact bind and pins its
+inode; a missing/rebound socket or regressed counter is an error, not zero
+loss. This is test-only `/proc/self/net/udp` inspection, with no per-packet
+production overhead. A focused test deliberately fills a small unread UDP
+socket and proves kernel overflow is reported.
+
+Use `XHYS_HANDOFF_REQUIRE_NO_DROPS=1` for a strict TCP benchmark gate: it fails
+on either relay or public UDP drops. Paced UDP already requires every sequence
+and now checks both counters too. A successful ordinary TCP benchmark can
+hide packet loss behind QUIC retransmission; it is not a release acceptance.
+The strict one-core ordinary-native run passed, while overlap failed with
+2217 relay drops and zero kernel drops. Logs: `/tmp/nodex-strict-{ordinary,overlap}.log`.
+
+A single exploratory recheck with a temporary direct-RX experiment showed
+zero kernel drops in direct, overlap and post-retirement on four/one cores.
+Overlap still reported 30 relay drops on four cores and 4182 on one. This
+supports targeting the relay, not merely its public socket buffer, for those
+runs. Logs: `/tmp/nodex-kernel-recheck-20261120/`.
+
+The direct-RX experiment bypassed Initial filtering for entirely short-header
+GRO batches and avoided cloning an unchanged waker. An interleaved three-round
+post-retirement comparison (32 flows, 64 KiB, 8192 exchanges, CPU sets 0–3/0
+and client 8–15) produced:
+
+| Cores | Variant | MB/s | Exchange p99, ms | Server CPU, µs/exchange |
+| --- | --- | ---: | ---: | ---: |
+| 4 | Current native managed direct | 581.08 | 21.496 | 689.54 |
+| 4 | Experimental short-header path | 589.55 | 22.766 | 694.91 |
+| 1 | Current native managed direct | 218.34 | 42.358 | 539.11 |
+| 1 | Experimental short-header path | 220.37 | 36.404 | 534.19 |
+
+All twelve completed with zero counted public/relay drops. The throughput
+difference is only ~1–1.5%, four-core CPU is not improved, and one four-core
+experiment had a substantial outlier. **The experiment was rejected and is
+not in the production code.** GRO/Initial regression tests are retained.
+Logs: `/tmp/nodex-fast-rx-compare-20261120/`. These are local measurements,
+not proof that managed direct has no overhead or saturated overlap is fixed.
+
 ## Current lifecycle and acceptance status, November 20, 2026
 
 The historical experiments below predate the integrated persistent broker,

@@ -44,6 +44,7 @@ type handoffLoadSnapshot struct {
 	Counts        []uint64
 	Ingress       native.NativeIngressStats
 	Drain         string
+	PublicUDP     handoffSocketStats
 }
 
 type handoffLoadInfo struct {
@@ -259,6 +260,10 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		}
 	}
 	start(0)
+	publicStats, err := readHandoffSocketStats(local, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if managed {
 		if _, err := controls[0].Command(t.Context(), "resume"); err != nil {
 			t.Fatal(err)
@@ -306,6 +311,10 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 			}
 		}
 		var snapshot handoffLoadSnapshot
+		snapshot.PublicUDP, err = readHandoffSocketStats(local, publicStats.Inode)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if scanner.Text() == "return-direct" {
 			relay, ok := ingress.(*native.NativeIngress)
 			if !ok || len(processes) != 2 {
@@ -701,6 +710,11 @@ func benchmarkHandoffLoad(b *testing.B, size int) {
 	b.ReportMetric(float64(after.ServerRSS)/1024, "server-peak-rss-MiB")
 	b.ReportMetric(float64(after.SupervisorRSS)/1024, "supervisor-echo-peak-rss-MiB")
 	b.ReportMetric(float64(after.Drops-before.Drops), "ingress-drops")
+	if after.PublicUDP.Inode != before.PublicUDP.Inode || after.PublicUDP.Drops < before.PublicUDP.Drops || after.Drops < before.Drops {
+		b.Fatal("public UDP identity changed or a drop counter regressed")
+	}
+	b.ReportMetric(float64(after.PublicUDP.Drops-before.PublicUDP.Drops), "public-udp-drops")
+	b.ReportMetric(float64(after.PublicUDP.QueueBytes), "public-udp-queue-bytes")
 	b.ReportMetric(float64(after.Ingress.Backpressure-before.Ingress.Backpressure), "ingress-queued")
 	b.ReportMetric(float64(after.Ingress.QueueDrops-before.Ingress.QueueDrops), "ingress-queue-drops")
 	b.ReportMetric(float64(after.Ingress.SendDrops-before.Ingress.SendDrops), "ingress-send-drops")
@@ -711,6 +725,9 @@ func benchmarkHandoffLoad(b *testing.B, size int) {
 	}
 	if after.Drops != before.Drops {
 		b.Logf("managed ingress dropped %d datagrams during TCP echo", after.Drops-before.Drops)
+	}
+	if os.Getenv("XHYS_HANDOFF_REQUIRE_NO_DROPS") == "1" && (after.Drops != before.Drops || after.PublicUDP.Drops != before.PublicUDP.Drops) {
+		b.Fatalf("strict loss gate failed: ingress_drops=%d public_udp_drops=%d", after.Drops-before.Drops, after.PublicUDP.Drops-before.PublicUDP.Drops)
 	}
 }
 
@@ -887,7 +904,8 @@ func TestHandoffUnderLoad(t *testing.T) {
 	t.Logf("received=%d/%d background_mibps=%.2f udp_p50_us=%.1f udp_p99_us=%.1f udp_max_us=%.1f ingress_drops=%d generations=%v server_cpu_seconds=%.3f supervisor_echo_cpu_seconds=%.3f server_peak_rss_mib=%.2f supervisor_echo_peak_rss_mib=%.2f", len(samples), packets, background, float64(samples[len(samples)/2])/1000, float64(samples[(len(samples)-1)*99/100])/1000, float64(samples[len(samples)-1])/1000, after.Drops-before.Drops, after.Counts, float64(after.ServerCPU-before.ServerCPU)/1e9, float64(after.SupervisorCPU-before.SupervisorCPU)/1e9, float64(after.ServerRSS)/1024, float64(after.SupervisorRSS)/1024)
 	t.Logf("missing_before_sequence_600=%d missing_after_sequence_600=%d missing_first_32=%v", missingBefore, missingAfter, missing)
 	t.Logf("native_ingress=%+v", after.Ingress)
-	if len(samples) != packets || after.Drops != before.Drops {
+	t.Logf("public_udp_drops_before=%d public_udp_drops_after=%d public_udp_queued_bytes=%d", before.PublicUDP.Drops, after.PublicUDP.Drops, after.PublicUDP.QueueBytes)
+	if len(samples) != packets || after.Drops != before.Drops || after.PublicUDP.Drops != before.PublicUDP.Drops {
 		t.Error("UDP loss under load")
 	}
 	select {
