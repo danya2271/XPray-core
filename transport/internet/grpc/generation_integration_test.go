@@ -110,7 +110,7 @@ func testManagedXrayProcesses(t *testing.T, binary string, secure bool) {
 		socket := filepath.Join(directory, "ctl.sock")
 		transport := "grpc"
 		if !valid {
-			transport = "xhttp"
+			transport = "tcp"
 		}
 		config := fmt.Sprintf(`{"inbounds":[{"tag":"vpn","listen":"127.0.0.1","port":%d,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":%d,"network":"tcp"},"streamSettings":{"network":%q,"grpcSettings":{"serviceName":"handoff"}%s}}],"outbounds":[{"protocol":"freedom"}]}`,
 			port, backend.Addr().(*net.TCPAddr).Port, transport, realitySettings)
@@ -223,7 +223,7 @@ func testManagedXrayProcesses(t *testing.T, binary string, secure bool) {
 	check(oldStream, 'A', '0')
 	invalidSocket, invalid := start("invalid", false)
 	if err := invalid.Wait(); err == nil {
-		t.Fatal("unsupported XHTTP transport started in managed mode")
+		t.Fatal("unsupported raw TCP transport started in managed mode")
 	}
 	if _, err := os.Lstat(invalidSocket); !os.IsNotExist(err) {
 		t.Fatalf("unsupported configuration created its control socket: %v", err)

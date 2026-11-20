@@ -2,12 +2,12 @@ package handoff
 
 import (
 	"errors"
-	"net"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-func validateListeningSocket(listener *net.TCPListener) error {
+func validateListeningSocket(listener syscall.Conn) error {
 	control, err := listener.SyscallConn()
 	if err != nil {
 		return err

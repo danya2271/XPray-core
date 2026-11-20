@@ -24,12 +24,8 @@ func ListenControl(path string, g *Generation) (net.Listener, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, errors.New("handoff control socket requires a clean absolute path")
 	}
-	directory, err := os.Lstat(filepath.Dir(path))
-	if err != nil {
+	if err := PrivateSocketDirectory(filepath.Dir(path)); err != nil {
 		return nil, err
-	}
-	if !directory.IsDir() || directory.Mode().Perm() != 0700 {
-		return nil, errors.New("handoff control socket requires a private directory (0700)")
 	}
 	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
@@ -51,11 +47,25 @@ func ListenControl(path string, g *Generation) (net.Listener, error) {
 	return listener, nil
 }
 
+func PrivateSocketDirectory(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errors.New("handoff sockets require a clean absolute directory path")
+	}
+	directory, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !directory.IsDir() || directory.Mode().Perm() != 0700 {
+		return errors.New("handoff sockets require a private directory (0700)")
+	}
+	return nil
+}
+
 func serveControl(conn net.Conn, generation *Generation) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
 	input := bufio.NewScanner(conn)
-	input.Buffer(make([]byte, 64), 64)
+	input.Buffer(make([]byte, 128), 4096)
 	if !input.Scan() {
 		return
 	}

@@ -136,13 +136,13 @@ func (w *tcpWorker) Start() error {
 	ctx := context.Background()
 	var managed *handoff.Generation
 	if generation := handoff.FromContext(w.ctx); generation != nil {
-		if w.stream.ProtocolName == "grpc" {
+		if w.stream.ProtocolName == "grpc" || w.stream.ProtocolName == "splithttp" {
 			if (w.stream.FinalMask != nil && w.stream.FinalMask.HasTCPMasks()) || w.recvOrigDest ||
 				(w.stream.SocketSettings != nil && (w.stream.SocketSettings.AcceptProxyProtocol || w.stream.SocketSettings.Tproxy != internet.SocketConfig_Off)) {
-				return errors.New("unsupported listener options for managed gRPC inbound ", w.tag)
+				return errors.New("unsupported listener options for managed stream inbound ", w.tag)
 			}
 			if w.address.Family().IsDomain() {
-				return errors.New("managed gRPC inbound requires a numeric IP: ", w.tag)
+				return errors.New("managed stream inbound requires a numeric IP: ", w.tag)
 			}
 			gate, err := generation.ClaimTCP(w.tag, w.address.IP(), int(w.port))
 			if err != nil {
@@ -168,18 +168,23 @@ func (w *tcpWorker) Start() error {
 		return errors.New("failed to listen TCP on ", w.port).Base(err)
 	}
 	if managed != nil {
-		drainer, ok := hub.(interface{ Drain() })
-		if !ok {
-			hub.Close()
-			return errors.New("managed inbound has no drain operation ", w.tag)
-		}
-		if err := managed.AttachDrain(w.tag, int(w.port), drainer.Drain); err != nil {
+		if err := attachHandoff(managed, w.tag, int(w.port), hub); err != nil {
 			hub.Close()
 			return err
 		}
 	}
 	w.hub = hub
 	return nil
+}
+
+func attachHandoff(g *handoff.Generation, tag string, port int, hub internet.Listener) error {
+	if xhttp, ok := hub.(handoff.XHTTP); ok {
+		return g.AttachXHTTP(tag, port, xhttp)
+	}
+	if drainer, ok := hub.(interface{ Drain() error }); ok {
+		return g.AttachDrain(tag, port, drainer.Drain)
+	}
+	return errors.New("managed inbound has no drain operation ", tag)
 }
 
 func (w *tcpWorker) Close() error {
@@ -560,15 +565,31 @@ func (w *dsWorker) Port() net.Port {
 }
 
 func (w *dsWorker) Start() error {
-	if handoff.FromContext(w.ctx) != nil {
-		return errors.New("handoff is not supported for Unix inbound ", w.tag)
-	}
 	ctx := context.Background()
+	managed := handoff.FromContext(w.ctx)
+	if managed != nil {
+		if w.stream.ProtocolName != "splithttp" || !w.address.Family().IsDomain() ||
+			(w.stream.FinalMask != nil && w.stream.FinalMask.HasTCPMasks()) ||
+			(w.stream.SocketSettings != nil && w.stream.SocketSettings.AcceptProxyProtocol) {
+			return errors.New("handoff is not supported for Unix inbound ", w.tag)
+		}
+		gate, err := managed.ClaimUnix(w.tag, w.address.Domain())
+		if err != nil {
+			return err
+		}
+		ctx = handoff.WithTCPListener(ctx, gate)
+	}
 	hub, err := internet.ListenUnix(ctx, w.address, w.stream, func(conn stat.Connection) {
 		go w.callback(conn)
 	})
 	if err != nil {
 		return errors.New("failed to listen Unix Domain Socket on ", w.address).Base(err)
+	}
+	if managed != nil {
+		if err := attachHandoff(managed, w.tag, 0, hub); err != nil {
+			hub.Close()
+			return err
+		}
 	}
 	w.hub = hub
 	return nil
