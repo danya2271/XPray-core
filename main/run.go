@@ -90,6 +90,9 @@ func executeRun(cmd *base.Command, args []string) {
 		if err != nil {
 			log.Fatalf("Failed to read handoff manifest: %v", err)
 		}
+		if err := handoff.AwaitStartup(manifest); err != nil {
+			log.Fatalf("Handoff launch was not committed: %v", err)
+		}
 		generation, err = handoff.ImportGeneration(manifest)
 		if err != nil {
 			log.Fatalf("Failed to start handoff generation: %v", err)

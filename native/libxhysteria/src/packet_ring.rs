@@ -16,7 +16,9 @@ use std::{
 use tokio::io::unix::AsyncFd;
 
 const MAGIC: u64 = 0x31525850414d584e;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const DESTINATION: usize = 17;
+const DATA_OFFSET: usize = 4 + DESTINATION;
 const CAPACITY: u32 = 32;
 const HEADER: usize = 192;
 const MAX_FRAME: usize = 24 + 65535;
@@ -171,26 +173,52 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    #[cfg(test)]
     pub fn push(&mut self, header: &[u8; 24], payloads: &[(SocketAddr, &[u8])]) -> io::Result<()> {
-        self.push_parts(header, payloads.iter().map(|p| p.1))
+        self.push_with_destination(header, payloads, None)
+    }
+
+    pub fn push_with_destination(
+        &mut self,
+        header: &[u8; 24],
+        payloads: &[(SocketAddr, &[u8])],
+        destination: Option<IpAddr>,
+    ) -> io::Result<()> {
+        self.push_parts(header, payloads.iter().map(|p| p.1), destination)
     }
 
     pub fn push_wire(&mut self, wire: &[u8]) -> io::Result<()> {
         if wire.len() < 24 {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        self.push_parts(wire[..24].try_into().unwrap(), std::iter::once(&wire[24..]))
+        self.push_wire_with_destination(wire, None)
+    }
+
+    pub fn push_wire_with_destination(
+        &mut self,
+        wire: &[u8],
+        destination: Option<IpAddr>,
+    ) -> io::Result<()> {
+        if wire.len() < 24 {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.push_parts(
+            wire[..24].try_into().unwrap(),
+            std::iter::once(&wire[24..]),
+            destination,
+        )
     }
 
     fn push_parts<'a>(
         &mut self,
         header: &[u8; 24],
         payloads: impl Iterator<Item = &'a [u8]> + Clone,
+        destination: Option<IpAddr>,
     ) -> io::Result<()> {
         let length = payloads
             .clone()
             .try_fold(24usize, |size, p| size.checked_add(p.len()));
-        let Some(length) = length.filter(|size| (25..=MAX_FRAME).contains(size)) else {
+        let Some(length) = length.filter(|size| (24..=MAX_FRAME).contains(size)) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "packet ring frame too large",
@@ -213,8 +241,21 @@ impl Batch<'_> {
         unsafe {
             let slot = self.sender.mapping.slot(self.tail);
             slot.cast::<u32>().write(length as u32);
-            std::ptr::copy_nonoverlapping(header.as_ptr(), slot.add(4), 24);
-            let mut offset = 28;
+            let mut local = [0u8; DESTINATION];
+            match destination {
+                Some(IpAddr::V4(ip)) => {
+                    local[0] = 4;
+                    local[13..].copy_from_slice(&ip.octets());
+                }
+                Some(IpAddr::V6(ip)) => {
+                    local[0] = 6;
+                    local[1..].copy_from_slice(&ip.octets());
+                }
+                None => {}
+            }
+            std::ptr::copy_nonoverlapping(local.as_ptr(), slot.add(4), DESTINATION);
+            std::ptr::copy_nonoverlapping(header.as_ptr(), slot.add(DATA_OFFSET), 24);
+            let mut offset = DATA_OFFSET + 24;
             for payload in payloads {
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), slot.add(offset), payload.len());
                 offset += payload.len();
@@ -404,6 +445,7 @@ impl Receiver {
         buffers: &mut [IoSliceMut<'_>],
         metadata: &mut [udp::RecvMeta],
         local: SocketAddr,
+        fence: &std::sync::Mutex<Option<[u8; 16]>>,
     ) -> io::Result<usize> {
         let h = self.mapping.header();
         let mut head = h.head.value.load(Ordering::Relaxed);
@@ -416,8 +458,27 @@ impl Receiver {
         for _ in 0..pending.min(buffers.len().min(metadata.len()) as u32) {
             let slot = self.mapping.slot(head);
             let length = unsafe { slot.cast::<u32>().read() } as usize;
+            let destination = unsafe { std::slice::from_raw_parts(slot.add(4), DESTINATION) };
+            let destination = match destination[0] {
+                0 => None,
+                4 if destination[1..13].iter().all(|&byte| byte == 0) => Some(IpAddr::V4(
+                    <[u8; 4]>::try_from(&destination[13..]).unwrap().into(),
+                )),
+                6 => Some(IpAddr::V6(
+                    <[u8; 16]>::try_from(&destination[1..]).unwrap().into(),
+                )),
+                _ => return Err(io::ErrorKind::InvalidData.into()),
+            };
+            if length == 24 {
+                let header = unsafe { std::slice::from_raw_parts(slot.add(DATA_OFFSET), 24) };
+                if let Some(token) = packet_socket::drain_marker(header) {
+                    *fence
+                        .lock()
+                        .map_err(|_| io::Error::other("drain fence poisoned"))? = Some(token);
+                }
+            }
             if (25..=MAX_FRAME).contains(&length) {
-                let frame = unsafe { std::slice::from_raw_parts(slot.add(4), length) };
+                let frame = unsafe { std::slice::from_raw_parts(slot.add(DATA_OFFSET), length) };
                 let mut header = frame[..24].try_into().unwrap();
                 if let Some((mut address, stride)) =
                     packet_socket::parse_frame_limit(&mut header, length - 24, true, 32)
@@ -434,7 +495,8 @@ impl Receiver {
                         len: length - 24,
                         stride,
                         ecn: None,
-                        dst_ip: (!local.ip().is_unspecified()).then_some(local.ip()),
+                        dst_ip: destination
+                            .or_else(|| (!local.ip().is_unspecified()).then_some(local.ip())),
                     };
                     count += 1;
                 }
@@ -449,6 +511,7 @@ impl Receiver {
         Ok(count)
     }
 
+    #[cfg(test)]
     pub fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
@@ -456,11 +519,22 @@ impl Receiver {
         metadata: &mut [udp::RecvMeta],
         local: SocketAddr,
     ) -> Poll<io::Result<usize>> {
+        self.poll_recv_fenced(cx, buffers, metadata, local, &std::sync::Mutex::new(None))
+    }
+
+    pub fn poll_recv_fenced(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffers: &mut [IoSliceMut<'_>],
+        metadata: &mut [udp::RecvMeta],
+        local: SocketAddr,
+        fence: &std::sync::Mutex<Option<[u8; 16]>>,
+    ) -> Poll<io::Result<usize>> {
         if buffers.is_empty() || metadata.is_empty() {
             return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
         }
         for _ in 0..32 {
-            let count = self.receive(buffers, metadata, local)?;
+            let count = self.receive(buffers, metadata, local, fence)?;
             if count != 0 {
                 return Poll::Ready(Ok(count));
             }

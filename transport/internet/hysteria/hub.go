@@ -209,12 +209,42 @@ func (l *Listener) GenerationConnections() (uint64, bool) {
 // ConnContext is called before the handshake is accepted and its context is
 // cancelled on handshake failure or connection close. Track this separately
 // from accepted HTTP/3 handlers, which may still be winding down afterwards.
-type generationWork struct{ count atomic.Uint64 }
+type generationWork struct {
+	count   atomic.Uint64
+	mu      sync.Mutex
+	retired bool
+}
 
 func (w *generationWork) track(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.retired {
+		return nil, errors.New("managed QUIC generation retired")
+	}
 	w.count.Add(1)
 	context.AfterFunc(ctx, func() { w.count.Add(^uint64(0)) })
 	return ctx, nil
+}
+
+// TryDrainGeneration is irreversible only on success. The private queue marker
+// must be observed first; the QUIC server then evaluates idle after every
+// previously queued unknown-CID packet, including pre-Accept handshakes.
+func (l *Listener) TryDrainGeneration(token [16]byte) (bool, error) {
+	fence, ok := l.pktConn.(interface{ DrainFenceSeen([16]byte) bool })
+	if !l.tracked || l.work == nil || !ok || !fence.DrainFenceSeen(token) {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return l.listener.TryRetireIdle(ctx, func() bool {
+		l.work.mu.Lock()
+		defer l.work.mu.Unlock()
+		if l.work.count.Load() != 0 || l.live.Load() != 0 {
+			return false
+		}
+		l.work.retired = true
+		return true
+	})
 }
 
 func (l *Listener) GenerationStatus() handoff.UDPConnectionStatus {

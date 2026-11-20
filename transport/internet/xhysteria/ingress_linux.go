@@ -100,6 +100,18 @@ func (i *NativeIngress) AdoptReceive(snapshot []byte) error {
 	return nil
 }
 
+// FenceGeneration is irreversible once acknowledged; Activate cannot roll a
+// fenced slot back into admission. False means Initial pins/queues still need
+// time. It does not mean the worker has already processed the marker.
+func (i *NativeIngress) FenceGeneration(slot byte, token [16]byte) (bool, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil || token == [16]byte{} {
+		return false, errors.New("invalid generation fence")
+	}
+	return bool(C.xhys_ingress_fence(i.handle, C.uint8_t(slot), (*C.uint8_t)(unsafe.Pointer(&token[0])))), nil
+}
+
 func (i *NativeIngress) Add(slot byte) (*os.File, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -125,6 +137,17 @@ func (i *NativeIngress) Add(slot byte) (*os.File, error) {
 // AddRing exports a native-only bounded receive ring and a Unix reply channel.
 // Files are returned in worker, memfd, readable-eventfd, writable-eventfd order.
 func (i *NativeIngress) AddRing(slot byte) ([]*os.File, error) {
+	return i.addRing(slot, false)
+}
+
+// AddDirectRing requires the worker to inherit the public transmit descriptor.
+// Unlike AddRing, its private channel carries no outgoing datagrams. The ingress
+// can therefore release public receive without abandoning relay egress queues.
+func (i *NativeIngress) AddDirectRing(slot byte) ([]*os.File, error) {
+	return i.addRing(slot, true)
+}
+
+func (i *NativeIngress) addRing(slot byte, directTransmit bool) ([]*os.File, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	if i.handle == nil || i.used[slot] {
@@ -140,7 +163,7 @@ func (i *NativeIngress) AddRing(slot byte) ([]*os.File, error) {
 	// Reserve even if acknowledgement times out: that is uncertain admission,
 	// not permission to reuse the same slot.
 	i.used[slot] = true
-	if !bool(C.xhys_ingress_add_ring(i.handle, C.uint8_t(slot), C.int32_t(parent.Fd()), &ring)) {
+	if !bool(C.xhys_ingress_add_ring(i.handle, C.uint8_t(slot), C.int32_t(parent.Fd()), C.bool(directTransmit), &ring)) {
 		child.Close()
 		return nil, errors.New("native ring attachment was not acknowledged")
 	}
@@ -155,6 +178,36 @@ func (i *NativeIngress) Activate(slot byte) error {
 		return errors.New("native ingress admission change was not acknowledged")
 	}
 	return nil
+}
+
+// Abandon requires proof that an unadmitted candidate has exited.
+func (i *NativeIngress) Abandon(slot byte) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil || !bool(C.xhys_ingress_abandon(i.handle, C.uint8_t(slot))) {
+		return errors.New("native candidate abandonment not acknowledged")
+	}
+	return nil
+}
+
+// Retire requires udp-drained from that generation with the same fence token.
+func (i *NativeIngress) Retire(slot byte, token [16]byte) (bool, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil || token == [16]byte{} {
+		return false, errors.New("invalid retirement token")
+	}
+	return bool(C.xhys_ingress_retire(i.handle, C.uint8_t(slot), (*C.uint8_t)(unsafe.Pointer(&token[0])))), nil
+}
+
+// ReleasePublic ACK must precede the active worker's acquire with this token.
+func (i *NativeIngress) ReleasePublic(slot byte, token [16]byte) (bool, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil || token == [16]byte{} {
+		return false, errors.New("invalid public receive release")
+	}
+	return bool(C.xhys_ingress_release_public(i.handle, C.uint8_t(slot), (*C.uint8_t)(unsafe.Pointer(&token[0])))), nil
 }
 
 func (i *NativeIngress) Dropped() uint64 {

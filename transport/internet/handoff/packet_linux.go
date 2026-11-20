@@ -131,9 +131,17 @@ type PacketEndpoint struct {
 	peers                        packetAddressCache
 	rxOffset, rxLength, rxStride int
 	rxPeer                       netip.AddrPort
-	transmit                     *net.UDPConn
-	ring                         [3]*os.File
-	directReceive                bool
+	rxLocal                      netip.Addr
+	destinationCache             [64]struct {
+		peer    netip.AddrPort
+		local   netip.Addr
+		address *packetDestination
+	}
+	transmit      *net.UDPConn
+	ring          [3]*os.File
+	directReceive bool
+	drainFence    atomic.Pointer[[16]byte]
+	egressFence   atomic.Pointer[[16]byte]
 }
 
 func importUDPPacket(fd *os.File, local net.UDPAddr) (net.PacketConn, error) {
@@ -219,6 +227,39 @@ func (e *PacketEndpoint) DirectReceive() bool    { return e.directReceive }
 
 func setDirectReceive(packet net.PacketConn) { packet.(*PacketEndpoint).directReceive = true }
 
+func (e *PacketEndpoint) DrainFenceSeen(token [16]byte) bool {
+	seen := e.drainFence.Load()
+	return token != [16]byte{} && seen != nil && token == *seen
+}
+
+// FenceEgress follows every earlier worker reply in the same private FIFO.
+func (e *PacketEndpoint) FenceEgress(token [16]byte) (bool, error) {
+	if e.transmit != nil {
+		return true, nil
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if previous := e.egressFence.Load(); previous != nil {
+		return *previous == token, nil
+	}
+	raw, err := e.conn.SyscallConn()
+	if err != nil {
+		return false, err
+	}
+	send := nonblockingDatagram{wire: DrainFrame(token)}
+	if err := raw.Control(send.send); err != nil {
+		return false, err
+	}
+	if errors.Is(send.err, unix.EAGAIN) || errors.Is(send.err, unix.EWOULDBLOCK) {
+		return false, nil
+	}
+	if send.err != nil {
+		return false, send.err
+	}
+	e.egressFence.Store(&token)
+	return true, nil
+}
+
 func attachUDPTransmit(packet net.PacketConn, descriptor int) error {
 	f := os.NewFile(uintptr(descriptor), "xray-inherited-udp-transmit")
 	defer f.Close()
@@ -252,49 +293,83 @@ func (e *PacketEndpoint) ReadFrom(payload []byte) (int, net.Addr, error) {
 	e.readMu.Lock()
 	defer e.readMu.Unlock()
 	if e.rx == nil {
-		e.rx = make([]byte, packetHeaderSize+packetMaximum)
+		e.rx = make([]byte, packetHeaderSize+destinationSize+packetMaximum)
 	}
 	for {
 		if e.rxOffset < e.rxLength {
 			end := min(e.rxOffset+e.rxStride, e.rxLength)
 			n := copy(payload, e.rx[e.rxOffset:end])
 			e.rxOffset = end
-			return n, e.peers.get(e.rxPeer), nil
+			peer := e.peers.get(e.rxPeer)
+			if e.rxLocal.IsValid() {
+				key := int(e.rxPeer.Port()) ^ int(e.rxLocal.As16()[15])
+				cached := &e.destinationCache[key&63]
+				if cached.address == nil || cached.peer != e.rxPeer || cached.local != e.rxLocal {
+					cached.peer, cached.local = e.rxPeer, e.rxLocal
+					cached.address = &packetDestination{peer: peer, local: e.rxLocal}
+				}
+				return n, cached.address, nil
+			}
+			return n, peer, nil
 		}
 		n, _, flags, _, err := e.conn.ReadMsgUnix(e.rx, nil)
 		if err != nil {
 			return 0, nil, err
 		}
+		if token, ok := readDrainFrame(e.rx[:n]); ok && flags&unix.MSG_TRUNC == 0 {
+			e.drainFence.Store(&token)
+			continue
+		}
 		if flags&unix.MSG_TRUNC == 0 {
-			if addr, stride, ok := readPacketFrame(e.rx[:n]); ok && stride <= len(payload) {
-				e.rxOffset, e.rxLength, e.rxStride, e.rxPeer = packetHeaderSize, n, stride, addr
+			if addr, stride, offset, local, ok := readDestinationPacketFrame(e.rx[:n]); ok && stride <= len(payload) {
+				e.rxOffset, e.rxLength, e.rxStride, e.rxPeer, e.rxLocal = offset, n, stride, addr, local
 			}
 		}
 	}
 }
 
 func (e *PacketEndpoint) WriteTo(payload []byte, address net.Addr) (int, error) {
+	return e.writePacketTo(payload, address, netip.Addr{})
+}
+
+func (e *PacketEndpoint) WritePacketTo(payload []byte, address net.Addr, oob []byte) (int, error) {
+	local, err := parsePacketSource(oob)
+	if err != nil {
+		return 0, err
+	}
+	return e.writePacketTo(payload, address, local)
+}
+
+func (e *PacketEndpoint) writePacketTo(payload []byte, address net.Addr, local netip.Addr) (int, error) {
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
 	if e.tx == nil {
-		e.tx = make([]byte, packetHeaderSize+packetMaximum)
+		e.tx = make([]byte, packetHeaderSize+destinationSize+packetMaximum)
 	}
 	peer, _ := address.(*net.UDPAddr)
 	if !writePacketHeader(e.tx, udpAddress(peer), len(payload)) {
 		return 0, errors.New("invalid handoff datagram")
 	}
-	copy(e.tx[packetHeaderSize:], payload)
-	n, err := e.conn.Write(e.tx[:packetHeaderSize+len(payload)])
+	offset := packetHeaderSize
+	if local.IsValid() {
+		e.tx[0] = 3
+		destinationHeader(e.tx[offset:], local)
+		offset += destinationSize
+	}
+	copy(e.tx[offset:], payload)
+	n, err := e.conn.Write(e.tx[:offset+len(payload)])
 	if err != nil {
 		return 0, err
 	}
-	return n - packetHeaderSize, nil
+	return n - offset, nil
 }
 
 type udpPeer struct {
-	conn   *net.UnixConn
-	raw    syscall.RawConn
-	failed atomic.Bool
+	conn        *net.UnixConn
+	raw         syscall.RawConn
+	failed      atomic.Bool
+	fence       [16]byte // protected by ingress.mu
+	egressFence atomic.Pointer[[16]byte]
 }
 
 type udpPeers [256]*udpPeer
@@ -341,7 +416,7 @@ func NewUDPIngress(public net.PacketConn, key [16]byte, initialSlot byte, pendin
 		return nil, errors.New("managed UDP ingress needs a public socket")
 	}
 	local, ok := public.LocalAddr().(*net.UDPAddr)
-	if !ok || local.Zone != "" || local.IP.IsUnspecified() || local.IP.To16() == nil || key == [16]byte{} || pendingLimit < 1 || pinLifetime <= 0 {
+	if !ok || local.Zone != "" || local.IP.To16() == nil || key == [16]byte{} || pendingLimit < 1 || pinLifetime <= 0 {
 		return nil, errors.New("managed UDP ingress requires a numeric, explicitly bound address and valid routing limits")
 	}
 	i := &UDPIngress{public: public, routes: NewQUICRoutes(NewQUICCIDCodec(key), initialSlot, pendingLimit, pinLifetime), done: make(chan struct{})}
@@ -392,7 +467,7 @@ func (i *UDPIngress) Activate(slot byte) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	peer := i.peers.Load()[slot]
-	if i.closed || i.failed.Load() || peer == nil || peer.failed.Load() {
+	if i.closed || i.failed.Load() || peer == nil || peer.failed.Load() || peer.fence != [16]byte{} {
 		return fmt.Errorf("UDP generation %d has no healthy ingress", slot)
 	}
 	i.routes.Activate(slot)
@@ -400,6 +475,71 @@ func (i *UDPIngress) Activate(slot byte) error {
 }
 
 func (i *UDPIngress) Dropped() uint64 { return i.dropped.Load() }
+
+// Abandon is only for an unadmitted slot after its process has exited.
+func (i *UDPIngress) Abandon(slot byte) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.closed || !i.routes.Retire(slot) {
+		return errors.New("cannot abandon the active UDP slot")
+	}
+	peers := *i.peers.Load()
+	if peer := peers[slot]; peer != nil {
+		peer.conn.Close()
+		peers[slot] = nil
+		i.peers.Store(&peers)
+	}
+	return nil
+}
+
+// Retire only removes CID routing after the caller has confirmed udp-drained
+// with this exact fence token. It does not infer retirement from queue counts.
+func (i *UDPIngress) Retire(slot byte, token [16]byte) (bool, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	peer := i.peers.Load()[slot]
+	if i.closed || i.failed.Load() || peer == nil || token == [16]byte{} || peer.fence != token {
+		return false, errors.New("generation retirement requires a healthy matching fence")
+	}
+	if seen := peer.egressFence.Load(); seen == nil || *seen != token {
+		return false, nil
+	}
+	return i.routes.Retire(slot), nil
+}
+
+// FenceGeneration emits a private FIFO marker after Initial admission and
+// earlier receive forwarding are fenced. Never resume the slot after success.
+func (i *UDPIngress) FenceGeneration(ctx context.Context, slot byte, token [16]byte) (bool, error) {
+	if token == [16]byte{} {
+		return false, errors.New("zero generation drain token")
+	}
+	before := i.routes.slots.Load()
+	until, err := i.FenceInitials(ctx, slot)
+	if err != nil || !until.IsZero() {
+		return false, err
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	peer := i.peers.Load()[slot]
+	if i.closed || peer == nil || before != i.routes.slots.Load() {
+		return false, errors.New("admission changed during generation fence")
+	}
+	if peer.fence != [16]byte{} {
+		return peer.fence == token, nil
+	}
+	send := nonblockingDatagram{wire: DrainFrame(token)}
+	if err := peer.raw.Control(send.send); err != nil {
+		return false, err
+	}
+	if errors.Is(send.err, unix.EAGAIN) || errors.Is(send.err, unix.EWOULDBLOCK) {
+		return false, nil
+	}
+	if send.err != nil {
+		return false, send.err
+	}
+	peer.fence = token
+	return true, nil
+}
 
 // FenceInitials reports whether new client-chosen Initial/0-RTT packets can
 // no longer reach an inactive slot through this ingress. A nonzero returned
@@ -478,18 +618,22 @@ func (i *UDPIngress) receive() {
 	defer close(i.done)
 	defer i.failed.Store(true)
 	reader := i.routes.NewReader()
-	wire := make([]byte, packetHeaderSize+packetMaximum)
+	wire := make([]byte, packetHeaderSize+destinationSize+packetMaximum)
 	var send nonblockingDatagram
 	write := send.send
 	for {
 		var n int
 		var peer netip.AddrPort
+		var local netip.Addr
 		var err error
 		if udp, ok := i.public.(*net.UDPConn); ok {
 			n, peer, err = udp.ReadFromUDPAddrPort(wire[packetHeaderSize:])
 		} else {
 			var from net.Addr
 			n, from, err = i.public.ReadFrom(wire[packetHeaderSize:])
+			if metadata, ok := from.(*packetDestination); ok {
+				from, local = metadata.peer, metadata.local
+			}
 			addr, _ := from.(*net.UDPAddr)
 			peer = udpAddress(addr)
 		}
@@ -524,7 +668,14 @@ func (i *UDPIngress) receive() {
 			i.dropped.Add(1)
 			continue
 		}
-		send.wire = wire[:packetHeaderSize+n]
+		length := packetHeaderSize + n
+		if local.IsValid() {
+			copy(wire[packetHeaderSize+destinationSize:], wire[packetHeaderSize:length])
+			wire[0] = 3
+			destinationHeader(wire[packetHeaderSize:], local)
+			length += destinationSize
+		}
+		send.wire = wire[:length]
 		if err := worker.raw.Control(write); err != nil || send.err != nil {
 			i.dropped.Add(1) // Never block another generation on this queue.
 		}
@@ -533,21 +684,27 @@ func (i *UDPIngress) receive() {
 
 func (i *UDPIngress) send(peer *udpPeer) {
 	defer peer.failed.Store(true)
-	wire := make([]byte, packetHeaderSize+packetMaximum)
+	wire := make([]byte, packetHeaderSize+destinationSize+packetMaximum)
 	var cache packetAddressCache
 	for {
 		n, _, flags, _, err := peer.conn.ReadMsgUnix(wire, nil)
 		if err != nil {
 			return
 		}
-		addr, stride, ok := readPacketFrame(wire[:n])
+		if token, ok := readDrainFrame(wire[:n]); ok && flags&unix.MSG_TRUNC == 0 {
+			peer.egressFence.Store(&token)
+			continue
+		}
+		addr, stride, start, local, ok := readDestinationPacketFrame(wire[:n])
 		if !ok || flags&unix.MSG_TRUNC != 0 {
 			i.dropped.Add(1)
 			continue
 		}
-		for offset := packetHeaderSize; offset < n; offset += stride {
+		for offset := start; offset < n; offset += stride {
 			payload := wire[offset:min(offset+stride, n)]
-			if udp, plain := i.public.(*net.UDPConn); plain {
+			if local.IsValid() {
+				_, err = i.public.WriteTo(payload, &packetDestination{peer: cache.get(addr), local: local})
+			} else if udp, plain := i.public.(*net.UDPConn); plain {
 				_, err = udp.WriteToUDPAddrPort(payload, addr)
 			} else {
 				_, err = i.public.WriteTo(payload, cache.get(addr))

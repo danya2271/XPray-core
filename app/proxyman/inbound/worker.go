@@ -143,9 +143,11 @@ func (w *tcpWorker) Start() error {
 			if w.address.Family().IsDomain() || w.recvOrigDest {
 				return errors.New("managed Hysteria inbound needs a numeric IP and no original destination socket option")
 			}
+			var applicationWork atomic.Int64
 			err := generation.AttachUDP(w.tag, int(w.port), w.address.IP(), func(packet net.PacketConn, key [16]byte, slot byte, batch bool) (func() handoff.UDPConnectionStatus, error) {
 				hub, err := hysteria.ListenGenerationWithBatch(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
-					go w.callback(conn)
+					applicationWork.Add(1)
+					go func() { defer applicationWork.Add(-1); w.callback(conn) }()
 				}, packet, key, slot, batch)
 				if err != nil {
 					return nil, err
@@ -161,7 +163,20 @@ func (w *tcpWorker) Start() error {
 			if err != nil {
 				return err
 			}
+			if drainer, ok := w.hub.(interface{ TryDrainGeneration([16]byte) (bool, error) }); ok {
+				if err := generation.AttachUDPDrain(w.tag, int(w.port), func(token [16]byte) (bool, error) {
+					ready, err := drainer.TryDrainGeneration(token)
+					return ready && applicationWork.Load() == 0, err
+				}); err != nil {
+					return err
+				}
+			}
 			if releaser, ok := w.hub.(interface{ ReleaseGenerationReceive() ([]byte, error) }); ok {
+				if owner, ok := w.hub.(interface{ AcquireGenerationReceive([16]byte) (bool, error) }); ok {
+					if err := generation.AttachUDPAcquire(w.tag, int(w.port), owner.AcquireGenerationReceive); err != nil {
+						return err
+					}
+				}
 				return generation.AttachUDPReceiveRelease(w.tag, int(w.port), releaser.ReleaseGenerationReceive)
 			}
 			return nil

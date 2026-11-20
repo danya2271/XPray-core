@@ -54,7 +54,11 @@ func (p *MetricsHandler) Start() error {
 
 	// direct listen a port if listen is set
 	if p.listen != "" {
-		TCPlistener, err := xnet.Listen("tcp", p.listen)
+		network := "tcp"
+		if strings.HasPrefix(p.listen, "/") {
+			network = "unix"
+		}
+		TCPlistener, err := xnet.Listen(network, p.listen)
 		if err != nil {
 			return err
 		}

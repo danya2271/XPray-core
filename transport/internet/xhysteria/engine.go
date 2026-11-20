@@ -525,6 +525,35 @@ func (e *Engine) GenerationWork() (uint64, bool) {
 	return uint64(count), true
 }
 
+func (e *Engine) TryDrainGeneration(token [16]byte) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.handle == nil {
+		return false, net.ErrClosed
+	}
+	if len(e.flows) != 0 {
+		return false, nil
+	}
+	result := int(C.xhys_engine_try_retire(e.handle, (*C.uint8_t)(unsafe.Pointer(&token[0]))))
+	if result < 0 {
+		return false, errors.New("native QUIC retirement is unavailable")
+	}
+	return result == 1, nil
+}
+
+func (e *Engine) AcquireGenerationReceive(token [16]byte) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.handle == nil {
+		return false, net.ErrClosed
+	}
+	result := int(C.xhys_engine_acquire_receive(e.handle, (*C.uint8_t)(unsafe.Pointer(&token[0]))))
+	if result < 0 {
+		return false, errors.New("cannot acquire native public receive ownership")
+	}
+	return result == 1, nil
+}
+
 func (e *Engine) ReleaseGenerationReceive() ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

@@ -1048,8 +1048,12 @@ impl AsyncUdpSocket for SplitPacketSocket {
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
         self.send.try_send(transmit)
     }
-    fn poll_recv(&self, cx: &mut std::task::Context<'_>, buffers: &mut [std::io::IoSliceMut<'_>],
-        metadata: &mut [quinn::udp::RecvMeta]) -> std::task::Poll<io::Result<usize>> {
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        buffers: &mut [std::io::IoSliceMut<'_>],
+        metadata: &mut [quinn::udp::RecvMeta],
+    ) -> std::task::Poll<io::Result<usize>> {
         self.receive.poll_recv(cx, buffers, metadata)
     }
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> { self.receive.local_addr() }
@@ -1108,7 +1112,11 @@ fn network_socket(config: &Config, descriptor: i32) -> Result<NetworkSocket> {
     }
 }
 
-fn endpoint(config: &Config, socket: NetworkSocket, _generation_status: Option<&Arc<GenerationStatus>>) -> Result<quinn::Endpoint> {
+fn endpoint(
+    config: &Config,
+    socket: NetworkSocket,
+    _generation_status: Option<&Arc<GenerationStatus>>,
+) -> Result<quinn::Endpoint> {
     if config.packet_direct_receive && !config.packet_bridge {
         return Err("direct managed RX requires a managed packet bridge".into());
     }
@@ -1118,11 +1126,8 @@ fn endpoint(config: &Config, socket: NetworkSocket, _generation_status: Option<&
             if config.port_hopping.is_some() {
                 return Err("packet bridge cannot own port hopping".into());
             }
-            let receive = PacketSocket::new(
-                socket,
-                config.packet_local.parse()?,
-                config.packet_batch,
-            )?;
+            let receive =
+                PacketSocket::new(socket, config.packet_local.parse()?, config.packet_batch)?;
             #[cfg(target_os = "linux")]
             let receive = if config.packet_ring_fds != [0; 3] {
                 if !config.server || !config.packet_batch || config.quic_generation.is_none() {
@@ -1137,9 +1142,20 @@ fn endpoint(config: &Config, socket: NetworkSocket, _generation_status: Option<&
                 return Err("packet ring requires Linux".into());
             }
             let receive = Arc::new(receive);
+            if let Some(status) = _generation_status {
+                status
+                    .packet
+                    .set(receive.clone())
+                    .map_err(|_| "duplicate managed packet socket")?;
+            }
             if config.packet_transmit_fd != 0 {
-                if config.packet_transmit_fd < 3 || !config.server || config.quic_generation.is_none() {
-                    return Err("direct packet transmit requires a managed server generation".into());
+                if config.packet_transmit_fd < 3
+                    || !config.server
+                    || config.quic_generation.is_none()
+                {
+                    return Err(
+                        "direct packet transmit requires a managed server generation".into(),
+                    );
                 }
                 let NetworkSocket::Udp(socket) = network_socket(&Config::default(), config.packet_transmit_fd)? else {
                     return Err("direct packet transmit needs a public UDP socket".into());
@@ -1151,14 +1167,28 @@ fn endpoint(config: &Config, socket: NetworkSocket, _generation_status: Option<&
                     Arc::new(MaskSocket::new(socket, &config.udp_masks)?)
                 } else if !config.salamander.is_empty() {
                     Arc::new(MaskedSocket::new(socket, config.salamander.as_bytes())?)
-                } else { runtime.wrap_udp_socket(socket)? };
-                if config.packet_direct_receive {
+                } else {
+                    runtime.wrap_udp_socket(socket)?
+                };
+                if config.packet_ring_fds != [0; 3] {
                     #[cfg(target_os = "linux")]
                     {
-                        let generation = config.quic_generation.as_ref().ok_or("direct RX requires a managed generation")?;
-                        let status = _generation_status.ok_or("direct RX requires tracked generation status")?;
-                        let owner = Arc::new(crate::receive_owner::ReceiveOwner::new(receive, send, generation));
-                        status.receive_owner.set(owner.clone()).map_err(|_| "duplicate direct RX owner")?;
+                        let generation = config
+                            .quic_generation
+                            .as_ref()
+                            .ok_or("direct RX requires a managed generation")?;
+                        let status = _generation_status
+                            .ok_or("direct RX requires tracked generation status")?;
+                        let owner = Arc::new(crate::receive_owner::ReceiveOwner::new(
+                            receive,
+                            send,
+                            generation,
+                            config.packet_direct_receive,
+                        ));
+                        status
+                            .receive_owner
+                            .set(owner.clone())
+                            .map_err(|_| "duplicate direct RX owner")?;
                         owner
                     }
                     #[cfg(not(target_os = "linux"))]
@@ -2405,6 +2435,8 @@ struct GenerationStatus {
     running: AtomicBool,
     connections: std::sync::OnceLock<(usize, Arc<Semaphore>)>,
     endpoint: std::sync::OnceLock<quinn::Endpoint>,
+    packet: std::sync::OnceLock<Arc<PacketSocket>>,
+    retired: std::sync::Mutex<bool>,
     #[cfg(target_os = "linux")]
     receive_owner: std::sync::OnceLock<Arc<crate::receive_owner::ReceiveOwner>>,
 }
@@ -2659,6 +2691,7 @@ pub unsafe extern "C" fn xhys_engine_generation_work(engine: *const c_void) -> i
     // can be counted twice; a zero requires both sources to be empty.
     let work = endpoint
         .open_connections()
+        .saturating_add(endpoint.incoming_connections())
         .saturating_add(limit.saturating_sub(permits.available_permits()));
     if status.running.load(Ordering::Acquire) {
         work.min(i64::MAX as usize) as i64
@@ -2688,7 +2721,94 @@ pub unsafe extern "C" fn xhys_engine_release_receive(
         snapshot.len() as i64
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = (engine, data, capacity); -1 }
+    {
+        let _ = (engine, data, capacity);
+        -1
+    }
+}
+
+/// # Safety
+/// Exclude join. Token points to 16 readable bytes. A zero result retains work.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_engine_try_retire(engine: *const c_void, token: *const u8) -> i32 {
+    if token.is_null() {
+        return -1;
+    }
+    let Some(engine) = (unsafe { engine.cast::<Engine>().as_ref() }) else {
+        return -1;
+    };
+    let Some(status) = &engine.generation else {
+        return -1;
+    };
+    if !status.running.load(Ordering::Acquire) {
+        return -1;
+    }
+    let Some(packet) = status.packet.get() else {
+        return -1;
+    };
+    let token: [u8; 16] = unsafe { std::slice::from_raw_parts(token, 16) }
+        .try_into()
+        .unwrap();
+    if !packet.fence_seen(token) {
+        return 0;
+    }
+    let Ok(mut retired) = status.retired.lock() else {
+        return -1;
+    };
+    if *retired {
+        return 1;
+    }
+    let (Some(endpoint), Some((limit, permits))) =
+        (status.endpoint.get(), status.connections.get())
+    else {
+        return -1;
+    };
+    if *limit != permits.available_permits() || !endpoint.retire_if_idle() {
+        return 0;
+    }
+    *retired = true;
+    1
+}
+
+/// # Safety
+/// Exclude join. Token must point to 16 readable bytes. Caller must confirm
+/// ingress release-public first; this method never creates a competing reader.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_engine_acquire_receive(
+    engine: *const c_void,
+    token: *const u8,
+) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        if token.is_null() {
+            return -1;
+        }
+        let Some(engine) = (unsafe { engine.cast::<Engine>().as_ref() }) else {
+            return -1;
+        };
+        let Some(status) = &engine.generation else {
+            return -1;
+        };
+        if !status.running.load(Ordering::Acquire) {
+            return -1;
+        }
+        let Some(owner) = status.receive_owner.get() else {
+            return -1;
+        };
+        let token = unsafe { std::slice::from_raw_parts(token, 16) }
+            .try_into()
+            .unwrap();
+        match owner.acquire(token) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -1,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (engine, token);
+        -1
+    }
 }
 
 /// The caller must close the Go bridge endpoint before joining.

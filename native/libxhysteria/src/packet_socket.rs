@@ -5,7 +5,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::net::UnixDatagram,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 use tokio::io::Interest;
@@ -13,12 +13,22 @@ use tokio::io::Interest;
 const HEADER: usize = 24;
 const MAX_PACKET: usize = 65535;
 const MAX_BATCH: usize = 8;
+const DRAIN_MAGIC: &[u8; 8] = b"NXDFENC\x01";
+
+pub(crate) fn drain_marker(header: &[u8]) -> Option<[u8; 16]> {
+    if header.len() != HEADER || &header[..8] != DRAIN_MAGIC {
+        return None;
+    }
+    let token: [u8; 16] = header[8..].try_into().ok()?;
+    (token != [0; 16]).then_some(token)
+}
 
 #[derive(Debug)]
 pub struct PacketSocket {
     socket: Arc<tokio::net::UnixDatagram>,
     local: SocketAddr,
     batch: bool,
+    fence: Mutex<Option<[u8; 16]>>,
     #[cfg(target_os = "linux")]
     ring: Option<std::sync::Mutex<crate::packet_ring::Receiver>>,
 }
@@ -29,9 +39,14 @@ impl PacketSocket {
             socket: Arc::new(tokio::net::UnixDatagram::from_std(socket)?),
             local,
             batch,
+            fence: Mutex::new(None),
             #[cfg(target_os = "linux")]
             ring: None,
         })
+    }
+
+    pub(crate) fn fence_seen(&self, token: [u8; 16]) -> bool {
+        token != [0; 16] && self.fence.lock().is_ok_and(|seen| *seen == Some(token))
     }
 
     #[cfg(target_os = "linux")]
@@ -169,6 +184,7 @@ fn receive_frame(
     socket: &tokio::net::UnixDatagram,
     payload: &mut [u8],
     batch: bool,
+    fence: &Mutex<Option<[u8; 16]>>,
 ) -> io::Result<Option<(SocketAddr, usize, usize)>> {
     let mut header = [0; HEADER];
     let mut vectors = [
@@ -197,6 +213,14 @@ fn receive_frame(
     if message.msg_flags & libc::MSG_TRUNC != 0 || length < HEADER {
         return Ok(None);
     }
+    if length == HEADER
+        && let Some(token) = drain_marker(&header)
+    {
+        *fence
+            .lock()
+            .map_err(|_| io::Error::other("drain fence poisoned"))? = Some(token);
+        return Ok(None);
+    }
     let length = length - HEADER;
     Ok(parse_frame(&mut header, length, batch).map(|(address, stride)| (address, length, stride)))
 }
@@ -208,6 +232,7 @@ fn receive_frames(
     metadata: &mut [udp::RecvMeta],
     local: SocketAddr,
     batch: bool,
+    fence: &Mutex<Option<[u8; 16]>>,
 ) -> io::Result<usize> {
     const RECEIVE_BATCH: usize = 32;
     let capacity = buffers.len().min(metadata.len()).min(RECEIVE_BATCH);
@@ -250,6 +275,14 @@ fn receive_frames(
     for index in 0..count {
         let length = messages[index].msg_len as usize;
         if messages[index].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 || length < HEADER {
+            continue;
+        }
+        if length == HEADER
+            && let Some(token) = drain_marker(&headers[index])
+        {
+            *fence
+                .lock()
+                .map_err(|_| io::Error::other("drain fence poisoned"))? = Some(token);
             continue;
         }
         let length = length - HEADER;
@@ -339,7 +372,7 @@ impl AsyncUdpSocket for PacketSocket {
             return ring
                 .lock()
                 .map_err(|_| io::Error::other("packet ring receive lock poisoned"))?
-                .poll_recv(context, buffers, metadata, self.local);
+                .poll_recv_fenced(context, buffers, metadata, self.local, &self.fence);
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -352,6 +385,7 @@ impl AsyncUdpSocket for PacketSocket {
                         &mut metadata[received..capacity],
                         self.local,
                         self.batch,
+                        &self.fence,
                     )
                 }) {
                     Ok(0) => continue,
@@ -385,7 +419,7 @@ impl AsyncUdpSocket for PacketSocket {
             let mut count = 0;
             for _ in 0..32 {
                 let packet = match self.socket.try_io(Interest::READABLE, || {
-                    receive_frame(&self.socket, &mut buffers[count], self.batch)
+                    receive_frame(&self.socket, &mut buffers[count], self.batch, &self.fence)
                 }) {
                     Ok(packet) => packet,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
