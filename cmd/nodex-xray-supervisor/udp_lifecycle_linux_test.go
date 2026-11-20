@@ -24,6 +24,7 @@ import (
 
 	stats "github.com/xtls/xray-core/app/stats/command"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -195,18 +196,30 @@ func TestSupervisorHysteriaSwitchRecoveryRollback(t *testing.T) {
 	TestSupervisorHysteriaGenerations(t)
 }
 
+func TestSupervisorHysteriaBrokerDirectRecovery(t *testing.T) {
+	t.Setenv("NODEX_TEST_CRASH_DIRECT_BROKER", "1")
+	t.Setenv("NODEX_TEST_REPEAT_UPDATE", "1")
+	TestSupervisorHysteriaGenerations(t)
+}
+
 func TestSupervisorHysteriaGenerations(t *testing.T) {
 	binary := os.Getenv("XRAY_TEST_GENERATION_BINARY")
 	if binary == "" {
 		t.Skip("requires a managed Xray build")
 	}
+	if os.Getenv("NODEX_TEST_CRASH_DIRECT_BROKER") == "1" && os.Getenv("XRAY_TEST_MANAGED_NATIVE") != "1" {
+		t.Skip("requires native-enabled supervisor and Xray")
+	}
 	for _, native := range []bool{false, true} {
+		if !native && os.Getenv("NODEX_TEST_CRASH_DIRECT_BROKER") == "1" {
+			continue
+		}
 		if native && os.Getenv("XRAY_TEST_MANAGED_NATIVE") != "1" {
 			continue
 		}
 		t.Run(fmt.Sprintf("native-%t", native), func(t *testing.T) {
 			t.Setenv("XRAY_HYSTERIA_NATIVE", "")
-			ctx, cancel := context.WithTimeout(t.Context(), 75*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 			defer cancel()
 			root := socketRoot(t)
 			runtime := filepath.Join(root, "run")
@@ -331,6 +344,50 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			old, stopOld := hysteriaTunnel(t, ctx, binary, root, port)
 			defer stopOld()
 			hysteriaPulse(t, old, 'A', 'a')
+			crashBroker := func(connection net.Conn, marker byte) {
+				t.Helper()
+				before := state()
+				if !before.BrokerRecoveryReady {
+					t.Fatalf("native direct checkpoint not ready: %+v", before)
+				}
+				fd, err := unix.PidfdOpen(before.Broker.PID, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+				unix.Close(fd)
+				if err != nil {
+					t.Fatal(err)
+				}
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					// The existing public receiver and QUIC session stay live
+					// before, during and after broker reconstruction.
+					hysteriaPulse(t, connection, marker, 'k')
+					after := state()
+					if after.Phase == "blocked" {
+						t.Fatalf("direct broker recovery blocked: %+v", after)
+					}
+					if after.Phase == "active" && after.Broker.PID != before.Broker.PID {
+						if !after.BrokerRecoveryReady {
+							t.Fatal("replacement did not prepare its next recovery checkpoint")
+						}
+						if after.Active.PID != before.Active.PID || after.Sequence != before.Sequence {
+							t.Fatalf("broker recovery replaced Xray: before=%+v after=%+v", before, after)
+						}
+						t.Logf("direct broker recovered %d -> %d with generation PID %d unchanged", before.Broker.PID, after.Broker.PID, after.Active.PID)
+						return
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("broker recovery did not finish: %+v", after)
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+			if os.Getenv("NODEX_TEST_CRASH_DIRECT_BROKER") == "1" {
+				crashBroker(old, 'A')
+				crashBroker(old, 'A')
+			}
 			data, _ := json.Marshal(b)
 			response, err := client.Post("http://nodex.local/upgrade", "application/json", bytes.NewReader(data))
 			if err != nil {
@@ -427,6 +484,9 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 				}
 			}
 			hysteriaPulse(t, next, 'B', 'e')
+			if os.Getenv("NODEX_TEST_CRASH_DIRECT_BROKER") == "1" {
+				crashBroker(next, 'B')
+			}
 			if os.Getenv("NODEX_TEST_REPEAT_UPDATE") == "1" {
 				data, _ := json.Marshal(c)
 				response, err := client.Post("http://nodex.local/upgrade", "application/json", bytes.NewReader(data))

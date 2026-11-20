@@ -106,17 +106,19 @@ type supervisor struct {
 	api            *apiGateway
 	apiBinding     *apiBinding
 	metrics        *http.Server
+	brokerBackup   *directBrokerBackup
 }
 
 type status struct {
-	Phase     string            `json:"phase"`
-	Sequence  uint64            `json:"sequence"`
-	BootID    string            `json:"boot_id"`
-	Active    *generationStatus `json:"last_confirmed_active,omitempty"`
-	Other     *generationStatus `json:"other,omitempty"`
-	Uncertain bool              `json:"admission_uncertain,omitempty"`
-	Error     string            `json:"error,omitempty"`
-	Broker    *brokerStatus     `json:"broker,omitempty"`
+	Phase               string            `json:"phase"`
+	Sequence            uint64            `json:"sequence"`
+	BootID              string            `json:"boot_id"`
+	Active              *generationStatus `json:"last_confirmed_active,omitempty"`
+	Other               *generationStatus `json:"other,omitempty"`
+	Uncertain           bool              `json:"admission_uncertain,omitempty"`
+	Error               string            `json:"error,omitempty"`
+	Broker              *brokerStatus     `json:"broker,omitempty"`
+	BrokerRecoveryReady bool              `json:"broker_recovery_ready,omitempty"`
 }
 
 func (s *supervisor) status() status {
@@ -131,7 +133,8 @@ func (s *supervisor) status() status {
 
 func (s *supervisor) snapshot(phase string) status {
 	return status{Phase: phase, Sequence: s.seq, BootID: s.boot, Active: s.active.status(), Other: s.other.status(), Broker: s.brokerState,
-		Uncertain: phase == "switching" || phase == "admission-unknown", Error: s.lastErr}
+		BrokerRecoveryReady: phase == "active" && s.brokerBackup != nil,
+		Uncertain:           phase == "switching" || phase == "admission-unknown", Error: s.lastErr}
 }
 
 func (s *supervisor) record(phase string, active, other *generation, err error) error {
@@ -145,6 +148,11 @@ func (s *supervisor) record(phase string, active, other *generation, err error) 
 	}
 	if err != nil {
 		s.lastErr = err.Error()
+	}
+	if phase == "active" {
+		if checkpointErr := s.checkpointDirectBrokerLocked(); checkpointErr != nil {
+			s.lastErr = errors.Join(err, fmt.Errorf("broker recovery checkpoint unavailable: %w", checkpointErr)).Error()
+		}
 	}
 	if err := saveState(s.root, s.snapshot(phase)); err != nil {
 		if phase != "admission-unknown" {
@@ -275,6 +283,7 @@ func newSupervisor(ctx context.Context, root, probe string, r release) (*supervi
 		s.close()
 		return nil, err
 	}
+	s.watchBroker()
 	return s, nil
 }
 
@@ -541,7 +550,15 @@ func (s *supervisor) upgrade(r release) error {
 	if s.ctx.Err() != nil || s.phase != "active" || !s.active.running() {
 		return fmt.Errorf("upgrade unavailable in state %s", s.phase)
 	}
+	if s.broker != nil {
+		dead, err := brokerDead(s.broker.pid, s.broker.startTicks)
+		if err != nil || dead {
+			return errors.Join(err, errors.New("UDP broker unavailable; wait for verified recovery before upgrading"))
+		}
+	}
 	old := s.active
+	// A checkpoint must never be used after a candidate may have received work.
+	s.clearBrokerBackup()
 	s.phase, s.lastErr = "starting", ""
 	// A replacement supervisor must not read a stable journal while this
 	// operation is already starting a second process.
@@ -728,6 +745,7 @@ func (s *supervisor) close() {
 	if s.brokerStop != nil {
 		s.brokerStop()
 	}
+	s.clearBrokerBackup()
 	if s.api != nil {
 		s.api.close()
 	}

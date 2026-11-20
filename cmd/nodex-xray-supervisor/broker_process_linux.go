@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,6 +27,7 @@ type brokerStatus struct {
 	StartTicks   uint64 `json:"start_ticks"`
 	SHA256       string `json:"sha256"`
 	ConfigSHA256 string `json:"config_sha256"`
+	Directory    string `json:"directory,omitempty"`
 }
 
 // An internal child entrypoint is also usable from the process test executable;
@@ -58,10 +60,14 @@ func runPacketBroker(path string) error {
 	if len(config.Bindings) == 0 || len(config.Bindings) > 128 {
 		return errors.New("invalid broker socket count")
 	}
-	if err := handoff.AwaitStartup(handoff.Manifest{StartupFD: 3 + len(config.Bindings)}); err != nil {
+	count := len(config.Bindings)
+	if len(config.Direct) != 0 {
+		count *= 5
+	}
+	if err := handoff.AwaitStartup(handoff.Manifest{StartupFD: 3 + count}); err != nil {
 		return err
 	}
-	files := make([]*os.File, len(config.Bindings))
+	files := make([]*os.File, count)
 	for i := range files {
 		files[i] = os.NewFile(uintptr(3+i), "broker-public-udp")
 		defer files[i].Close()
@@ -201,6 +207,12 @@ func (s *supervisor) recoverBroker(ctx context.Context, saved *brokerStatus) err
 		return nil
 	}
 	directory := filepath.Join(s.root, "broker")
+	if saved.Directory != "" {
+		if filepath.Base(saved.Directory) != saved.Directory || !strings.HasPrefix(saved.Directory, "broker-recovery-") {
+			return errors.New("invalid recovered broker directory")
+		}
+		directory = filepath.Join(s.root, saved.Directory)
+	}
 	if err := handoff.PrivateSocketDirectory(directory); err != nil {
 		return err
 	}
