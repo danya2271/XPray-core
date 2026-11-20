@@ -309,5 +309,5 @@ func (s *supervisor) launchDirectBroker(ctx context.Context, backup *directBroke
 			return errors.Join(err, errors.New("replacement broker did not retain direct ownership"))
 		}
 	}
-	return nil
+	return s.attachBrokerControl(ctx)
 }

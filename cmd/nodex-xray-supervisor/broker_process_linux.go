@@ -33,6 +33,13 @@ type brokerStatus struct {
 // An internal child entrypoint is also usable from the process test executable;
 // it must run before testing parses the supervisor's command-line flags.
 func init() {
+	if path := os.Getenv("NODEX_INTERNAL_BROKER_CONTROL"); path != "" {
+		if err := runBrokerControl(path); err != nil {
+			fmt.Fprintln(os.Stderr, "NodeX broker control:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if path := os.Getenv("NODEX_INTERNAL_BROKER_MANIFEST"); path != "" {
 		if err := runPacketBroker(path); err != nil {
 			fmt.Fprintln(os.Stderr, "NodeX UDP broker:", err)
@@ -192,7 +199,7 @@ func (s *supervisor) startBroker(config []byte) error {
 	defer cancel()
 	for {
 		if response, _, err := s.broker.command(ctx, brokerRequest{Operation: "ping"}); err == nil && response.Ready {
-			return nil
+			return s.attachBrokerControl(ctx)
 		}
 		select {
 		case <-ctx.Done():
@@ -252,6 +259,12 @@ func (s *supervisor) recoverBroker(ctx context.Context, saved *brokerStatus) err
 	}
 	s.broker, s.brokerState = client, saved
 	s.brokerStop = func() { unix.PidfdSendSignal(fd, unix.SIGTERM, nil, 0); unix.Close(fd) }
+	if err := s.attachBrokerControl(ctx); err != nil {
+		// Validation failure closes this pidfd in the defer; do not retain a
+		// closure that could later signal/close a reused descriptor number.
+		s.brokerStop = nil
+		return err
+	}
 	keep = true
 	return nil
 }

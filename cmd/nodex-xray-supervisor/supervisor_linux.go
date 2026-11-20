@@ -110,15 +110,16 @@ type supervisor struct {
 }
 
 type status struct {
-	Phase               string            `json:"phase"`
-	Sequence            uint64            `json:"sequence"`
-	BootID              string            `json:"boot_id"`
-	Active              *generationStatus `json:"last_confirmed_active,omitempty"`
-	Other               *generationStatus `json:"other,omitempty"`
-	Uncertain           bool              `json:"admission_uncertain,omitempty"`
-	Error               string            `json:"error,omitempty"`
-	Broker              *brokerStatus     `json:"broker,omitempty"`
-	BrokerRecoveryReady bool              `json:"broker_recovery_ready,omitempty"`
+	Phase               string                 `json:"phase"`
+	Sequence            uint64                 `json:"sequence"`
+	BootID              string                 `json:"boot_id"`
+	Active              *generationStatus      `json:"last_confirmed_active,omitempty"`
+	Other               *generationStatus      `json:"other,omitempty"`
+	Uncertain           bool                   `json:"admission_uncertain,omitempty"`
+	Error               string                 `json:"error,omitempty"`
+	Broker              *brokerStatus          `json:"broker,omitempty"`
+	BrokerRecoveryReady bool                   `json:"broker_recovery_ready,omitempty"`
+	BrokerControl       *brokerControlIdentity `json:"broker_control,omitempty"`
 }
 
 func (s *supervisor) status() status {
@@ -132,7 +133,13 @@ func (s *supervisor) status() status {
 }
 
 func (s *supervisor) snapshot(phase string) status {
+	var control *brokerControlIdentity
+	if s.broker != nil && s.broker.control != nil {
+		identity := s.broker.control.identity()
+		control = &identity
+	}
 	return status{Phase: phase, Sequence: s.seq, BootID: s.boot, Active: s.active.status(), Other: s.other.status(), Broker: s.brokerState,
+		BrokerControl:       control,
 		BrokerRecoveryReady: phase == "active" && s.brokerBackup != nil,
 		Uncertain:           phase == "switching" || phase == "admission-unknown", Error: s.lastErr}
 }
