@@ -633,6 +633,26 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	}
 	if config.PacketBridge {
 		local := raw.LocalAddr()
+		// A managed process already received the native packet wire. Do not
+		// install a second Go datagram pump between the supervisor and Rust.
+		if config.QUICGeneration != nil {
+			if descriptor, ok := raw.(interface{ File() (*os.File, error) }); ok {
+				file, err := descriptor.File()
+				if err != nil {
+					return nil, err
+				}
+				defer file.Close()
+				config.PacketLocal = local.String()
+				config.PacketBatch = false
+				config.DisablePMTUD = true
+				engine, err := native.Start(ctx, config, file, local, nil, func(conn *native.Conn) { handler(&nativeInbound{Conn: conn, user: conn.User}) })
+				if err != nil {
+					return nil, err
+				}
+				raw.Close() // Rust has its own duplicate now.
+				return finishNativeListener(engine, local, settings, masqueradeTransport), nil
+			}
+		}
 		engine, err := native.StartPacketConn(ctx, config, raw, local, nil, func(conn *native.Conn) { handler(&nativeInbound{Conn: conn, user: conn.User}) })
 		if err != nil {
 			return nil, err

@@ -70,15 +70,35 @@ func LinkXHTTP(ctx context.Context, previous, candidate ControlSocket) error {
 // separate, irreversible operation to initiate after the caller confirms
 // the switch and records the new active generation.
 func Switch(ctx context.Context, previous, candidate Control, verify func(context.Context) error) (SwitchResult, error) {
+	return switchAdmission(ctx, previous, candidate, nil, verify)
+}
+
+// SwitchWithIngress also changes the supervisor-owned UDP admission selector.
+// The selector is committed before probing public traffic. On rollback it is
+// restored without deleting either generation's established CID routes.
+// apply must be idempotent; an error does not prove admission was unchanged.
+func SwitchWithIngress(ctx context.Context, previous, candidate Control, apply func(candidate bool) error, verify func(context.Context) error) (SwitchResult, error) {
+	if apply == nil {
+		return SwitchResult{Active: "unknown"}, errors.New("UDP switch requires an ingress selector")
+	}
+	return switchAdmission(ctx, previous, candidate, apply, verify)
+}
+
+func switchAdmission(ctx context.Context, previous, candidate Control, apply func(candidate bool) error, verify func(context.Context) error) (SwitchResult, error) {
 	unknown := SwitchResult{Active: "unknown"}
 	if verify == nil {
 		return unknown, errors.New("switch requires a candidate data-path probe")
 	}
-	if err := expect(ctx, previous, "status", "active"); err != nil {
+	oldStatus, err := commandState(ctx, previous, "status", "active")
+	if err != nil {
 		return unknown, fmt.Errorf("old generation is not active: %w", err)
 	}
-	if err := expect(ctx, candidate, "status", "paused"); err != nil {
+	newStatus, err := commandState(ctx, candidate, "status", "paused")
+	if err != nil {
 		return unknown, fmt.Errorf("candidate is not paused and ready: %w", err)
+	}
+	if oldStatus.UDPManaged != newStatus.UDPManaged || oldStatus.UDPManaged != (apply != nil) {
+		return unknown, errors.New("UDP admission selector must match both generation manifests")
 	}
 	if err := move(ctx, previous, "pause", "paused"); err != nil {
 		rollback, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -90,7 +110,10 @@ func Switch(ctx context.Context, previous, candidate Control, verify func(contex
 		}
 		return SwitchResult{Active: "previous"}, err
 	}
-	err := move(ctx, candidate, "resume", "active")
+	err = move(ctx, candidate, "resume", "active")
+	if err == nil && apply != nil {
+		err = apply(true)
+	}
 	if err == nil {
 		err = verify(ctx)
 	}
@@ -108,18 +131,28 @@ func Switch(ctx context.Context, previous, candidate Control, verify func(contex
 	if resumeErr := move(rollback, previous, "resume", "active"); resumeErr != nil {
 		return unknown, errors.Join(err, fmt.Errorf("could not restore previous generation: %w", resumeErr))
 	}
+	if apply != nil {
+		if restore := apply(false); restore != nil {
+			return unknown, errors.Join(err, fmt.Errorf("could not restore UDP ingress: %w", restore))
+		}
+	}
 	return SwitchResult{Active: "previous", RolledBack: true}, err
 }
 
 func expect(ctx context.Context, endpoint Control, command, expected string) error {
+	_, err := commandState(ctx, endpoint, command, expected)
+	return err
+}
+
+func commandState(ctx context.Context, endpoint Control, command, expected string) (Response, error) {
 	response, err := endpoint.Command(ctx, command)
 	if err != nil {
-		return fmt.Errorf("%s: %w", command, err)
+		return response, fmt.Errorf("%s: %w", command, err)
 	}
 	if response.Protocol != ProtocolVersion || response.Error != "" || response.State != expected {
-		return fmt.Errorf("%s: expected %q, got state %q (protocol %d, %s)", command, expected, response.State, response.Protocol, response.Error)
+		return response, fmt.Errorf("%s: expected %q, got state %q (protocol %d, %s)", command, expected, response.State, response.Protocol, response.Error)
 	}
-	return nil
+	return response, nil
 }
 
 func move(ctx context.Context, endpoint Control, command, expected string) error {
