@@ -92,6 +92,8 @@ enum Command {
         bool,
         mpsc::SyncSender<Option<[OwnedFd; 3]>>,
     ),
+    ExportDirect(u8, mpsc::SyncSender<Option<(OwnedFd, [OwnedFd; 3])>>),
+    RestoreDirect(u8, UnixDatagram, [OwnedFd; 3], mpsc::SyncSender<bool>),
     Activate(u8, mpsc::SyncSender<bool>),
     AdoptReceive(Vec<u8>, mpsc::SyncSender<bool>),
     Fence(u8, [u8; 16], mpsc::SyncSender<bool>),
@@ -943,6 +945,45 @@ async fn run(
                     if healthy { routes.current = slot; }
                     let _ = ack.send(healthy);
                 }
+                Some(Command::ExportDirect(slot, ack)) => {
+                    let result = (|| -> io::Result<_> {
+                        if public.is_some() || received_batch.pending() || routes.current != slot
+                            || live.iter().enumerate().any(|(index, alive)| *alive && index != slot as usize)
+                        {
+                            return Err(io::ErrorKind::WouldBlock.into());
+                        }
+                        let peer = peers[slot as usize].as_ref().ok_or(io::ErrorKind::NotFound)?;
+                        if !peer.direct_transmit || !peer.queue.is_empty() || peer.fence.is_some() {
+                            return Err(io::ErrorKind::WouldBlock.into());
+                        }
+                        let ring = peer.ring.as_ref().ok_or(io::ErrorKind::InvalidInput)?.export()?;
+                        let fd = unsafe { libc::fcntl(peer.socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+                        if fd < 0 { return Err(io::Error::last_os_error()); }
+                        Ok((unsafe { OwnedFd::from_raw_fd(fd) }, ring))
+                    })();
+                    let _ = ack.send(result.ok());
+                }
+                Some(Command::RestoreDirect(slot, socket, descriptors, ack)) => {
+                    let result = (|| -> io::Result<()> {
+                        if public.is_some() || received_batch.pending() || !slots.is_empty() {
+                            return Err(io::ErrorKind::AlreadyExists.into());
+                        }
+                        let ring = packet_ring::Sender::import_empty(
+                            descriptors[0].as_raw_fd(), descriptors[1].as_raw_fd(), descriptors[2].as_raw_fd(),
+                        )?;
+                        let socket = Arc::new(tokio::net::UnixDatagram::from_std(socket)?);
+                        peers[slot as usize] = Some(Peer {
+                            socket, ring: Some(ring), queue: VecDeque::new(), bytes: 0,
+                            fence: None, direct_transmit: true,
+                        });
+                        routes.current = slot;
+                        live[slot as usize] = true;
+                        used[slot as usize] = true;
+                        slots.push(slot);
+                        Ok(())
+                    })();
+                    let _ = ack.send(result.is_ok());
+                }
                 Some(Command::AdoptReceive(snapshot, ack)) => {
                     let valid = if public.is_some() {
                         adopted.as_ref() == Some(&snapshot)
@@ -1284,6 +1325,82 @@ pub struct RingDescriptors {
     file: i32,
     wake: i32,
     space: i32,
+}
+
+/// # Safety
+/// Exclude join. The caller owns all returned descriptors.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_export_direct(
+    handle: *mut c_void,
+    slot: u8,
+    out: *mut RingDescriptors,
+) -> i32 {
+    use std::os::fd::IntoRawFd;
+    let Some(ingress) = (unsafe { handle.cast::<Ingress>().as_ref() }) else {
+        return -1;
+    };
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return -1;
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    if ingress
+        .commands
+        .send(Command::ExportDirect(slot, tx))
+        .is_err()
+    {
+        return -1;
+    }
+    let Ok(Some((peer, [file, wake, space]))) = rx.recv_timeout(Duration::from_secs(3)) else {
+        return -1;
+    };
+    *out = RingDescriptors {
+        file: file.into_raw_fd(),
+        wake: wake.into_raw_fd(),
+        space: space.into_raw_fd(),
+    };
+    peer.into_raw_fd()
+}
+
+/// # Safety
+/// The previous producer must be dead and the only live generation must own
+/// direct public RX. All supplied descriptors remain owned by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_restore_direct(
+    handle: *mut c_void,
+    slot: u8,
+    peer: i32,
+    file: i32,
+    wake: i32,
+    space: i32,
+) -> bool {
+    let Some(ingress) = (unsafe { handle.cast::<Ingress>().as_ref() }) else {
+        return false;
+    };
+    let duplicate = |fd| -> io::Result<OwnedFd> {
+        let copied = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if copied < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(copied) })
+    };
+    let result = (|| -> io::Result<_> {
+        let socket = UnixDatagram::from(duplicate(peer)?);
+        socket.peer_addr()?;
+        socket.set_nonblocking(true)?;
+        Ok((
+            socket,
+            [duplicate(file)?, duplicate(wake)?, duplicate(space)?],
+        ))
+    })();
+    let Ok((socket, descriptors)) = result else {
+        return false;
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    ingress
+        .commands
+        .send(Command::RestoreDirect(slot, socket, descriptors, tx))
+        .is_ok()
+        && rx.recv_timeout(Duration::from_secs(3)).ok() == Some(true)
 }
 
 /// # Safety
