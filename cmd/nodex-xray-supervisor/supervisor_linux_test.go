@@ -30,9 +30,9 @@ import (
 func TestRejectUnsupportedConfigAndExistingSocket(t *testing.T) {
 	for _, conf := range []string{
 		`{"api":{},"inbounds":[]}`,
-		`{"inbounds":[{"tag":"h","port":443,"protocol":"hysteria","streamSettings":{"network":"hysteria"}}]}`,
+		`{"inbounds":[{"tag":"h","port":443,"protocol":"hysteria","listen":"invalid","streamSettings":{"network":"hysteria"}}]}`,
 		`{"inbounds":[{"tag":"x","port":443,"streamSettings":{"network":"xhttp","tlsSettings":{"alpn":["h3"]}}}]}`,
-		`{"inbounds":[{"tag":"g","port":443,"streamSettings":{"network":"grpc","sockopt":{"mark":42}}}]}`,
+		`{"inbounds":[{"tag":"g","port":443,"streamSettings":{"network":"grpc","sockopt":{"acceptProxyProtocol":true}}}]}`,
 		`{"inbounds":[{"tag":"g","port":"1-65535","streamSettings":{"network":"grpc"}}]}`,
 	} {
 		if _, err := configBindings([]byte(conf)); err == nil {
@@ -73,6 +73,24 @@ func TestStateWriteFailureBlocksDrain(t *testing.T) {
 	s.retire(nil, nil, nil)
 	if got := s.status(); got.Phase != "blocked" || !strings.Contains(got.Error, "could not persist") {
 		t.Fatalf("state write failure did not block: %+v", got)
+	}
+}
+
+func TestRejectedRecoveryUsesPreservingExitStatus(t *testing.T) {
+	if os.Getenv("NODEX_TEST_REJECTED_RECOVERY") == "1" {
+		os.Args = []string{"nodex-xray-supervisor", "-runtime", "/", "-probe", "/bin/false", "recover"}
+		main()
+		t.Fatal("rejected recovery returned successfully")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run", "^TestRejectedRecoveryUsesPreservingExitStatus$")
+	command.Env = append(os.Environ(), "NODEX_TEST_REJECTED_RECOVERY=1")
+	output, err := command.CombinedOutput()
+	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 23 {
+		t.Fatalf("rejected recovery: %v, %s", err, output)
 	}
 }
 
@@ -343,7 +361,7 @@ func TestRecoverAfterSupervisorCrash(t *testing.T) {
 		t.Fatal("recovered using the wrong config")
 	}
 	grpcPulse(t, stream, 'A', '2')
-	spawn("recover", a)
+	second := spawn("recover", a)
 	after := wait("active", "g1")
 	orphaned = false
 	if *before.Active != *after.Active {
@@ -361,7 +379,23 @@ func TestRecoverAfterSupervisorCrash(t *testing.T) {
 	}
 	wait("draining", "g2")
 	grpcPulse(t, stream, 'A', '4')
-	grpcPulse(t, grpcStream(t, ctx, address), 'B', '5')
+	bStream := grpcStream(t, ctx, address)
+	grpcPulse(t, bStream, 'B', '5')
+	if err := second.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Wait(); err == nil {
+		t.Fatal("draining supervisor was not killed")
+	}
+	grpcPulse(t, stream, 'A', '6')
+	grpcPulse(t, bStream, 'B', '7')
+	spawn("recover", b)
+	recovered := wait("draining", "g2")
+	if recovered.Other == nil || recovered.Other.PID != before.Active.PID {
+		t.Fatalf("drain recovery replaced previous generation: %+v", recovered)
+	}
+	grpcPulse(t, stream, 'A', '8')
+	grpcPulse(t, bStream, 'B', '9')
 	endOld()
 	wait("active", "g2")
 }

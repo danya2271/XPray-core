@@ -48,6 +48,14 @@ func (fm *FinalMask) UDPMasks() []UDPMask {
 
 func (fm *FinalMask) HasTCPMasks() bool { return len(fm.tcpMasks) != 0 }
 
+// WithPacketListener preserves mask order while supplying a previously bound
+// public socket. Listener-owning masks must be validated by the caller.
+func (fm *FinalMask) WithPacketListener(listen func(context.Context, net.Addr) (net.PacketConn, error)) *FinalMask {
+	configured := *fm
+	configured.listenPacket = listen
+	return &configured
+}
+
 func (fm *FinalMask) WithPacketConnSetup(setup func(net.PacketConn)) *FinalMask {
 	configured := *fm
 	configured.dialUDP = func(ctx context.Context, dest net.Destination) (net.PacketConn, net.Addr, error) {

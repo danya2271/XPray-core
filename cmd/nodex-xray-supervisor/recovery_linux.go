@@ -76,7 +76,7 @@ func fileDigest(path string) (string, error) {
 	return fmt.Sprintf("%x", hash.Sum(nil)), err
 }
 
-func adopt(ctx context.Context, root string, saved generationStatus) (*generation, error) {
+func adopt(ctx context.Context, root string, saved generationStatus, states ...string) (*generation, error) {
 	n, err := strconv.ParseUint(strings.TrimPrefix(saved.ID, "g"), 10, 64)
 	if err != nil || saved.ID != "g"+strconv.FormatUint(n, 10) || n == 0 || saved.PID <= 1 {
 		return nil, errors.New("invalid saved generation identity")
@@ -111,6 +111,7 @@ func adopt(ctx context.Context, root string, saved generationStatus) (*generatio
 		return nil, errors.New("generation binary hash changed")
 	}
 	g := &generation{id: saved.ID, dir: dir, hash: hash, configHash: saved.ConfigSHA256,
+		slot: saved.Slot, udp: saved.UDP,
 		pid: saved.PID, startTicks: ticks, control: handoff.ControlSocket(filepath.Join(dir, "ctl.sock")), done: make(chan struct{}),
 		signal: func(sig syscall.Signal) error {
 			pidLock.Lock()
@@ -120,7 +121,19 @@ func adopt(ctx context.Context, root string, saved generationStatus) (*generatio
 			}
 			return unix.PidfdSendSignal(fd, unix.Signal(sig), nil, 0)
 		}}
-	if err := expect(ctx, g, "status", "active"); err != nil {
+	if len(states) == 0 {
+		states = []string{"active"}
+	}
+	response, err := g.control.Command(ctx, "status")
+	if err != nil || !slices.Contains(states, response.State) || response.UDPManaged != saved.UDP {
+		return nil, errors.Join(err, fmt.Errorf("unexpected recovered generation state %q", response.State))
+	}
+	if g.configHash == "" {
+		return nil, errors.New("missing generation config identity")
+	}
+	if data, err := os.ReadFile(filepath.Join(dir, "config.json")); err == nil && configDigest(data) != g.configHash {
+		return nil, errors.New("generation config snapshot changed")
+	} else if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	keep = true
@@ -149,9 +162,9 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 		return nil, err
 	}
 	var saved status
-	if err := json.Unmarshal(data, &saved); err != nil || saved.Phase != "active" ||
-		saved.Uncertain || saved.Other != nil || saved.Active == nil || saved.Sequence == 0 {
-		return nil, errors.New("only a confirmed single active TCP generation can be recovered")
+	if err := json.Unmarshal(data, &saved); err != nil || saved.Active == nil || saved.Sequence == 0 ||
+		!slices.Contains([]string{"active", "starting", "preparing", "switching", "draining", "retiring", "admission-unknown"}, saved.Phase) {
+		return nil, errors.New("unsupported or incomplete supervisor recovery journal")
 	}
 	boot, err := bootID()
 	if err != nil || boot != saved.BootID || boot == "" {
@@ -161,8 +174,9 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 	if err != nil {
 		return nil, err
 	}
-	if configDigest(config) != saved.Active.ConfigSHA256 {
-		return nil, errors.New("recovery config must match the active generation's snapshot")
+	if configDigest(config) != saved.Active.ConfigSHA256 &&
+		(saved.Other == nil || configDigest(config) != saved.Other.ConfigSHA256) {
+		return nil, errors.New("recovery config must match a journaled generation's snapshot")
 	}
 	bindings, err := configBindings(config)
 	if err != nil {
@@ -174,6 +188,8 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 	}
 	timeout, cancel := context.WithTimeout(ctx, operationLimit)
 	defer cancel()
+	// Both processes may be paused in the middle of a switch. Export from an
+	// active or paused survivor; a draining server may have closed its copies.
 	control := handoff.ControlSocket(filepath.Join(root, saved.Active.ID, "ctl.sock"))
 	export, err := handoff.ExportListeners(timeout, control)
 	if err != nil {
@@ -185,12 +201,17 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 	}
 	s := &supervisor{ctx: ctx, root: root, probe: probe, bindings: bindings,
 		seq: saved.Sequence, boot: boot, phase: "active", lastErr: saved.Error}
+	if err := s.recoverBroker(timeout, saved.Broker); err != nil {
+		return nil, err
+	}
 	keep := false
 	defer func() {
 		if !keep {
 			// Never signal a live child when recovery validation fails.
 			for _, l := range s.listeners {
-				l.Close()
+				if l != nil {
+					l.Close()
+				}
 			}
 		}
 	}()
@@ -208,11 +229,28 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 		}
 		unixBindings[b.Tag] = b
 	}
-	if len(imported)+len(unixBindings) != len(bindings) {
+	tcpCount := 0
+	for _, binding := range bindings {
+		if binding.transport != "hysteria" {
+			tcpCount++
+		}
+	}
+	if len(imported)+len(unixBindings) != tcpCount {
 		return nil, errors.New("recovered listener set differs from the config")
 	}
 	used := make([]int, 0, len(bindings))
 	for _, b := range bindings {
+		if b.transport == "hysteria" {
+			if s.broker == nil {
+				return nil, errors.New("UDP recovery requires the original persistent broker")
+			}
+			response, _, err := s.broker.command(timeout, brokerRequest{Operation: "status", Tag: b.tag})
+			if err != nil || response.Binding == nil || response.Binding.Address != b.address || response.Binding.Port != b.port || response.Binding.Native != b.native {
+				return nil, errors.Join(err, errors.New("recovered UDP broker binding mismatch"))
+			}
+			s.listeners = append(s.listeners, nil)
+			continue
+		}
 		var fd int
 		if b.port == 0 {
 			entry, ok := unixBindings[b.tag]
@@ -257,13 +295,136 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 		}
 		s.xhttp = s.xhttp || b.transport == "xhttp"
 	}
-	// Validate all descriptors and journal before adopting process control.
-	// Recovery does not alter admission or execute a probe that could force
-	// a rollback on an already running generation.
-	s.active, err = adopt(timeout, root, *saved.Active)
+	// No signal or admission change is issued until every process identity and
+	// descriptor has been validated. The journal determines the next operation.
+	s.active, err = adopt(timeout, root, *saved.Active, "active", "paused")
 	if err != nil {
+		return nil, err
+	}
+	if saved.Other != nil {
+		if saved.Other.ID == saved.Active.ID || saved.Other.PID == saved.Active.PID {
+			return nil, errors.New("duplicate recovery generation")
+		}
+		otherSequence, sequenceErr := strconv.ParseUint(strings.TrimPrefix(saved.Other.ID, "g"), 10, 64)
+		if sequenceErr != nil || otherSequence > saved.Sequence {
+			return nil, errors.New("invalid other generation sequence")
+		}
+		s.other, err = adopt(timeout, root, *saved.Other, "active", "paused", "draining", "drained")
+		if err != nil {
+			// During preparation EOF on the launch pipe can terminate the
+			// candidate; during retirement stopping it was already committed.
+			_, identityErr := processStart(saved.Other.PID)
+			if !slices.Contains([]string{"preparing", "retiring"}, saved.Phase) || !os.IsNotExist(identityErr) {
+				return nil, err
+			}
+		}
+	}
+	if err := s.recoverAPI(timeout, config); err != nil {
+		return nil, err
+	}
+	if err := s.reconcileRecovery(timeout, saved.Phase); err != nil {
 		return nil, err
 	}
 	keep = true
 	return s, nil
+}
+
+func (s *supervisor) recoverAPI(ctx context.Context, config []byte) error {
+	_, api, err := managedAPIConfig(config, "")
+	if err != nil || api == nil {
+		return err
+	}
+	s.api, err = newAPIGateway(s.root)
+	if err != nil {
+		return err
+	}
+	for _, generation := range []*generation{s.active, s.other} {
+		if generation == nil || s.api.journal.Finalized[generation.id] {
+			continue
+		}
+		if err := s.api.connect(generation.id, filepath.Join(generation.dir, "api.sock")); err != nil {
+			return err
+		}
+		if err := s.api.replay(ctx, s.api.clients[generation.id]); err != nil {
+			return err
+		}
+	}
+	s.api.active = s.active.id
+	s.apiBinding = api
+	if err := s.api.serve(api.Address); err != nil {
+		return err
+	}
+	return s.serveMetrics(api.Metrics)
+}
+
+func (s *supervisor) reconcileRecovery(ctx context.Context, phase string) error {
+	active, other := s.active, s.other
+	a, err := active.control.Command(ctx, "status")
+	if err != nil {
+		return err
+	}
+	if other == nil {
+		if a.State != "active" {
+			return errors.New("single recovered generation is not active")
+		}
+		return s.record("active", active, nil, nil)
+	}
+	b, err := other.control.Command(ctx, "status")
+	if err != nil {
+		return err
+	}
+	if phase == "draining" || phase == "retiring" {
+		if a.State != "active" || !slices.Contains([]string{"paused", "draining", "drained"}, b.State) {
+			return errors.New("drain journal does not match live admission")
+		}
+	} else {
+		if a.State == "paused" && b.State == "active" {
+			if s.broker != nil {
+				if err := s.adoptUDPReceive(ctx, active); err != nil {
+					return err
+				}
+				if err := s.activateUDP(ctx, other); err != nil {
+					return err
+				}
+			}
+			if err := s.verify(ctx, other); err != nil {
+				return err
+			}
+			active, other = other, active
+		} else if b.State == "paused" && (a.State == "active" || a.State == "paused") {
+			if s.broker != nil {
+				if err := s.adoptUDPReceive(ctx, active); err != nil {
+					return err
+				}
+			}
+			if s.xhttp {
+				if err := handoff.LinkXHTTP(ctx, active.control, other.control); err != nil {
+					// LinkXHTTP expects the previous side active. Restore only
+					// after both links exist, so use the individual commands.
+					if _, err := active.control.Command(ctx, "link "+other.dir); err != nil {
+						return err
+					}
+					if _, err := other.control.Command(ctx, "link "+active.dir); err != nil {
+						return err
+					}
+				}
+			}
+			if err := expect(ctx, active, "resume", "active"); err != nil {
+				return err
+			}
+			if s.broker != nil {
+				if err := s.activateUDP(ctx, active); err != nil {
+					return err
+				}
+			}
+		} else {
+			return fmt.Errorf("cannot reconcile admission: %s/%s", a.State, b.State)
+		}
+	}
+	if err := s.record("draining", active, other, nil); err != nil {
+		return err
+	}
+	s.wg.Add(1)
+	go func() { defer s.wg.Done(); s.retire(active, other, nil) }()
+	return nil
 }

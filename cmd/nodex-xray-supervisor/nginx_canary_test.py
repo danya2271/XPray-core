@@ -6,6 +6,7 @@ The fixture is DanVlessBot's vless_xhttp_tls_test --streaming-fixture entrypoint
 """
 
 import contextlib
+import http.server
 import json
 import os
 from pathlib import Path
@@ -108,6 +109,8 @@ def probe():
     marker = {"g1": b"A", "g2": b"B"}[sys.argv[2]]
     assert len(os.environ["NODEX_CANDIDATE_SHA256"]) == 64
     assert int(os.environ["NODEX_CANDIDATE_PID"]) > 1
+    if public_probe := os.environ.get("NODEX_TEST_PUBLIC_PROBE"):
+        subprocess.run([public_probe, sys.argv[2]], check=True, timeout=40)
     directory = Path(tempfile.mkdtemp(prefix="probe-", dir=meta["directory"]))
     try:
         for profile in ("direct", "white"):
@@ -141,6 +144,14 @@ def main():
                 while data := self.request.recv(1):
                     self.request.sendall(self.server.marker + data)
 
+        class ProbeHTTP(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(204 if self.path == "/generate_204" else 404)
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
         def launch(command, label, **kwargs):
             log = stack.enter_context(open(directory / f"{label}.log", "wb"))
             process = subprocess.Popen(command, stdout=log, stderr=log, **kwargs)
@@ -148,6 +159,11 @@ def main():
             return process
 
         try:
+            probe_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProbeHTTP)
+            probe_thread = threading.Thread(target=probe_server.serve_forever, daemon=True)
+            servers.append(probe_server)
+            threads.append(probe_thread)
+            probe_thread.start()
             for marker in (b"A", b"B"):
                 server = Backend(("127.0.0.1", 0), Echo)
                 server.marker = marker
@@ -155,9 +171,10 @@ def main():
                 servers.append(server)
                 threads.append(thread)
                 thread.start()
-            target = servers[0].server_address[1]
+            echo_servers = servers[1:]
+            target = echo_servers[0].server_address[1]
             http_port, direct, white = free_port(), free_port(), free_port()
-            assert len({http_port, direct, white, target, servers[1].server_address[1]}) == 5
+            assert len({http_port, direct, white, target, echo_servers[1].server_address[1]}) == 5
             subprocess.run([fixture, "--streaming-fixture", temporary, str(direct), str(white), upstream, "/vxt/"],
                            check=True, timeout=10)
             subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -187,13 +204,26 @@ def main():
             subprocess.run(["nginx", "-t", "-p", temporary, "-c", str(nginx_config)],
                            check=True, capture_output=True, timeout=5)
             configs = []
-            for marker, backend in zip(("A", "B"), servers):
+            api_port = free_port()
+            for marker, backend in zip(("A", "B"), echo_servers):
                 config = json.loads((directory / "server.json").read_text())
                 config["outbounds"][0]["settings"] = {
                     "redirect": f"127.0.0.1:{backend.server_address[1]}",
                     "finalRules": [{"action": "allow", "ip": ["127.0.0.1"], "port": port}
                                    for port in {target, backend.server_address[1]}],
                 }
+                if os.environ.get("NODEX_TEST_PUBLIC_PROBE"):
+                    config["api"] = {"tag": "api", "listen": f"127.0.0.1:{api_port}",
+                                     "services": ["HandlerService", "StatsService"]}
+                    config["_vxt"] = {tag: {"address": "127.0.0.1", "port": port,
+                                            "host": "origin.test", "sni": "origin.test",
+                                            "ca": str(directory / "cert.pem")}
+                                      for tag, port in (("direct", direct), ("white", white))}
+                    config["outbounds"].append({"tag": "probe", "protocol": "freedom",
+                        "settings": {"redirect": f"127.0.0.1:{probe_server.server_address[1]}",
+                                     "finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]}})
+                    config["routing"] = {"rules": [{"type": "field", "domain": ["full:proxvless.test"],
+                                                     "outboundTag": "probe"}]}
                 path = directory / f"generation-{marker}.json"
                 path.write_text(json.dumps(config))
                 configs.append(path)

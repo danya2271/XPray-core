@@ -31,23 +31,25 @@ type UnixBinding struct {
 }
 
 type UDPBinding struct {
-	Tag           string   `json:"tag"`
-	Address       string   `json:"address"`
-	Port          int      `json:"port"`
-	FD            int      `json:"fd"`
-	Key           [16]byte `json:"key"`
-	Slot          byte     `json:"slot"`
-	PacketBatch   bool     `json:"packet_batch,omitempty"`
-	TransmitFD    int      `json:"transmit_fd,omitempty"`
-	RingFDs       []int    `json:"ring_fds,omitempty"`
-	DirectReceive bool     `json:"direct_receive,omitempty"`
+	Tag               string   `json:"tag"`
+	Address           string   `json:"address"`
+	Port              int      `json:"port"`
+	FD                int      `json:"fd"`
+	Key               [16]byte `json:"key"`
+	Slot              byte     `json:"slot"`
+	PacketBatch       bool     `json:"packet_batch,omitempty"`
+	TransmitFD        int      `json:"transmit_fd,omitempty"`
+	RingFDs           []int    `json:"ring_fds,omitempty"`
+	DirectReceive     bool     `json:"direct_receive,omitempty"`
+	PacketDestination bool     `json:"packet_destination,omitempty"`
 }
 
 type Manifest struct {
-	Control string        `json:"control"`
-	TCP     []TCPBinding  `json:"tcp"`
-	Unix    []UnixBinding `json:"unix,omitempty"`
-	UDP     []UDPBinding  `json:"udp,omitempty"`
+	Control   string        `json:"control"`
+	StartupFD int           `json:"startup_fd,omitempty"`
+	TCP       []TCPBinding  `json:"tcp"`
+	Unix      []UnixBinding `json:"unix,omitempty"`
+	UDP       []UDPBinding  `json:"udp,omitempty"`
 }
 
 type bindingKey struct {
@@ -67,6 +69,10 @@ type udpBinding struct {
 	packet         net.PacketConn
 	status         func() UDPConnectionStatus
 	releaseReceive func() ([]byte, error)
+	drain          func([16]byte) (bool, error)
+	drained        bool
+	drainToken     [16]byte
+	acquireReceive func([16]byte) (bool, error)
 }
 
 // XHTTP participates in the admission transaction in addition to having
@@ -168,7 +174,7 @@ func ImportGeneration(manifest Manifest) (*Generation, error) {
 		key := bindingKey{spec.Tag, spec.Port}
 		ip, err := netip.ParseAddr(spec.Address)
 		if spec.Port < 1 || spec.Port > 65535 || spec.Tag == "" || spec.FD < 3 || seen[spec.FD] ||
-			spec.Key == [16]byte{} || err != nil || ip.IsUnspecified() || ip.Zone() != "" || g.udp[key] != nil {
+			spec.Key == [16]byte{} || err != nil || (ip.IsUnspecified() && len(spec.RingFDs) == 0 && !spec.PacketDestination) || ip.Zone() != "" || g.udp[key] != nil {
 			g.Close()
 			return nil, fmt.Errorf("invalid or duplicate inherited UDP binding for %q", spec.Tag)
 		}
@@ -258,6 +264,28 @@ func (g *Generation) AttachUDPReceiveRelease(tag string, port int, release func(
 	return nil
 }
 
+func (g *Generation) AttachUDPDrain(tag string, port int, drain func([16]byte) (bool, error)) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	b := g.udp[bindingKey{tag, port}]
+	if b == nil || b.status == nil || b.drain != nil || drain == nil || g.state != "starting" {
+		return errors.New("cannot attach UDP drain")
+	}
+	b.drain = drain
+	return nil
+}
+
+func (g *Generation) AttachUDPAcquire(tag string, port int, acquire func([16]byte) (bool, error)) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	b := g.udp[bindingKey{tag, port}]
+	if b == nil || b.acquireReceive != nil || acquire == nil || g.state != "starting" {
+		return errors.New("cannot attach UDP receive acquire")
+	}
+	b.acquireReceive = acquire
+	return nil
+}
+
 func (g *Generation) ReleaseUDPReceive(target string) (string, []byte, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -265,7 +293,7 @@ func (g *Generation) ReleaseUDPReceive(target string) (string, []byte, error) {
 		return g.state, nil, errors.New("cannot release receive ownership in current generation state")
 	}
 	for key, b := range g.udp {
-		if fmt.Sprintf("%s:%d", key.tag, key.port) == target && b.spec.DirectReceive && b.releaseReceive != nil {
+		if fmt.Sprintf("%s:%d", key.tag, key.port) == target && (b.spec.DirectReceive || b.acquireReceive != nil) && b.releaseReceive != nil {
 			data, err := b.releaseReceive()
 			return g.state, data, err
 		}
@@ -394,10 +422,84 @@ func (g *Generation) Ready() error {
 func (g *Generation) Command(command string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if target, ok := strings.CutPrefix(command, "acquire-receive "); ok {
+		parts := strings.Fields(target)
+		if len(parts) != 2 || g.state != "active" {
+			return g.state, errors.New("receive acquire requires active generation, binding and token")
+		}
+		token, err := parseDrainToken(parts[1])
+		if err != nil {
+			return g.state, err
+		}
+		for key, b := range g.udp {
+			if fmt.Sprintf("%s:%d", key.tag, key.port) != parts[0] {
+				continue
+			}
+			if b.acquireReceive == nil || b.drained {
+				return g.state, errors.New("UDP receive acquire unavailable")
+			}
+			ready, err := b.acquireReceive(token)
+			if err != nil {
+				return g.state, err
+			}
+			if ready {
+				return "receive-direct", nil
+			}
+			return "receive-waiting", nil
+		}
+		return g.state, errors.New("unknown receive binding")
+	}
+	if target, ok := strings.CutPrefix(command, "drain-udp "); ok {
+		parts := strings.Fields(target)
+		if len(parts) != 2 || (g.state != "paused" && g.state != "draining" && g.state != "drained") {
+			return g.state, errors.New("UDP drain requires paused generation, binding and token")
+		}
+		token, err := parseDrainToken(parts[1])
+		if err != nil {
+			return g.state, err
+		}
+		for key, b := range g.udp {
+			if fmt.Sprintf("%s:%d", key.tag, key.port) != parts[0] {
+				continue
+			}
+			if b.drain == nil || (b.drainToken != [16]byte{} && b.drainToken != token) {
+				return g.state, errors.New("UDP drain token or backend mismatch")
+			}
+			b.drainToken = token
+			if b.drained {
+				return "udp-drained", nil
+			}
+			ready, err := b.drain(token)
+			if err != nil {
+				return g.state, err
+			}
+			if ready {
+				if endpoint, ok := b.packet.(interface{ FenceEgress([16]byte) (bool, error) }); ok {
+					ready, err = endpoint.FenceEgress(token)
+					if err != nil {
+						return g.state, err
+					}
+				}
+			}
+			b.drained = ready
+			if ready {
+				return "udp-drained", nil
+			}
+			return "udp-waiting", nil
+		}
+		return g.state, errors.New("unknown UDP drain binding")
+	}
 	switch command {
 	case "status":
 		return g.state, nil
 	case "pause", "resume":
+		if command == "resume" {
+			for _, b := range g.udp {
+				if b.drainToken != [16]byte{} {
+					return g.state, errors.New("cannot resume a generation after UDP drain began")
+				}
+			}
+		}
 		if g.state != "active" && g.state != "paused" {
 			return g.state, fmt.Errorf("cannot %s admission in %s", command, g.state)
 		}
@@ -443,8 +545,10 @@ func (g *Generation) Command(command string) (string, error) {
 		if g.state != "paused" {
 			return g.state, fmt.Errorf("cannot drain a generation in %s", g.state)
 		}
-		if len(g.udp) != 0 {
-			return g.state, errors.New("cannot prove UDP ingress and handshake retirement; retaining the old generation")
+		for _, b := range g.udp {
+			if !b.drained {
+				return g.state, errors.New("UDP ingress fence and QUIC idle retirement not yet confirmed; retaining old generation")
+			}
 		}
 		g.state = "draining"
 		drain := make([]func() error, 0, len(g.bindings))

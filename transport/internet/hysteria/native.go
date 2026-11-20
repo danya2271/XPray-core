@@ -198,6 +198,22 @@ func nativeConfig(settings *internet.MemoryStreamConfig) (native.Config, error) 
 	return c, nil
 }
 
+// ManagedNativeMasks validates the identical settings used by the native
+// worker. The broker must apply masks exactly once, in physical wire order.
+func ManagedNativeMasks(settings *internet.MemoryStreamConfig) ([]native.UDPMaskConfig, error) {
+	config, err := nativeConfig(settings)
+	if err != nil {
+		return nil, err
+	}
+	if config.PacketBridge || config.PortHopping != nil {
+		return nil, fmt.Errorf("native managed ingress cannot own the configured network mask")
+	}
+	if config.Salamander != "" {
+		return []native.UDPMaskConfig{{Kind: "salamander", Password: config.Salamander}}, nil
+	}
+	return config.UDPMasks, nil
+}
+
 func nativeClientWorkers() (uint8, error) {
 	workers := min(4, max(1, runtime.GOMAXPROCS(0)))
 	if value := os.Getenv("XRAY_HYSTERIA_CLIENT_WORKERS"); value != "" {
@@ -553,6 +569,14 @@ func (l *nativeListener) GenerationStatus() handoff.UDPConnectionStatus {
 
 func (l *nativeListener) ReleaseGenerationReceive() ([]byte, error) {
 	return l.engine.ReleaseGenerationReceive()
+}
+
+func (l *nativeListener) TryDrainGeneration(token [16]byte) (bool, error) {
+	return l.engine.TryDrainGeneration(token)
+}
+
+func (l *nativeListener) AcquireGenerationReceive(token [16]byte) (bool, error) {
+	return l.engine.AcquireGenerationReceive(token)
 }
 
 type nativeInbound struct {

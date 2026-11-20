@@ -52,9 +52,9 @@ func exportControl(conn net.Conn, g *Generation) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	// Recovery of a switching/draining or UDP generation needs additional
-	// transactions. Never export a partial listener set as a complete one.
-	if g.state != "active" || len(g.udp) != 0 {
+	// Paused candidates still own the same listener set. Draining generations
+	// may already have closed theirs, so recovery exports from the survivor.
+	if g.state != "active" && g.state != "paused" {
 		return
 	}
 	keys := make([]bindingKey, 0, len(g.bindings))
@@ -90,7 +90,11 @@ func exportControl(conn net.Conn, g *Generation) {
 	}
 	// The one-byte preamble carries all rights. JSON follows in the stream,
 	// avoiding partial ancillary-data delivery with a large JSON write.
-	if n, _, err := socket.WriteMsgUnix([]byte{'F'}, unix.UnixRights(fds...), nil); err != nil || n != 1 {
+	var rights []byte
+	if len(fds) != 0 {
+		rights = unix.UnixRights(fds...)
+	}
+	if n, _, err := socket.WriteMsgUnix([]byte{'F'}, rights, nil); err != nil || n != 1 {
 		return
 	}
 	_ = json.NewEncoder(socket).Encode(manifest)
@@ -142,7 +146,7 @@ func ExportListeners(ctx context.Context, control ControlSocket) (*ExportedListe
 		}
 	}
 	if n != 1 || preamble[0] != 'F' || flags&unix.MSG_CTRUNC != 0 ||
-		len(result.Files) == 0 || len(result.Files) > 128 {
+		len(result.Files) > 128 {
 		return nil, errors.New("invalid or truncated generation listener export")
 	}
 	result.Manifest, err = ReadManifest(socket)

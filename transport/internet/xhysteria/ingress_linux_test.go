@@ -255,11 +255,12 @@ func TestDormantNativeIngressDoesNotReadUntilConfirmedAdoption(t *testing.T) {
 	}
 	snapshot := func(key [16]byte, local string) []byte {
 		data, err := json.Marshal(struct {
+			Lease uint64   `json:"lease"`
 			Key   [16]byte `json:"key"`
 			Local string   `json:"local"`
 			Slot  byte     `json:"slot"`
 			Pins  []any    `json:"pins"`
-		}{key, local, 0, []any{}})
+		}{1, key, local, 0, []any{}})
 		if err != nil {
 			t.Fatal(err)
 		}

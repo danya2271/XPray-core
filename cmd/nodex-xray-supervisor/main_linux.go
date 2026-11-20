@@ -1,7 +1,7 @@
 //go:build linux && !android
 
-// Command nodex-xray-supervisor is an opt-in TCP-only node canary. It is not
-// installed as the production xray.service and cannot import unmanaged work.
+// Command nodex-xray-supervisor manages independent Xray generations on Linux.
+// Managed mode is opt-in and cannot import an unmanaged process's live work.
 package main
 
 import (
@@ -26,6 +26,11 @@ import (
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "NodeX supervisor:", err)
+		if len(os.Args) > 1 && os.Args[len(os.Args)-1] == "recover" {
+			// systemd must retain the surviving workers on rejected recovery,
+			// rather than looping over an uncertain ownership transition.
+			os.Exit(23)
+		}
 		os.Exit(1)
 	}
 }

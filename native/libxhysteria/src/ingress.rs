@@ -10,7 +10,7 @@ use std::{
     ffi::c_void,
     future::poll_fn,
     io::{self, IoSliceMut},
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::net::UnixDatagram,
     sync::{
@@ -85,9 +85,18 @@ pub struct IngressStats {
 
 enum Command {
     Add(u8, UnixDatagram, mpsc::SyncSender<bool>),
-    AddRing(u8, UnixDatagram, mpsc::SyncSender<Option<[OwnedFd; 3]>>),
+    AddRing(
+        u8,
+        UnixDatagram,
+        bool,
+        mpsc::SyncSender<Option<[OwnedFd; 3]>>,
+    ),
     Activate(u8, mpsc::SyncSender<bool>),
     AdoptReceive(Vec<u8>, mpsc::SyncSender<bool>),
+    Fence(u8, [u8; 16], mpsc::SyncSender<bool>),
+    Retire(u8, [u8; 16], mpsc::SyncSender<bool>),
+    ReleasePublic(u8, [u8; 16], mpsc::SyncSender<bool>),
+    Abandon(u8, mpsc::SyncSender<bool>),
     Stop,
 }
 
@@ -104,6 +113,7 @@ struct Routes {
     current: u8,
     pins: HashMap<(u32, u8, [u8; 20]), (u8, Instant)>,
     next_gc: Instant,
+    leases: [u64; 256],
 }
 
 #[derive(Deserialize)]
@@ -117,6 +127,7 @@ struct ReceivePin {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReceiveSnapshot {
+    lease: u64,
     key: [u8; 16],
     local: SocketAddr,
     slot: u8,
@@ -136,6 +147,8 @@ fn adopt_receive(
         || snapshot.slot != routes.current
         || !live[snapshot.slot as usize]
         || snapshot.pins.len() > PIN_LIMIT
+        || snapshot.lease == 0
+        || snapshot.lease <= routes.leases[snapshot.slot as usize]
     {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -164,6 +177,7 @@ fn adopt_receive(
         }
     }
     routes.pins = pins;
+    routes.leases[snapshot.slot as usize] = snapshot.lease;
     Ok(())
 }
 
@@ -316,6 +330,7 @@ fn forward(
 struct QueuedFrame {
     wire: Vec<u8>,
     packets: usize,
+    destination: Option<IpAddr>,
 }
 
 struct Peer {
@@ -323,10 +338,16 @@ struct Peer {
     ring: Option<packet_ring::Sender>,
     queue: VecDeque<QueuedFrame>,
     bytes: usize,
+    fence: Option<[u8; 16]>,
+    direct_transmit: bool,
 }
 
 impl Peer {
-    fn try_forward(&mut self, packets: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+    fn try_forward(
+        &mut self,
+        packets: &[(SocketAddr, &[u8])],
+        destination: Option<IpAddr>,
+    ) -> io::Result<usize> {
         let Some(ring) = self.ring.as_mut() else {
             return forward(&self.socket, packets);
         };
@@ -334,7 +355,7 @@ impl Peer {
         let mut sent = 0;
         while sent < packets.len() {
             let (count, header) = frame_shape(&packets[sent..], 32)?;
-            match batch.push(&header, &packets[sent..sent + count]) {
+            match batch.push_with_destination(&header, &packets[sent..sent + count], destination) {
                 Ok(()) => sent += count,
                 Err(_) if sent != 0 => break,
                 Err(error) => return Err(error),
@@ -343,9 +364,19 @@ impl Peer {
         Ok(sent)
     }
 
+    #[cfg(test)]
     fn forward(&mut self, packets: &[(SocketAddr, &[u8])], health: &Health) {
+        self.forward_with_destination(packets, health, None)
+    }
+
+    fn forward_with_destination(
+        &mut self,
+        packets: &[(SocketAddr, &[u8])],
+        health: &Health,
+        destination: Option<IpAddr>,
+    ) {
         let sent = if self.queue.is_empty() {
-            match self.try_forward(packets) {
+            match self.try_forward(packets, destination) {
                 Ok(sent) => sent,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
                 Err(_) => {
@@ -388,6 +419,7 @@ impl Peer {
                 self.queue.push_back(QueuedFrame {
                     wire,
                     packets: count,
+                    destination,
                 });
                 self.bytes += length;
                 let total = health
@@ -405,7 +437,7 @@ impl Peer {
             let mut sent = 0;
             let mut batch = ring.batch();
             for frame in self.queue.iter().take(BATCH) {
-                match batch.push_wire(&frame.wire) {
+                match batch.push_wire_with_destination(&frame.wire, frame.destination) {
                     Ok(()) => sent += 1,
                     Err(_) if sent != 0 => break,
                     Err(error) => return Err(error),
@@ -592,6 +624,7 @@ async fn run(
             )?))
         }
     };
+    let mut public_descriptor = socket.as_raw_fd();
     let mut raw = Some(socket);
     let mut public = if config.dormant {
         None
@@ -606,12 +639,16 @@ async fn run(
         current: config.slot,
         pins: HashMap::new(),
         next_gc: Instant::now(),
+        leases: [0; 256],
     };
     let mut peers: [Option<Peer>; 256] = std::array::from_fn(|_| None);
     let mut slots = Vec::new();
     let mut live = [false; 256];
+    let mut used = [false; 256];
+    let mut retired = [None; 256];
     let mut outputs = JoinSet::new();
     let mut adopted: Option<Vec<u8>> = None;
+    let mut released: Option<(u8, [u8; 16])> = None;
     // Quinn's batched I/O may return GRO data. Preserve each segment's CID
     // ownership rather than forwarding an aggregate to one generation.
     let mut storage: Vec<Vec<u8>> = (0..BATCH).map(|_| vec![0; 65536]).collect();
@@ -625,11 +662,12 @@ async fn run(
             command = commands.recv() => match command {
                 Some(Command::Add(slot, socket, ack)) => {
                     let index = slot as usize;
-                    if peers[index].is_some() { let _ = ack.send(false); continue; }
+                    if used[index] { let _ = ack.send(false); continue; }
+                    used[index] = true;
                     match tokio::net::UnixDatagram::from_std(socket) {
                         Ok(socket) => {
                             let socket = Arc::new(socket);
-                            peers[index] = Some(Peer { socket: socket.clone(), ring: None, queue: VecDeque::new(), bytes: 0 });
+                            peers[index] = Some(Peer { socket: socket.clone(), ring: None, queue: VecDeque::new(), bytes: 0, fence: None, direct_transmit: false });
                             slots.push(slot); live[index] = true;
                             if let Some(public) = &public {
                                 outputs.spawn(egress(socket, public.clone(), health.clone()));
@@ -639,16 +677,17 @@ async fn run(
                         Err(_) => { let _ = ack.send(false); }
                     }
                 }
-                Some(Command::AddRing(slot, socket, ack)) => {
+                Some(Command::AddRing(slot, socket, direct_transmit, ack)) => {
                     let index = slot as usize;
-                    if peers[index].is_some() { let _ = ack.send(None); continue; }
+                    if used[index] { let _ = ack.send(None); continue; }
+                    used[index] = true;
                     let result = (|| -> io::Result<_> {
                         let socket = Arc::new(tokio::net::UnixDatagram::from_std(socket)?);
                         let ring = packet_ring::Sender::new()?;
                         let descriptors = ring.export()?;
-                        peers[index] = Some(Peer { socket: socket.clone(), ring: Some(ring), queue: VecDeque::new(), bytes: 0 });
+                        peers[index] = Some(Peer { socket: socket.clone(), ring: Some(ring), queue: VecDeque::new(), bytes: 0, fence: None, direct_transmit });
                         slots.push(slot); live[index] = true;
-                        if let Some(public) = &public {
+                        if let Some(public) = &public && !direct_transmit {
                             outputs.spawn(egress(socket, public.clone(), health.clone()));
                         }
                         Ok(descriptors)
@@ -656,7 +695,7 @@ async fn run(
                     let _ = ack.send(result.ok());
                 }
                 Some(Command::Activate(slot, ack)) => {
-                    let healthy = public.is_some() && peers[slot as usize].is_some();
+                    let healthy = public.is_some() && peers[slot as usize].as_ref().is_some_and(|peer| peer.fence.is_none());
                     if healthy { routes.current = slot; }
                     let _ = ack.send(healthy);
                 }
@@ -664,19 +703,94 @@ async fn run(
                     let valid = if public.is_some() {
                         adopted.as_ref() == Some(&snapshot)
                     } else {
-                        adopt_receive(&mut routes, &live, config.key, local, &snapshot).is_ok()
+                        adopted.as_ref() != Some(&snapshot) && adopt_receive(&mut routes, &live, config.key, local, &snapshot).is_ok()
                     };
                     if valid && public.is_none() {
+                        public_descriptor = raw.as_ref().unwrap().as_raw_fd();
                         let socket = match wrap(raw.take().unwrap()) {
                             Ok(socket) => socket,
                             Err(_) => { let _ = ack.send(false); break; }
                         };
                         for &slot in &slots {
-                            outputs.spawn(egress(peers[slot as usize].as_ref().unwrap().socket.clone(), socket.clone(), health.clone()));
+                            let peer = peers[slot as usize].as_ref().unwrap();
+                            if !peer.direct_transmit {
+                                outputs.spawn(egress(peer.socket.clone(), socket.clone(), health.clone()));
+                            }
                         }
-                        public = Some(socket); adopted = Some(snapshot);
+                        public = Some(socket); adopted = Some(snapshot); released = None;
                     }
                     let _ = ack.send(valid);
+                }
+                Some(Command::Fence(slot, token, ack)) => {
+                    let now = Instant::now();
+                    let pinned = routes.pins.values().any(|&(owner, until)| owner == slot && now < until);
+                    let Some(peer) = peers[slot as usize].as_mut() else { let _ = ack.send(false); continue; };
+                    if public.is_none() || routes.current == slot || pinned || token == [0;16] {
+                        let _ = ack.send(false); continue;
+                    }
+                    if let Some(previous) = peer.fence {
+                        let _ = ack.send(previous == token); continue;
+                    }
+                    let mut wire = b"NXDFENC\x01".to_vec(); wire.extend_from_slice(&token);
+                    if peer.queue.len() >= QUEUE_FRAMES || peer.bytes + wire.len() > QUEUE_BYTES {
+                        let _ = ack.send(false); continue;
+                    }
+                    peer.bytes += wire.len();
+                    health.queued_bytes.fetch_add(wire.len() as u64, Ordering::Relaxed);
+                    peer.queue.push_back(QueuedFrame { wire, packets: 0, destination:None });
+                    peer.fence = Some(token);
+                    let _ = ack.send(true);
+                }
+                Some(Command::Retire(slot, token, ack)) => {
+                    if let Some(previous) = retired[slot as usize] { let _ = ack.send(previous == token); continue; }
+                    let valid = routes.current != slot && peers[slot as usize].as_ref().is_some_and(|p| p.fence == Some(token) && p.queue.is_empty());
+                    if valid {
+                        live[slot as usize] = false;
+                        retired[slot as usize] = Some(token);
+                        // Direct TX owns no outstanding relay replies. Retain
+                        // only the tombstone, not a 2 MiB ring per old release.
+                        if peers[slot as usize].as_ref().unwrap().direct_transmit {
+                            peers[slot as usize] = None;
+                            slots.retain(|&present| present != slot);
+                        }
+                    }
+                    let _ = ack.send(valid);
+                }
+                Some(Command::Abandon(slot,ack)) => {
+                    // Caller proved this slot's process is stopped and it was
+                    // never activated. No live QUIC work may be abandoned.
+                    if routes.current==slot { let _=ack.send(false);continue; }
+                    live[slot as usize]=false;
+                    if let Some(mut peer)=peers[slot as usize].take(){peer.discard(&health);}
+                    slots.retain(|&present|present!=slot);
+                    let _=ack.send(true);
+                }
+                Some(Command::ReleasePublic(slot, token, ack)) => {
+                    if let Some(previous) = released {
+                        let _ = ack.send(previous == (slot,token)); continue;
+                    }
+                    let only_current = live.iter().enumerate().all(|(index, alive)| !alive || index == slot as usize);
+                    // A receive-ring fence says nothing about worker->public
+                    // egress. Only direct-TX peers have no relay replies to lose.
+                    let direct_transmit = slots.iter().all(|&slot| peers[slot as usize].as_ref().unwrap().direct_transmit);
+                    let Some(peer) = peers[slot as usize].as_mut() else { let _ = ack.send(false); continue; };
+                    if public.is_none() || routes.current != slot || !only_current || !direct_transmit || peer.ring.is_none() || !peer.queue.is_empty() || token == [0;16] {
+                        let _ = ack.send(false); continue;
+                    }
+                    let duplicate = unsafe { libc::fcntl(public_descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+                    if duplicate < 0 { let _ = ack.send(false); continue; }
+                    let mut marker = b"NXDFENC\x01".to_vec(); marker.extend_from_slice(&token);
+                    if peer.ring.as_mut().unwrap().batch().push_wire(&marker).is_err() {
+                        unsafe { libc::close(duplicate); }
+                        let _ = ack.send(false); continue;
+                    }
+                    outputs.abort_all();
+                    while outputs.join_next().await.is_some() {}
+                    // Drop the last registered public socket before ACK.
+                    public = None;
+                    raw = Some(unsafe { UdpSocket::from_raw_fd(duplicate) });
+                    released = Some((slot,token));
+                    let _ = ack.send(true);
                 }
                 _ => break,
             },
@@ -687,17 +801,21 @@ async fn run(
                 let mut pending: [(SocketAddr, &[u8]); BATCH] = [(local, &[]); BATCH];
                 let mut pending_count = 0;
                 let mut pending_slot = 0;
+                let mut pending_destination=None;
                 for index in 0..count {
                     let meta = metadata[index];
                     if meta.stride == 0 { continue; }
                     health.received.fetch_add(meta.len.div_ceil(meta.stride) as u64, Ordering::Relaxed);
                     for payload in buffers[index][..meta.len].chunks(meta.stride) {
                         let Some(slot) = routes.route(payload, &live) else { continue; };
-                        if pending_count != 0 && (pending_slot != slot || pending_count == BATCH) {
-                            peers[pending_slot as usize].as_mut().unwrap().forward(&pending[..pending_count], &health);
+                        let destination=local.ip().is_unspecified().then_some(meta.dst_ip).flatten();
+                        if local.ip().is_unspecified() && destination.is_none(){health.drop_send(1);continue;}
+                        if pending_count != 0 && (pending_slot != slot || pending_count == BATCH || pending_destination!=destination) {
+                            peers[pending_slot as usize].as_mut().unwrap().forward_with_destination(&pending[..pending_count], &health,pending_destination);
                             pending_count = 0;
                         }
                         pending_slot = slot;
+                        pending_destination=destination;
                         let address = if local.is_ipv4() {
                             match meta.addr { SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some() => SocketAddr::new(a.ip().to_ipv4_mapped().unwrap().into(), a.port()), other => other }
                         } else { meta.addr };
@@ -706,7 +824,7 @@ async fn run(
                     }
                 }
                 if pending_count != 0 {
-                    peers[pending_slot as usize].as_mut().unwrap().forward(&pending[..pending_count], &health);
+                    peers[pending_slot as usize].as_mut().unwrap().forward_with_destination(&pending[..pending_count], &health,pending_destination);
                 }
             }
         }
@@ -743,7 +861,7 @@ pub unsafe extern "C" fn xhys_ingress_start(
     let Ok(local) = socket.local_addr() else {
         return std::ptr::null_mut();
     };
-    if local.ip().is_unspecified() || local.port() == 0 || socket.set_nonblocking(true).is_err() {
+    if local.port() == 0 || socket.set_nonblocking(true).is_err() {
         return std::ptr::null_mut();
     }
     let (tx, rx) = control::unbounded_channel();
@@ -813,6 +931,18 @@ pub unsafe extern "C" fn xhys_ingress_activate(handle: *mut c_void, slot: u8) ->
 }
 
 /// # Safety
+/// Caller must prove the slot's process has exited before first admission.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_abandon(handle: *mut c_void, slot: u8) -> bool {
+    let Some(ingress) = (unsafe { handle.cast::<Ingress>().as_ref() }) else {
+        return false;
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    ingress.commands.send(Command::Abandon(slot, tx)).is_ok()
+        && rx.recv_timeout(Duration::from_secs(3)).ok() == Some(true)
+}
+
+/// # Safety
 /// Exclude ingress join. `data` must point to `length` readable snapshot bytes.
 /// Caller must prove the old native process released public RX first.
 #[unsafe(no_mangle)]
@@ -834,6 +964,78 @@ pub unsafe extern "C" fn xhys_ingress_adopt_receive(
         .send(Command::AdoptReceive(snapshot, tx))
         .is_ok()
         && rx.recv_timeout(Duration::from_secs(3)).ok() == Some(true)
+}
+
+/// # Safety
+/// Exclude join. Token points to 16 readable bytes; retry the identical token.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_fence(
+    handle: *mut c_void,
+    slot: u8,
+    token: *const u8,
+) -> bool {
+    if token.is_null() {
+        return false;
+    }
+    let Some(ingress) = (unsafe { handle.cast::<Ingress>().as_ref() }) else {
+        return false;
+    };
+    let token = unsafe { std::slice::from_raw_parts(token, 16) }
+        .try_into()
+        .unwrap();
+    let (tx, rx) = mpsc::sync_channel(1);
+    ingress
+        .commands
+        .send(Command::Fence(slot, token, tx))
+        .is_ok()
+        && rx.recv_timeout(Duration::from_secs(3)).ok() == Some(true)
+}
+
+unsafe fn ownership_command(
+    handle: *mut c_void,
+    slot: u8,
+    token: *const u8,
+    release: bool,
+) -> bool {
+    if token.is_null() {
+        return false;
+    }
+    let Some(ingress) = (unsafe { handle.cast::<Ingress>().as_ref() }) else {
+        return false;
+    };
+    let token = unsafe { std::slice::from_raw_parts(token, 16) }
+        .try_into()
+        .unwrap();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let command = if release {
+        Command::ReleasePublic(slot, token, tx)
+    } else {
+        Command::Retire(slot, token, tx)
+    };
+    ingress.commands.send(command).is_ok()
+        && rx.recv_timeout(Duration::from_secs(3)).ok() == Some(true)
+}
+
+/// # Safety
+/// Caller must first confirm worker retirement with the same fence token.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_retire(
+    handle: *mut c_void,
+    slot: u8,
+    token: *const u8,
+) -> bool {
+    unsafe { ownership_command(handle, slot, token, false) }
+}
+
+/// # Safety
+/// Exclude join. Token must point to 16 readable bytes, reused on retry.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_release_public(
+    handle: *mut c_void,
+    slot: u8,
+    token: *const u8,
+) -> bool {
+    unsafe { ownership_command(handle, slot, token, true) }
 }
 
 /// # Safety
@@ -859,6 +1061,7 @@ pub unsafe extern "C" fn xhys_ingress_add_ring(
     handle: *mut c_void,
     slot: u8,
     descriptor: i32,
+    direct_transmit: bool,
     out: *mut RingDescriptors,
 ) -> bool {
     use std::os::fd::IntoRawFd;
@@ -879,7 +1082,7 @@ pub unsafe extern "C" fn xhys_ingress_add_ring(
     let (tx, rx) = mpsc::sync_channel(1);
     if ingress
         .commands
-        .send(Command::AddRing(slot, socket, tx))
+        .send(Command::AddRing(slot, socket, direct_transmit, tx))
         .is_err()
     {
         return false;
@@ -952,6 +1155,7 @@ mod tests {
             current: 0,
             pins: HashMap::new(),
             next_gc: Instant::now(),
+            leases: [0; 256],
         };
         let mut live = [false; 256];
         live[0] = true;
@@ -961,7 +1165,7 @@ mod tests {
         initial[4] = 1;
         initial[5] = 8;
         initial[6..14].copy_from_slice(b"original");
-        let snapshot = serde_json::to_vec(&serde_json::json!({"key":vec![1u8;16], "local":"127.0.0.1:443", "slot":0, "pins":[{"version":1,"cid":[111,114,105,103,105,110,97,108],"remaining_ms":1000}]})).unwrap();
+        let snapshot = serde_json::to_vec(&serde_json::json!({"lease":1,"key":vec![1u8;16], "local":"127.0.0.1:443", "slot":0, "pins":[{"version":1,"cid":[111,114,105,103,105,110,97,108],"remaining_ms":1000}]})).unwrap();
         adopt_receive(
             &mut routes,
             &live,
@@ -970,6 +1174,16 @@ mod tests {
             &snapshot,
         )
         .unwrap();
+        assert!(
+            adopt_receive(
+                &mut routes,
+                &live,
+                [1; 16],
+                "127.0.0.1:443".parse().unwrap(),
+                &snapshot
+            )
+            .is_err()
+        );
         routes.current = 1;
         assert_eq!(routes.route(&initial, &live), Some(0));
         initial[6..14].copy_from_slice(b"new-work");
@@ -986,6 +1200,7 @@ mod tests {
             current: 0,
             pins: HashMap::new(),
             next_gc: Instant::now(),
+            leases: [0; 256],
         };
         let mut live = [false; 256];
         live[0] = true;
@@ -999,6 +1214,7 @@ mod tests {
         ] {
             let mut value: serde_json::Value = serde_json::from_str(snapshot).unwrap();
             value["key"] = serde_json::json!(vec![1u8; 16]);
+            value["lease"] = serde_json::json!(1);
             value["local"] = serde_json::json!("127.0.0.1:443");
             assert!(
                 adopt_receive(
@@ -1013,7 +1229,7 @@ mod tests {
             assert!(routes.pins.is_empty());
         }
         let valid = serde_json::to_vec(
-            &serde_json::json!({"key":vec![1u8;16],"local":"127.0.0.1:443","slot":0,"pins":[]}),
+            &serde_json::json!({"lease":1,"key":vec![1u8;16],"local":"127.0.0.1:443","slot":0,"pins":[]}),
         )
         .unwrap();
         assert!(
@@ -1061,6 +1277,8 @@ mod tests {
                 ring: None,
                 queue: VecDeque::new(),
                 bytes: 0,
+                fence: None,
+                direct_transmit: false,
             },
             tokio::net::UnixDatagram::from_std(receiver).unwrap(),
         )

@@ -1,8 +1,8 @@
-//! Experimental one-way public RX lease for a stable native generation.
+//! Public RX lease for a managed native generation.
 //! The caller must suspend the ingress before creating this socket. Releasing
 //! the lease excludes an in-progress read and exports client-chosen Initial
-//! routes before the ingress is resumed. Reacquisition requires safe retirement
-//! and is intentionally not implemented here.
+//! routes before the ingress is resumed. Reacquisition requires all other
+//! generations to retire and the ingress to fence its queue and unregister RX.
 
 use crate::{generation_cid, packet_socket::PacketSocket};
 use quinn::{AsyncUdpSocket, UdpPoller, udp};
@@ -37,6 +37,7 @@ struct InitialPin {
 
 #[derive(Serialize)]
 struct Snapshot {
+    lease: u64,
     key: [u8; 16],
     local: SocketAddr,
     slot: u8,
@@ -49,6 +50,8 @@ struct State {
     next_gc: Instant,
     snapshot: Option<Vec<u8>>,
     waker: Option<Waker>,
+    acquired: Option<[u8; 16]>,
+    releases: u64,
 }
 
 pub struct ReceiveOwner {
@@ -73,6 +76,7 @@ impl ReceiveOwner {
         packet: Arc<PacketSocket>,
         public: Arc<dyn AsyncUdpSocket>,
         generation: &generation_cid::Config,
+        direct: bool,
     ) -> Self {
         Self {
             packet,
@@ -81,13 +85,44 @@ impl ReceiveOwner {
             slot: generation.slot,
             key: generation.key,
             state: Mutex::new(State {
-                direct: true,
+                direct,
                 pins: HashMap::new(),
                 next_gc: Instant::now(),
                 snapshot: None,
                 waker: None,
+                acquired: None,
+                releases: 0,
             }),
         }
+    }
+
+    pub fn acquire(&self, token: [u8; 16]) -> io::Result<bool> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("receive lease poisoned"))?;
+        if token == [0; 16] {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        if state.direct {
+            return Ok(state.acquired == Some(token));
+        }
+        if state.acquired == Some(token) {
+            // A previous acquisition marker may still be visible after a new
+            // release. Replaying it must not create two public receive owners.
+            return Ok(false);
+        }
+        if !self.packet.fence_seen(token) {
+            return Ok(false);
+        }
+        state.direct = true;
+        state.acquired = Some(token);
+        state.snapshot = None;
+        state.pins.clear();
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+        Ok(true)
     }
 
     // False only for an Initial/0-RTT that cannot be pinned. Never let the
@@ -159,6 +194,9 @@ impl ReceiveOwner {
         if let Some(snapshot) = &state.snapshot {
             return Ok(snapshot.clone());
         }
+        if !state.direct {
+            return Err(io::Error::other("generation does not own public receive"));
+        }
         let now = Instant::now();
         let pins = state
             .pins
@@ -172,7 +210,12 @@ impl ReceiveOwner {
                 })
             })
             .collect();
+        let lease = state
+            .releases
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("receive lease exhausted"))?;
         let snapshot = serde_json::to_vec(&Snapshot {
+            lease,
             key: self.key,
             local: self.public.local_addr()?,
             slot: self.slot,
@@ -181,6 +224,7 @@ impl ReceiveOwner {
         if snapshot.len() > SNAPSHOT_LIMIT {
             return Err(io::Error::other("receive lease snapshot too large"));
         }
+        state.releases = lease;
         state.direct = false;
         state.snapshot = Some(snapshot.clone());
         if let Some(waker) = state.waker.take() {
@@ -207,10 +251,10 @@ impl AsyncUdpSocket for ReceiveOwner {
             .state
             .lock()
             .map_err(|_| io::Error::other("receive lease poisoned"))?;
+        state.waker = Some(cx.waker().clone());
         if !state.direct {
             return self.packet.poll_recv(cx, buffers, metadata);
         }
-        state.waker = Some(cx.waker().clone());
         for _ in 0..32 {
             let count = match self.public.poll_recv(cx, buffers, metadata) {
                 Poll::Ready(Ok(count)) => count,
@@ -293,6 +337,7 @@ mod tests {
                 key: [1; 16],
                 slot: 7,
             },
+            true,
         );
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut initial = [0u8; 1200];
@@ -329,6 +374,29 @@ mod tests {
             1
         );
         assert_eq!(&buffers[0][..metadata[0].len], b"relay");
+        let token = [3; 16];
+        assert!(!owner.acquire(token).unwrap());
+        let mut marker = b"NXDFENC\x01".to_vec();
+        marker.extend_from_slice(&token);
+        bridge.send(&marker).unwrap();
+        // Reading the marker has no application payload; cancel the pending
+        // receive once it has consumed the private channel.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                poll_fn(|cx| owner.poll_recv(cx, &mut buffers, &mut metadata))
+            )
+            .await
+            .is_err()
+        );
+        assert!(!owner.acquire([4; 16]).unwrap());
+        assert!(owner.acquire(token).unwrap());
+        assert!(owner.acquire(token).unwrap());
+        let second = owner.release().unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        assert_eq!(parsed["lease"], 2);
+        assert_ne!(snapshot, second);
+        assert!(!owner.acquire(token).unwrap());
     }
 
     #[tokio::test]
@@ -340,13 +408,29 @@ mod tests {
         let (worker, _bridge) = UnixDatagram::pair().unwrap();
         worker.set_nonblocking(true).unwrap();
         let packet = Arc::new(PacketSocket::new(worker, local, true).unwrap());
-        let owner = ReceiveOwner::new(packet, public, &generation_cid::Config { key: [1;16], slot: 7 });
+        let owner = ReceiveOwner::new(
+            packet,
+            public,
+            &generation_cid::Config {
+                key: [1; 16],
+                slot: 7,
+            },
+            true,
+        );
         let mut state = owner.state.lock().unwrap();
         let now = Instant::now();
         state.next_gc = now + Duration::from_secs(1);
         for nonce in 0..PIN_LIMIT {
-            let mut cid = [0;20]; cid[..8].copy_from_slice(&(nonce as u64).to_be_bytes());
-            state.pins.insert(InitialKey { version: 1, length: 8, cid }, now + PIN_LIFETIME);
+            let mut cid = [0; 20];
+            cid[..8].copy_from_slice(&(nonce as u64).to_be_bytes());
+            state.pins.insert(
+                InitialKey {
+                    version: 1,
+                    length: 8,
+                    cid,
+                },
+                now + PIN_LIFETIME,
+            );
         }
         let mut initial = [0;1200];
         initial[0] = 0xc0; initial[4] = 1; initial[5] = 8;
