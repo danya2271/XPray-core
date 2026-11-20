@@ -7,6 +7,10 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +18,87 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
 )
+
+func TestTCPReadDropsConsumedPayloadReference(t *testing.T) {
+	for _, owned := range []bool{false, true} {
+		t.Run(strconv.FormatBool(owned), func(t *testing.T) {
+			engine := &Engine{done: make(chan struct{}), out: make(chan frame, 8)}
+			connection := newConn(engine, 1, xnet.Destination{Network: xnet.Network_TCP}, nil)
+			payload := []byte("payload")
+			message := frame{kind: dataFrame, id: connection.id, data: payload}
+			released := 0
+			if owned {
+				message.storage = buf.FromBytesWithRelease(payload, func() { released++ })
+			}
+			connection.in <- message
+			if count, err := connection.Read(nil); count != 0 || err != nil || len(connection.in) != 1 {
+				t.Fatalf("empty read consumed a frame: count=%d err=%v", count, err)
+			}
+			prefix := make([]byte, 3)
+			if count, err := connection.Read(prefix); count != len(prefix) || err != nil || string(prefix) != "pay" {
+				t.Fatalf("partial read: count=%d err=%v data=%q", count, err, prefix)
+			}
+			if string(connection.pending) != "load" || released != 0 {
+				t.Fatal("partial read released unread payload")
+			}
+			suffix := make([]byte, 4)
+			if count, err := connection.Read(suffix); count != len(suffix) || err != nil || string(suffix) != "load" {
+				t.Fatalf("final read: count=%d err=%v data=%q", count, err, suffix)
+			}
+			if connection.pending != nil || connection.pendingStorage != nil {
+				t.Fatal("completed read retained a payload reference")
+			}
+			if owned && released != 1 {
+				t.Fatalf("payload released %d times", released)
+			}
+			connection.in <- frame{kind: dataFrame, id: connection.id, data: []byte("next")}
+			if count, err := connection.Read(suffix); count != len(suffix) || err != nil || string(suffix) != "next" {
+				t.Fatalf("next frame: count=%d err=%v data=%q", count, err, suffix)
+			}
+		})
+	}
+}
+
+func BenchmarkConsumedTCPReadMemory(b *testing.B) {
+	const flows, size = 2048, 16384
+	for b.Loop() {
+		debug.FreeOSMemory()
+		var before runtime.MemStats
+		runtime.ReadMemStats(&before)
+		engine := &Engine{done: make(chan struct{}), out: make(chan frame, 8)}
+		connections := make([]*Conn, flows)
+		reply := make([]byte, size)
+		for index := range connections {
+			connection := newConn(engine, uint64(index+1), xnet.Destination{Network: xnet.Network_TCP}, nil)
+			payload := bytes.Repeat([]byte{0xa5}, size)
+			connection.in <- frame{kind: dataFrame, id: connection.id, data: payload}
+			if count, err := connection.Read(reply); count != size || err != nil || !bytes.Equal(reply, payload) {
+				b.Fatalf("payload read: count=%d err=%v", count, err)
+			}
+			connections[index] = connection
+		}
+		debug.FreeOSMemory()
+		var after runtime.MemStats
+		runtime.ReadMemStats(&after)
+		b.ReportMetric(float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/(1<<20), "retained-heap-MiB")
+		retained := 0
+		for _, connection := range connections {
+			if connection.pending != nil {
+				retained++
+			}
+		}
+		b.ReportMetric(float64(retained), "retained-payload-refs")
+		if data, err := os.ReadFile("/proc/self/statm"); err == nil {
+			fields := strings.Fields(string(data))
+			if len(fields) >= 2 {
+				if pages, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+					b.ReportMetric(float64(pages)*float64(os.Getpagesize())/(1<<20), "current-rss-MiB")
+				}
+			}
+		}
+		runtime.KeepAlive(connections)
+	}
+}
 
 func TestServerFlowQueuesAndCreditsStayWithinChunkBudget(t *testing.T) {
 	e := &Engine{role: "server", done: make(chan struct{}), out: make(chan frame, 8)}

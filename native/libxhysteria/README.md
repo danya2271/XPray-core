@@ -395,7 +395,8 @@ the resulting archive hash so its linker cache cannot reuse the normal build:
 cargo build --locked --release --features 'engine allocation-profile' --lib \
   --manifest-path native/libxhysteria/Cargo.toml
 native_hash=$(sha256sum native/libxhysteria/target/release/libxhysteria.a)
-CGO_ENABLED=1 go build -tags 'xhysteria_native xray_server' \
+bash native/libxhysteria/link-go.sh native/libxhysteria/target/release objcopy \
+  env CGO_ENABLED=1 go build -tags 'xhysteria_native xray_server' \
   -ldflags="-buildid=xhysteria-${native_hash%% *}" \
   -o build_assets/xray-native-allocation-profile ./main
 XRAY_NET_DIAG=1 build_assets/xray-native-allocation-profile run -c /path/to/config.json
@@ -429,6 +430,11 @@ blocked TX directly through Go netpoll; a third wakes Rust. Coalesced pending
 flags reduce redundant notification syscalls without delaying data. No CGO
 call is made for normal payload publication or per-payload release. The last
 Go arena owner uses a teardown CGO call to release its Rust reference.
+The ordinary `Conn.Read` path clears its slice reference as soon as a payload
+is fully consumed, so idle readers do not keep the previous backing allocation
+alive after its owner is released. Partial reads retain unread data; the
+MultiBuffer path already clears its reference. This does not change arena or
+QUIC capacities, and does not eliminate other native allocator retention.
 The socket bridge remains available for
 comparison and rollback, and is the default on other supported architectures.
 Space notifications are armed only by writers that observe a full ring, then

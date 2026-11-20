@@ -2628,3 +2628,280 @@ XHYS_LOSS_POOL_SIZE=auto XHYS_LOSS_REQUIRE_ZERO=1 \
   -test.run '^TestHysteriaPacketLossUnderLoad$/native$/cascade_true$/size_4096$' \
   -test.v -test.timeout 90s
 ```
+
+## RSS Retention Investigation and Consumed TCP Reads (2026-11-20)
+
+All custom Rust allocator policies in the investigation below were rejected.
+Neither their large RSS reductions nor their benchmark executables describe
+the shipped implementation. The final change clears a consumed Go TCP read
+reference; Rust's allocator, huge-page policy and all transport budgets remain
+unchanged. The final consumed-read measurements follow the experiment history.
+
+This pass preserves the previous client workers/session policy, all QUIC
+windows, GRO/GSO support, packet masks, flow credits and queue capacities.
+The baseline is `5393f01d` runtime behavior, built as `client8-complete.test`;
+the subsequent build-script fix changes no runtime behavior. It uses the
+same Linux isolated-client benchmark source as the candidate. Client CPUs
+8–15 and server/echo CPUs 0–3 are distinct physical cores, with eight/four
+Go CPUs respectively, on the Xeon E5-2698 v3 described above. Both endpoints
+use their executable's allocator variant. CPU and RSS measurements refer to
+the client process only. The host still runs unrelated workloads, has about
+62.6 GiB RAM and imposes no process memory limit; these results do not simulate
+the original 1 GiB VPS OOM or establish Android-device memory behavior.
+
+### Allocation Policy and Rejected Experiment
+
+The rejected candidate routed Linux and Android Rust allocations of at least
+1 MiB and alignment up to 4096 bytes through anonymous private `mmap`/`munmap`.
+Smaller and more strictly aligned allocations retained the system allocator.
+A Linux mapped resize used `mremap` when both sizes qualified;
+Android resizes and threshold crossings allocated a replacement, preserved the payload and
+releases the previous owner. Failure preserves the original allocation, as
+required by the allocator contract. The large-allocation path is marked cold;
+hot small-allocation paths are inlineable. The policy adds no allocation-size
+header, native dependency, worker, periodic trim or global libc tuning.
+
+The experiment's goal was to keep large endpoint receive scratch allocations out of libc's
+adaptive mmap threshold and per-thread retained arenas. Quinn's receive-buffer
+capacity is unchanged: this is not a smaller receive queue, disabled GRO,
+fewer sessions, reduced send window or artificially reduced offered traffic.
+Mapped zeroed allocations do not explicitly touch unused payload pages, and
+release returns their pages directly instead of waiting for allocator reuse.
+The experimental allocation-profile wrapper delegated to the same policy; its
+size-class counters include the direct mappings, while libc `mallinfo2` does
+not. Anonymous shared-bridge arenas remain a separate mapping category.
+
+A preliminary mimalloc experiment was rejected and completely removed,
+including its dependencies and lockfile edits. In its two-repeat sweep,
+eight-worker peak RSS reached 127–131 MiB for short exchanges and about
+141 MiB for bulk, versus roughly 50/102 MiB with the system allocator.
+Disabling eager commit and purge delay improved that allocator's result but
+did not establish an advantage worth changing dependencies and defaults.
+The final source does not use mimalloc or modify its environment variables.
+
+### Cold Start Versus Repeated Lifetimes (Rejected Prototype)
+
+The earlier three-second adaptive benchmarks run setup/teardown multiple times
+as Go calibrates their iteration count. This can raise libc's allocation
+threshold and keep previously freed large scratch buffers in its arenas.
+That pattern resembles repeated engine lifetimes, not one continuously open
+pool. It must not be presented as the memory saved on every cold connection.
+
+The first direct-mapping prototype's two-repeat adaptive sweep measured
+four-worker bulk client peak RSS at 73.33–74.17 MiB before versus
+49.97–51.57 MiB after, and eight-worker RSS at 98.37–104.30 MiB before versus
+55.40–56.15 MiB after. These are useful peak-retention observations, but the
+fixed-work and repeated-lifetime controls below are the primary comparisons.
+Prototype logs are `mapped-r*-*.log`; rejected allocator logs are
+`sweep-r*-*-mimalloc.log` and `mimalloc-*.log` under
+`build_assets/rss-20261120/`.
+
+### Rejected No-Huge-Page Prototype Measurements
+
+The initial no-huge-page candidate is `rss-final.test`; it was subsequently
+rejected by the paired UDP validation described below. Four fresh-process samples per
+configuration alternate baseline/candidate ordering. Each bulk sample completes
+exactly 16,384 exchanges of 64 KiB each way (2 GiB total duplex payload), and
+each short-message sample completes exactly 240,000 exchanges of 64 B each
+way. There are 32 live flows throughout timing. The table gives medians;
+MB/s counts both directions in decimal units, and CPU is client process CPU
+per completed echo. The final benchmark source is identical in both binaries.
+
+| Workers / sessions | Workload | Before → after client peak RSS, MiB | Before → after MB/s | Before → after RTT p99, µs | Before → after client CPU, µs/exchange |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4 / 4 | 64 B | 51.72 → 48.64 | — | 1209.5 → 1252.0 | 48.95 → 48.53 |
+| 4 / 4 | 64 KiB | 54.35 → 52.08 | 665.89 → 663.38 | 16570.5 → 17167.5 | 499.82 → 502.08 |
+| 8 / 8 | 64 B | 51.89 → 51.34 | — | 1236.0 → 1227.5 | 60.90 → 60.55 |
+| 8 / 8 | 64 KiB | 56.26 → 54.75 | 725.12 → 719.12 | 10895.0 → 10975.5 | 542.55 → 545.43 |
+
+Cold-start/fixed-work RSS reductions are modest: about 1.5–3 MiB in most
+rows, not the 40+ MiB seen after repeated allocation lifetimes. Bulk rates
+are 0.4%/0.8% lower in these final four/eight-worker samples, and CPU per
+exchange differs by less than 1%. Four-worker p99 is 3.5% higher for short
+messages and 3.6% higher for bulk; eight-worker small-message p99 is 0.7%
+lower and bulk p99 is 0.7% higher. These observations do not establish a
+universal zero-latency-cost guarantee or a latency improvement.
+
+The earlier fixed-work prototype matrix additionally covers eight live flows
+and uses 160,000 short-message exchanges per sample. Its four-sample medians
+show bulk rates within about 1% of baseline and do not establish a consistent
+throughput change. Its 32-flow eight-worker short-message p99 was 6.5% higher;
+the final cold-path separation above removes the large-allocation function's
+stack setup from ordinary allocation calls, and the final small-message
+comparison does not repeat that tail increase. This is not proof that all
+outliers were allocator-induced. Raw fixed-work prototype and final logs are
+`fixed-r*-*.log` and `final-r*-*.log`.
+
+To measure retained memory directly, an additional final comparison runs the
+same fixed 16,384-exchange bulk workload four times inside each process,
+closing and recreating its Xray instance, sessions and isolated server between
+runs. `RUSAGE_SELF` peak RSS is process-lifetime cumulative; each element below
+is the measured high-water mark after that completed client lifetime:
+
+| Workers / sessions | Before peak RSS by lifetime, MiB | After peak RSS by lifetime, MiB | End-of-process peak reduction |
+| --- | --- | --- | ---: |
+| 4 / 4 | 54.04, 56.52, 69.09, 74.74 | 49.57, 50.49, 50.66, 50.66 | 32.2% |
+| 8 / 8 | 61.23, 61.23, 91.38, 99.15 | 55.06, 55.06, 55.06, 55.06 | 44.5% |
+
+Median per-lifetime bulk speed is 671.85 → 666.48 MB/s with four workers
+and 724.44 → 725.10 MB/s with eight. Median per-lifetime p99 is
+16.389 → 16.198 ms and 10.635 → 10.909 ms, respectively. CPU per exchange
+is 499.20 → 496.75 µs and 547.35 → 545.86 µs. The candidate therefore
+substantially reduces the retained-memory peak without reducing the session
+topology or delivered payload; it does not make every measured latency lower.
+Final lifetime logs are `final-restarts-w*-*.log`. Two prototype repetitions
+of the same lifetime experiment (`restarts-r*-*.log`) end at 71.50–73.26
+versus 51.34–54.38 MiB for four workers and 98.81–100.20 versus 54.28–54.77
+MiB for eight workers.
+
+For reproduction with suitable disjoint physical CPU sets:
+
+```sh
+XHYS_CLIENT_SERVER_CPUS=0-3 XRAY_HYSTERIA_CLIENT_WORKERS=8 \
+  XRAY_HYSTERIA_POOL_SIZE=8 XHYS_BENCH_PARALLELISM=4 \
+  taskset -c 8-15 interop.test -test.run '^$' \
+  -test.bench '^BenchmarkIsolatedClientParallelTransfer$' \
+  -test.benchtime 16384x -test.cpu 8 -test.count 4
+```
+
+Use `-test.count 1` for the cold-start control, or the parallel latency benchmark
+with `-test.benchtime 240000x` for the final short-message case. Do not compare
+an adaptive multi-calibration peak from one binary with a single cold fixed-work
+sample from the other. These measurements exclude the server and kernel buffers
+but include Go heap, native allocator pages, benchmark samples and setup/teardown.
+
+### Why the No-Huge-Page Variant Was Not Shipped
+
+Although `rss-final.test` passed the first 20,000-packet matrix, the subsequent
+paired paced-cascade check exposed a regression. One candidate sample had
+48.943 ms UDP p99, and the next received only 1993/2000 replies, with 58.534 ms
+p99 and 147.328 ms maximum RTT. The missing sequences are retained in
+`udp-paired-r2-final.log`; native QUIC diagnostics count 15 dropped receive
+datagrams while owned kernel UDP drops remain zero. This is not a successful
+zero-loss result and was not hidden by the earlier matrix. The strong RSS
+reductions and prototype timing tables above describe this rejected policy,
+not the final shipped version.
+
+This host has transparent huge pages set to `always`. The revised allocator
+keeps direct release to the OS but removes `MADV_NOHUGEPAGE` for large Rust
+allocations. It leaves the existing independent shared-arena policy unchanged.
+No QUIC DATAGRAM queue, credit timeout or traffic pacing is increased to mask
+the failure. The revised executable is `rss-thp.test`; its own measurements
+below supersede the rejected prototype results. This change is a conservative
+policy correction, not proof that huge-page policy alone explains every tail.
+
+In three new fresh-process paced-cascade pairs with 4 KiB UDP payloads,
+both baseline and revised allocator receive 6000/6000 replies with zero sampled
+kernel UDP drops and no duplicates. Median achieved background rates are
+127.31 and 127.09 MiB/s. Median per-run UDP p99 is 2.045 → 1.786 ms, with
+individual ranges of 1.822–21.394 ms before and 1.733–15.492 ms after. The
+revised samples still contain a maximum RTT up to 49.941 ms, so no bounded
+jitter or universal latency improvement is claimed. Raw logs are
+`thp-udp-r*-*.log`.
+
+The revised huge-page-preserving candidate also failed the expanded matrix:
+`shipped-loss-auto-paced-4096.log` receives 1998/2000 replies, with 25.992 ms
+p99 and 88.152 ms maximum RTT, missing sequences 45 and 46. Despite the log
+prefix, this candidate was **not shipped**. Its `shipped-r*-*.log` and
+`shipped-restarts-*.log` contain additional experimental timing and retention
+data, not a successful release comparison. Both allocator modules and their
+profiling changes were removed, with no Cargo dependency or lockfile changes
+left. These failures are a reason to reject the candidates, not proof of a
+single causal explanation for all existing cascade loss or host jitter.
+
+### Shipped Fix: Release Consumed TCP Read References
+
+The final production change is in the Go adapter's `Conn.Read`. After the last
+byte of a frame was copied to the caller, `pending = pending[n:]` left an
+empty, non-nil slice referencing the old backing allocation. Releasing
+`pendingStorage` did not remove this independent slice reference. Idle readers
+could therefore keep the last payload alive until another read or close,
+including after a buffer pool stopped retaining it. The fix explicitly sets
+`pending` to nil when drained, with the existing ownership/release check
+preserved. Partial and zero-length reads keep their previous behavior.
+
+The new regression test fails on the original code for both owned and
+unowned frames and passes after the fix. It checks that partial reads preserve
+unread data, the last read releases ownership once, no consumed reference
+remains, zero-length reads do not consume a frame, and the following frame is
+still readable. The shipped code has no custom Rust allocator, Rust source
+change, queue/window reduction, new copy, timer, worker or dependency.
+
+`BenchmarkConsumedTCPReadMemory` creates 2048 native-adapter `Conn` objects,
+feeds one 16 KiB DATA frame through each real `Conn.Read`, verifies the copied
+payload and keeps every connection alive after draining it. It intentionally
+uses an in-process frame source rather than opening QUIC connections: this
+isolates the reference-retention defect. After forced GC/OS reclamation in the
+test only, three fresh-process samples per binary give:
+
+| Metric | Before samples | After samples | Median before → after |
+| --- | --- | --- | --- |
+| Retained Go heap, MiB | 35.45, 35.46, 35.45 | 3.460, 3.455, 3.460 | 35.45 → 3.46 |
+| Current process RSS, MiB | 51.54, 51.57, 51.55 | 18.68, 18.09, 17.98 | 51.55 → 18.09 |
+| Retained consumed payload references | 2048, 2048, 2048 | 0, 0, 0 | 2048 → 0 |
+
+The heap reduction is approximately the expected 32 MiB of payload storage.
+This is a controlled idle-reader memory result, not an 8-session QUIC RSS
+measurement or evidence that every active native process shrank by 65%.
+Production code does not force GC or call `FreeOSMemory`. The MultiBuffer fast
+path already clears its pending reference and is not rewritten. The separate
+Rust allocator-retention costs found during the investigation remain unresolved.
+
+Identical benchmark/test sources are compiled against before/after `Conn.Read`
+code. The failing original regression log is `read-reproducer-before.log`;
+passing regression and memory logs are `read-regression-after.log` and
+`read-memory-{before,after}-*.log`. The fixture can be reproduced with the
+tagged `transport/internet/xhysteria` test executable:
+
+```sh
+taskset -c 8-15 xhysteria.test -test.run '^$' \
+  -test.bench '^BenchmarkConsumedTCPReadMemory$' \
+  -test.benchtime 1x -test.cpu 8 -test.count 1
+```
+
+Its elapsed time includes deliberate GC and must not be used as a transport
+latency or throughput benchmark.
+
+### Final Transport Checks for the Consumed-Read Fix
+
+Three alternating-order fresh-process samples per version use eight physical
+client CPUs, eight workers/sessions, 32 live flows and a separate four-CPU
+native server with the same Salamander/WireGuard masks. These are normal,
+non-profiled builds with the original system allocator and the same benchmark
+sources. Each benchmark runs for three seconds, so the completed exchange
+counts differ; CPU is normalized per completed exchange.
+
+| Metric | Before | Consumed-read fix |
+| --- | ---: | ---: |
+| 64 B echo RTT p50, µs | 484.1 | 478.0 |
+| 64 B echo RTT p99, µs | 1324 | 1257 |
+| 64 B client CPU, µs/exchange | 63.38 | 62.36 |
+| 64 KiB duplex speed, MB/s | 700.37 | 697.32 |
+| 64 KiB echo RTT p99, ms | 11.311 | 10.530 |
+| 64 KiB client CPU, µs/exchange | 557.62 | 555.35 |
+| Bulk client peak RSS, MiB | 103.2 | 101.4 |
+
+The 0.4% bulk-rate difference is small; this is not a throughput speedup claim.
+Neither measured p99 increases, but the small three-sample comparison on a
+shared host is not a universal latency guarantee. Active QUIC-pool RSS is
+essentially unchanged: the isolated idle-read fixture's 32 MiB improvement
+must not be attributed to this bulk workload. Raw logs are
+`read-performance-r*-{before,after}.log`.
+
+Three fresh final-build paced-cascade checks with 4 KiB UDP payloads deliver
+6000/6000 replies, with no sampled owned kernel UDP drops or duplicates.
+Achieved TCP background rates are 126.42–126.86 MiB/s; UDP p99 is
+1.681–1.848 ms, with one maximum RTT of 26.587 ms. The strict zero-loss flag
+is enabled (`read-loss-r*.log`). This does not establish zero production WAN
+loss; the rejected candidates' failed tests above remain part of the record.
+
+Final Go race tests pass for `proxy/hysteria`, `transport/internet/xhysteria`
+and `transport/internet/hysteria`. All 140 packet-mask cases, both cascade
+port-hopping cases, pool lifecycle/rate-protection tests and the 100 ms RTT
+bulk-transfer check pass on `rss-read-final.test`. Linux native and Android
+arm64/API 26 binaries build successfully through the restored system allocator;
+the Android build uses the corrected archive-normalizing script. Android is
+compilation/linking validation only. Logs are `read-go-race.log`,
+`read-go-linux.log`, `read-interop.log` and `read-android.log`; final executable
+hashes are in `read-binaries.sha256`. No rejected allocator code or dependency
+remains in the source diff.

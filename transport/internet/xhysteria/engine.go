@@ -1139,9 +1139,12 @@ func (c *Conn) Read(p []byte) (int, error) {
 	}
 	n := copy(p, c.pending)
 	c.pending = c.pending[n:]
-	if len(c.pending) == 0 && c.pendingStorage != nil {
-		c.pendingStorage.Release()
-		c.pendingStorage = nil
+	if len(c.pending) == 0 {
+		c.pending = nil
+		if c.pendingStorage != nil {
+			c.pendingStorage.Release()
+			c.pendingStorage = nil
+		}
 	}
 	return n, nil
 }
