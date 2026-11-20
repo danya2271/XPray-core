@@ -676,8 +676,19 @@ func (i *UDPIngress) receive() {
 			length += destinationSize
 		}
 		send.wire = wire[:length]
-		if err := worker.raw.Control(write); err != nil || send.err != nil {
-			i.dropped.Add(1) // Never block another generation on this queue.
+		err = worker.raw.Control(write)
+		if err == nil && (errors.Is(send.err, unix.EAGAIN) || errors.Is(send.err, unix.EWOULDBLOCK)) {
+			// Keep this datagram in the existing receive buffer until the
+			// worker can accept it. Do not read another public packet merely
+			// to discard this one. Admission remains independently controlled;
+			// a receive fence cannot acknowledge before this write settles.
+			err = worker.raw.Write(func(fd uintptr) bool {
+				write(fd)
+				return !errors.Is(send.err, unix.EAGAIN) && !errors.Is(send.err, unix.EWOULDBLOCK)
+			})
+		}
+		if err != nil || send.err != nil {
+			i.dropped.Add(1)
 		}
 	}
 }
