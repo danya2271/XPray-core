@@ -1,6 +1,7 @@
 package handoff
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -17,8 +18,8 @@ import (
 
 const (
 	packetHeaderSize = 24
-	// The shared wire is the single-datagram frame used by xhysteria's
-	// PacketSocket. Batched native transmit is not enabled on this wire.
+	// Version 1 is a single datagram. Version 2 optionally carries up to
+	// eight equal-stride datagrams (the final one can be short).
 	packetMaximum = 65535
 )
 
@@ -54,6 +55,10 @@ func readPacketHeader(header []byte, length int) (netip.AddrPort, bool) {
 	if len(header) < packetHeaderSize || header[0] != 1 || length < 1 || length > packetMaximum || uint32(length) != binary.BigEndian.Uint32(header[20:24]) {
 		return netip.AddrPort{}, false
 	}
+	return packetPeer(header)
+}
+
+func packetPeer(header []byte) (netip.AddrPort, bool) {
 	var address netip.Addr
 	switch header[1] {
 	case 4:
@@ -69,6 +74,30 @@ func readPacketHeader(header []byte, length int) (netip.AddrPort, bool) {
 	}
 	port := binary.BigEndian.Uint16(header[2:4])
 	return netip.AddrPortFrom(address, port), port != 0
+}
+
+func readPacketFrame(wire []byte) (netip.AddrPort, int, bool) {
+	length := len(wire) - packetHeaderSize
+	if length < 1 || length > packetMaximum {
+		return netip.AddrPort{}, 0, false
+	}
+	stride := length
+	switch wire[0] {
+	case 1:
+		if uint32(length) != binary.BigEndian.Uint32(wire[20:24]) {
+			return netip.AddrPort{}, 0, false
+		}
+	case 2:
+		stride = int(binary.BigEndian.Uint16(wire[20:22]))
+		if stride == 0 || stride > length || (length+stride-1)/stride > 8 ||
+			length != int(binary.BigEndian.Uint16(wire[22:24])) {
+			return netip.AddrPort{}, 0, false
+		}
+	default:
+		return netip.AddrPort{}, 0, false
+	}
+	peer, ok := packetPeer(wire[:packetHeaderSize])
+	return peer, stride, ok
 }
 
 type packetAddressCache struct {
@@ -94,12 +123,15 @@ func (cache *packetAddressCache) get(address netip.AddrPort) *net.UDPAddr {
 // PacketEndpoint exposes an inherited datagram channel as a UDP PacketConn
 // to Go QUIC. Rust can consume the same descriptor directly via File().
 type PacketEndpoint struct {
-	conn    *net.UnixConn
-	local   net.UDPAddr
-	readMu  sync.Mutex
-	writeMu sync.Mutex
-	rx, tx  []byte
-	peers   packetAddressCache
+	conn                         *net.UnixConn
+	local                        net.UDPAddr
+	readMu                       sync.Mutex
+	writeMu                      sync.Mutex
+	rx, tx                       []byte
+	peers                        packetAddressCache
+	rxOffset, rxLength, rxStride int
+	rxPeer                       netip.AddrPort
+	transmit                     *net.UDPConn
 }
 
 func importUDPPacket(fd *os.File, local net.UDPAddr) (net.PacketConn, error) {
@@ -119,8 +151,38 @@ func ImportPacketEndpoint(fd *os.File, local net.UDPAddr) (*PacketEndpoint, erro
 	return &PacketEndpoint{conn: socket, local: local}, nil
 }
 
-func (e *PacketEndpoint) File() (*os.File, error)            { return e.conn.File() }
-func (e *PacketEndpoint) Close() error                       { return e.conn.Close() }
+func (e *PacketEndpoint) File() (*os.File, error) { return e.conn.File() }
+func (e *PacketEndpoint) Close() error {
+	if e.transmit != nil {
+		e.transmit.Close()
+	}
+	return e.conn.Close()
+}
+
+func attachUDPTransmit(packet net.PacketConn, descriptor int) error {
+	f := os.NewFile(uintptr(descriptor), "xray-inherited-udp-transmit")
+	defer f.Close()
+	conn, err := net.FilePacketConn(f)
+	if err != nil {
+		return err
+	}
+	udp, ok := conn.(*net.UDPConn)
+	if !ok || udp.LocalAddr().String() != packet.LocalAddr().String() {
+		conn.Close()
+		return errors.New("inherited transmit socket does not match UDP ingress address")
+	}
+	packet.(*PacketEndpoint).transmit = udp
+	return nil
+}
+
+// TransmitFile is never read by the worker. Only the common ingress receives
+// public packets; each native generation may send masked replies directly.
+func (e *PacketEndpoint) TransmitFile() (*os.File, error) {
+	if e.transmit == nil {
+		return nil, nil
+	}
+	return e.transmit.File()
+}
 func (e *PacketEndpoint) LocalAddr() net.Addr                { return &e.local }
 func (e *PacketEndpoint) SetReadDeadline(t time.Time) error  { return e.conn.SetReadDeadline(t) }
 func (e *PacketEndpoint) SetWriteDeadline(t time.Time) error { return e.conn.SetWriteDeadline(t) }
@@ -133,13 +195,19 @@ func (e *PacketEndpoint) ReadFrom(payload []byte) (int, net.Addr, error) {
 		e.rx = make([]byte, packetHeaderSize+packetMaximum)
 	}
 	for {
-		n, _, flags, _, err := e.conn.ReadMsgUnix(e.rx[:packetHeaderSize+min(len(payload), packetMaximum)], nil)
+		if e.rxOffset < e.rxLength {
+			end := min(e.rxOffset+e.rxStride, e.rxLength)
+			n := copy(payload, e.rx[e.rxOffset:end])
+			e.rxOffset = end
+			return n, e.peers.get(e.rxPeer), nil
+		}
+		n, _, flags, _, err := e.conn.ReadMsgUnix(e.rx, nil)
 		if err != nil {
 			return 0, nil, err
 		}
 		if flags&unix.MSG_TRUNC == 0 {
-			if addr, ok := readPacketHeader(e.rx[:n], n-packetHeaderSize); ok {
-				return copy(payload, e.rx[packetHeaderSize:n]), e.peers.get(addr), nil
+			if addr, stride, ok := readPacketFrame(e.rx[:n]); ok && stride <= len(payload) {
+				e.rxOffset, e.rxLength, e.rxStride, e.rxPeer = packetHeaderSize, n, stride, addr
 			}
 		}
 	}
@@ -200,7 +268,13 @@ type UDPIngress struct {
 	group   sync.WaitGroup
 	dropped atomic.Uint64
 	failed  atomic.Bool
+	done    chan struct{}
+	// Only an explicitly requested fence sets a deadline. The ordinary
+	// receive/send path never checks this pointer.
+	readFence atomic.Pointer[udpReadFence]
 }
+
+type udpReadFence struct{ done chan error }
 
 func NewUDPIngress(public net.PacketConn, key [16]byte, initialSlot byte, pendingLimit int, pinLifetime time.Duration) (*UDPIngress, error) {
 	if public == nil {
@@ -210,7 +284,7 @@ func NewUDPIngress(public net.PacketConn, key [16]byte, initialSlot byte, pendin
 	if !ok || local.Zone != "" || local.IP.IsUnspecified() || local.IP.To16() == nil || key == [16]byte{} || pendingLimit < 1 || pinLifetime <= 0 {
 		return nil, errors.New("managed UDP ingress requires a numeric, explicitly bound address and valid routing limits")
 	}
-	i := &UDPIngress{public: public, routes: NewQUICRoutes(NewQUICCIDCodec(key), initialSlot, pendingLimit, pinLifetime)}
+	i := &UDPIngress{public: public, routes: NewQUICRoutes(NewQUICCIDCodec(key), initialSlot, pendingLimit, pinLifetime), done: make(chan struct{})}
 	i.peers.Store(new(udpPeers))
 	return i, nil
 }
@@ -267,6 +341,61 @@ func (i *UDPIngress) Activate(slot byte) error {
 
 func (i *UDPIngress) Dropped() uint64 { return i.dropped.Load() }
 
+// FenceInitials reports whether new client-chosen Initial/0-RTT packets can
+// no longer reach an inactive slot through this ingress. A nonzero returned
+// deadline means the caller should retry at or after the given time. On a
+// successful zero deadline, all pre-fence forwarding by the receive loop has
+// finished and admission did not change during the fence. The supervisor must
+// serialize any future Activate with decisions made using this result.
+//
+// This is NOT a retirement certificate: packets may still match a server CID,
+// and earlier datagrams can still be queued in the worker socket or engine.
+func (i *UDPIngress) FenceInitials(ctx context.Context, slot byte) (time.Time, error) {
+	i.mu.Lock()
+	if i.closed || !i.started || i.failed.Load() || i.peers.Load()[slot] == nil {
+		i.mu.Unlock()
+		return time.Time{}, errors.New("UDP ingress is unavailable")
+	}
+	state, until, inactive := i.routes.initialFence(slot)
+	if !inactive {
+		i.mu.Unlock()
+		return time.Time{}, errors.New("cannot fence an active or unknown UDP generation")
+	}
+	if time.Now().Before(until) {
+		i.mu.Unlock()
+		return until, nil
+	}
+	fence := &udpReadFence{done: make(chan error, 1)}
+	if !i.readFence.CompareAndSwap(nil, fence) {
+		i.mu.Unlock()
+		return time.Time{}, errors.New("another UDP ingress fence is in progress")
+	}
+	err := i.public.SetReadDeadline(time.Now())
+	if err != nil {
+		i.readFence.CompareAndSwap(fence, nil)
+	}
+	i.mu.Unlock()
+	if err != nil {
+		return time.Time{}, err
+	}
+	select {
+	case err := <-fence.done:
+		if err != nil {
+			return time.Time{}, err
+		}
+	case <-i.done:
+		return time.Time{}, errors.New("UDP ingress stopped during fence")
+	case <-ctx.Done():
+		return time.Time{}, ctx.Err()
+	}
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.closed || i.failed.Load() || state != i.routes.slots.Load() {
+		return time.Time{}, errors.New("UDP ingress admission changed during fence")
+	}
+	return time.Time{}, nil
+}
+
 func (i *UDPIngress) Close() error {
 	i.mu.Lock()
 	if i.closed {
@@ -286,6 +415,7 @@ func (i *UDPIngress) Close() error {
 }
 
 func (i *UDPIngress) receive() {
+	defer close(i.done)
 	defer i.failed.Store(true)
 	reader := i.routes.NewReader()
 	wire := make([]byte, packetHeaderSize+packetMaximum)
@@ -304,6 +434,21 @@ func (i *UDPIngress) receive() {
 			peer = udpAddress(addr)
 		}
 		if err != nil {
+			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				fence := i.readFence.Load()
+				if fence != nil {
+					// Use the same lock as installation to avoid clearing a
+					// successor's deadline or racing socket shutdown.
+					i.mu.Lock()
+					resetErr := i.public.SetReadDeadline(time.Time{})
+					i.readFence.Store(nil)
+					i.mu.Unlock()
+					fence.done <- resetErr
+					if resetErr == nil {
+						continue
+					}
+				}
+			}
 			return
 		}
 		if n < 1 || n > packetMaximum {
@@ -335,18 +480,21 @@ func (i *UDPIngress) send(peer *udpPeer) {
 		if err != nil {
 			return
 		}
-		addr, ok := readPacketHeader(wire[:n], n-packetHeaderSize)
+		addr, stride, ok := readPacketFrame(wire[:n])
 		if !ok || flags&unix.MSG_TRUNC != 0 {
 			i.dropped.Add(1)
 			continue
 		}
-		if udp, plain := i.public.(*net.UDPConn); plain {
-			_, err = udp.WriteToUDPAddrPort(wire[packetHeaderSize:n], addr)
-		} else {
-			_, err = i.public.WriteTo(wire[packetHeaderSize:n], cache.get(addr))
-		}
-		if err != nil {
-			i.dropped.Add(1)
+		for offset := packetHeaderSize; offset < n; offset += stride {
+			payload := wire[offset:min(offset+stride, n)]
+			if udp, plain := i.public.(*net.UDPConn); plain {
+				_, err = udp.WriteToUDPAddrPort(payload, addr)
+			} else {
+				_, err = i.public.WriteTo(payload, cache.get(addr))
+			}
+			if err != nil {
+				i.dropped.Add(1)
+			}
 		}
 	}
 }

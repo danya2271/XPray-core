@@ -2,6 +2,7 @@
 #define XHYSTERIA_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,13 @@ void *xhys_engine_start_shared(const uint8_t *config_json, uintptr_t config_len,
 void xhys_engine_join(void *engine);
 /* Live accepted QUIC connections, or -1 if untracked/stopped. Exclude join. */
 int64_t xhys_engine_generation_connections(const void *engine);
+int64_t xhys_engine_generation_work(const void *engine);
+/* Experimental Linux packet ingress; not an activation/retirement API. */
+void *xhys_ingress_start(const uint8_t *config_json, uintptr_t length, int32_t udp_fd);
+bool xhys_ingress_add(void *ingress, uint8_t slot, int32_t worker_fd);
+bool xhys_ingress_activate(void *ingress, uint8_t slot);
+uint64_t xhys_ingress_dropped(const void *ingress);
+void xhys_ingress_join(void *ingress);
 void xhys_shared_release(void *owner);
 
 #ifdef __cplusplus

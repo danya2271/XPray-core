@@ -92,6 +92,7 @@ type Config struct {
 	PacketBridge              bool                                      `json:"packet_bridge,omitempty"`
 	PacketBatch               bool                                      `json:"packet_batch,omitempty"`
 	PacketLocal               string                                    `json:"packet_local,omitempty"`
+	PacketTransmitFD          int                                       `json:"packet_transmit_fd,omitempty"`
 	QUICGeneration            *QUICGenerationConfig                     `json:"quic_generation,omitempty"`
 	Diagnostic                bool                                      `json:"diagnostic"`
 	ExternalAuth              bool                                      `json:"external_auth"`
@@ -503,6 +504,19 @@ func (e *Engine) GenerationConnections() (uint64, bool) {
 		return 0, false
 	}
 	count := int64(C.xhys_engine_generation_connections(e.handle))
+	if count < 0 {
+		return 0, false
+	}
+	return uint64(count), true
+}
+
+func (e *Engine) GenerationWork() (uint64, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.handle == nil {
+		return 0, false
+	}
+	count := int64(C.xhys_engine_generation_work(e.handle))
 	if count < 0 {
 		return 0, false
 	}

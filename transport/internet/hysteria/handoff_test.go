@@ -2,6 +2,7 @@ package hysteria_test
 
 import (
 	"context"
+	cryptotls "crypto/tls"
 	"io"
 	stdnet "net"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol/tls/cert"
 	proxy "github.com/xtls/xray-core/proxy/hysteria"
@@ -20,6 +22,97 @@ import (
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
+
+// Hold the server's first flight so the transport has an in-progress
+// handshake but the Hysteria listener cannot have accepted it yet.
+type holdHandshake struct {
+	net.PacketConn
+	release <-chan struct{}
+}
+
+func (c *holdHandshake) WriteTo(p []byte, addr net.Addr) (int, error) {
+	select {
+	case <-c.release:
+		return c.PacketConn.WriteTo(p, addr)
+	default:
+		return len(p), nil // Simulate outbound packet loss during handshake.
+	}
+}
+
+func TestManagedGoStatusCountsUnacceptedHandshake(t *testing.T) {
+	t.Setenv("XRAY_HYSTERIA_NATIVE", "")
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.LocalHostIP.IP()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	local := server.LocalAddr().(*net.UDPAddr)
+	release := make(chan struct{})
+	certificate, _ := cert.MustGenerate(nil, cert.CommonName("localhost"), cert.DNSNames("localhost"))
+	credential := tls.ParseCertificate(certificate)
+	credential.OneTimeLoading = true
+	settings := &internet.MemoryStreamConfig{
+		ProtocolName: "hysteria", ProtocolSettings: &hysteria.Config{Auth: "test-auth"},
+		SecurityType: "tls", SecuritySettings: &tls.Config{Certificate: []*tls.Certificate{credential}},
+	}
+	l, err := hysteria.ListenGeneration(ctx, net.LocalHostIP, net.Port(local.Port), settings, func(stat.Connection) {},
+		&holdHandshake{PacketConn: server, release: release}, [16]byte{8}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	status := l.(hysteria.GenerationListener).GenerationStatus
+	client := make(chan *quic.Conn, 1)
+	dialError := make(chan error, 1)
+	go func() {
+		conn, err := quic.DialAddr(ctx, local.String(), &cryptotls.Config{
+			InsecureSkipVerify: true, NextProtos: []string{"h3"}, // Local ephemeral certificate.
+		}, nil)
+		if err != nil {
+			dialError <- err
+			return
+		}
+		client <- conn
+		<-ctx.Done()
+		_ = conn.CloseWithError(0, "test finished")
+	}()
+	wait := func(ready func(handoff.UDPConnectionStatus) bool) {
+		t.Helper()
+		for ctx.Err() == nil {
+			if ready(status()) {
+				return
+			}
+			select {
+			case err := <-dialError:
+				t.Fatal(err)
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		t.Fatalf("unexpected QUIC work status: %+v", status())
+	}
+	wait(func(s handoff.UDPConnectionStatus) bool {
+		return s.Known && s.WorkKnown && s.Count == 0 && s.TransportWork == 1
+	})
+	close(release)
+	select {
+	case conn := <-client:
+		wait(func(s handoff.UDPConnectionStatus) bool {
+			return s.Known && s.WorkKnown && s.Count == 1 && s.TransportWork == 1
+		})
+		if err := conn.CloseWithError(0, "test finished"); err != nil {
+			t.Fatal(err)
+		}
+	case err := <-dialError:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	wait(func(s handoff.UDPConnectionStatus) bool {
+		return s.Known && s.WorkKnown && s.Count == 0 && s.TransportWork == 0
+	})
+}
 
 type testPacket struct {
 	data []byte

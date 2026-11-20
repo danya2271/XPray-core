@@ -31,7 +31,7 @@ impl PacketSocket {
     }
 }
 
-fn encode_header(address: SocketAddr, length: usize) -> io::Result<[u8; HEADER]> {
+pub(crate) fn encode_header(address: SocketAddr, length: usize) -> io::Result<[u8; HEADER]> {
     if length > MAX_PACKET {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -50,7 +50,7 @@ fn encode_header(address: SocketAddr, length: usize) -> io::Result<[u8; HEADER]>
     Ok(wire)
 }
 
-fn decode_header(wire: &[u8; HEADER], length: usize) -> io::Result<SocketAddr> {
+pub(crate) fn decode_header(wire: &[u8; HEADER], length: usize) -> io::Result<SocketAddr> {
     if wire[0] != 1 || length > MAX_PACKET {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -115,10 +115,39 @@ fn send_frame(
     }
 }
 
+fn parse_frame(
+    header: &mut [u8; HEADER],
+    length: usize,
+    batch: bool,
+) -> Option<(SocketAddr, usize)> {
+    if length == 0 || length > MAX_PACKET {
+        return None;
+    }
+    let stride = if header[0] == 2 && batch {
+        let stride = u16::from_be_bytes(header[20..22].try_into().unwrap()) as usize;
+        if stride == 0
+            || stride > length
+            || length.div_ceil(stride) > MAX_BATCH
+            || u16::from_be_bytes(header[22..24].try_into().unwrap()) as usize != length
+        {
+            return None;
+        }
+        header[0] = 1;
+        header[20..24].copy_from_slice(&(length as u32).to_be_bytes());
+        stride
+    } else {
+        length
+    };
+    let address = decode_header(header, length).ok()?;
+    (address.port() != 0).then_some((address, stride))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn receive_frame(
     socket: &tokio::net::UnixDatagram,
     payload: &mut [u8],
-) -> io::Result<Option<(SocketAddr, usize)>> {
+    batch: bool,
+) -> io::Result<Option<(SocketAddr, usize, usize)>> {
     let mut header = [0; HEADER];
     let mut vectors = [
         libc::iovec {
@@ -147,9 +176,83 @@ fn receive_frame(
         return Ok(None);
     }
     let length = length - HEADER;
-    Ok(decode_header(&header, length)
-        .ok()
-        .map(|address| (address, length)))
+    Ok(parse_frame(&mut header, length, batch).map(|(address, stride)| (address, length, stride)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn receive_frames(
+    socket: &tokio::net::UnixDatagram,
+    buffers: &mut [IoSliceMut<'_>],
+    metadata: &mut [udp::RecvMeta],
+    local: SocketAddr,
+    batch: bool,
+) -> io::Result<usize> {
+    const RECEIVE_BATCH: usize = 32;
+    let capacity = buffers.len().min(metadata.len()).min(RECEIVE_BATCH);
+    let mut headers = [[0u8; HEADER]; RECEIVE_BATCH];
+    let mut vectors: [[libc::iovec; 2]; RECEIVE_BATCH] = unsafe { std::mem::zeroed() };
+    let mut messages: [libc::mmsghdr; RECEIVE_BATCH] = unsafe { std::mem::zeroed() };
+    for index in 0..capacity {
+        vectors[index] = [
+            libc::iovec {
+                iov_base: headers[index].as_mut_ptr().cast(),
+                iov_len: HEADER,
+            },
+            libc::iovec {
+                iov_base: buffers[index].as_mut_ptr().cast(),
+                iov_len: buffers[index].len(),
+            },
+        ];
+        messages[index].msg_hdr.msg_iov = vectors[index].as_mut_ptr();
+        messages[index].msg_hdr.msg_iovlen = 2;
+    }
+    let count = loop {
+        let count = unsafe {
+            libc::recvmmsg(
+                socket.as_raw_fd(),
+                messages.as_mut_ptr(),
+                capacity as u32,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if count >= 0 {
+            break count as usize;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    let mut kept = 0;
+    for index in 0..count {
+        let length = messages[index].msg_len as usize;
+        if messages[index].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 || length < HEADER {
+            continue;
+        }
+        let length = length - HEADER;
+        let Some((mut address, stride)) = parse_frame(&mut headers[index], length, batch) else {
+            continue;
+        };
+        if local.is_ipv6()
+            && let IpAddr::V4(ip) = address.ip()
+        {
+            address = SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), address.port());
+        }
+        if kept != index {
+            let (previous, current) = buffers.split_at_mut(index);
+            previous[kept][..length].copy_from_slice(&current[0][..length]);
+        }
+        metadata[kept] = udp::RecvMeta {
+            addr: address,
+            len: length,
+            stride,
+            ecn: None,
+            dst_ip: (!local.ip().is_unspecified()).then_some(local.ip()),
+        };
+        kept += 1;
+    }
+    Ok(kept)
 }
 
 #[derive(Debug)]
@@ -209,49 +312,91 @@ impl AsyncUdpSocket for PacketSocket {
                 "empty packet receive batch",
             )));
         }
-        let mut count = 0;
-        for _ in 0..32 {
-            let packet = match self.socket.try_io(Interest::READABLE, || {
-                receive_frame(&self.socket, &mut buffers[count])
-            }) {
-                Ok(packet) => packet,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if count != 0 {
-                        return Poll::Ready(Ok(count));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let mut received = 0;
+            for _ in 0..32 {
+                match self.socket.try_io(Interest::READABLE, || {
+                    receive_frames(
+                        &self.socket,
+                        &mut buffers[received..capacity],
+                        &mut metadata[received..capacity],
+                        self.local,
+                        self.batch,
+                    )
+                }) {
+                    Ok(0) => continue,
+                    Ok(count) => {
+                        received += count;
+                        if received == capacity {
+                            return Poll::Ready(Ok(received));
+                        }
                     }
-                    match self.socket.poll_recv_ready(context) {
-                        Poll::Ready(Ok(())) => continue,
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                        Poll::Pending => return Poll::Pending,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if received != 0 {
+                            return Poll::Ready(Ok(received));
+                        }
+                        match self.socket.poll_recv_ready(context) {
+                            Poll::Ready(Ok(())) => continue,
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Pending => return Poll::Pending,
+                        }
                     }
+                    Err(error) => return Poll::Ready(Err(error)),
                 }
-                Err(error) => return Poll::Ready(Err(error)),
-            };
-            let Some((mut address, length)) = packet else {
-                continue;
-            };
-            if self.local.is_ipv6()
-                && let IpAddr::V4(ip) = address.ip()
-            {
-                address = SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), address.port());
             }
-            metadata[count] = udp::RecvMeta {
-                addr: address,
-                len: length,
-                stride: length,
-                ecn: None,
-                dst_ip: (!self.local.ip().is_unspecified()).then_some(self.local.ip()),
-            };
-            count += 1;
-            if count == capacity {
+            if received != 0 {
+                return Poll::Ready(Ok(received));
+            }
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let mut count = 0;
+            for _ in 0..32 {
+                let packet = match self.socket.try_io(Interest::READABLE, || {
+                    receive_frame(&self.socket, &mut buffers[count], self.batch)
+                }) {
+                    Ok(packet) => packet,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if count != 0 {
+                            return Poll::Ready(Ok(count));
+                        }
+                        match self.socket.poll_recv_ready(context) {
+                            Poll::Ready(Ok(())) => continue,
+                            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                let Some((mut address, length, stride)) = packet else {
+                    continue;
+                };
+                if self.local.is_ipv6()
+                    && let IpAddr::V4(ip) = address.ip()
+                {
+                    address = SocketAddr::new(IpAddr::V6(ip.to_ipv6_mapped()), address.port());
+                }
+                metadata[count] = udp::RecvMeta {
+                    addr: address,
+                    len: length,
+                    stride,
+                    ecn: None,
+                    dst_ip: (!self.local.ip().is_unspecified()).then_some(self.local.ip()),
+                };
+                count += 1;
+                if count == capacity {
+                    return Poll::Ready(Ok(count));
+                }
+            }
+            if count != 0 {
                 return Poll::Ready(Ok(count));
             }
+            context.waker().wake_by_ref();
+            Poll::Pending
         }
-        if count != 0 {
-            return Poll::Ready(Ok(count));
-        }
-        context.waker().wake_by_ref();
-        Poll::Pending
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -261,7 +406,7 @@ impl AsyncUdpSocket for PacketSocket {
         if self.batch { MAX_BATCH } else { 1 }
     }
     fn max_receive_segments(&self) -> usize {
-        1
+        if self.batch { MAX_BATCH } else { 1 }
     }
     fn may_fragment(&self) -> bool {
         false
@@ -342,6 +487,39 @@ mod tests {
                         .kind(),
                     io::ErrorKind::InvalidInput
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_socket_receives_segmented_frames_only_with_capability() {
+        for batch in [false, true] {
+            let (raw, peer) = UnixDatagram::pair().unwrap();
+            raw.set_nonblocking(true).unwrap();
+            let socket = PacketSocket::new(raw, "127.0.0.1:1".parse().unwrap(), batch).unwrap();
+            let mut wire = Vec::new();
+            encode("127.0.0.2:443".parse().unwrap(), &[0x37; 2401], &mut wire).unwrap();
+            wire[0] = 2;
+            wire[20..22].copy_from_slice(&1200u16.to_be_bytes());
+            wire[22..24].copy_from_slice(&2401u16.to_be_bytes());
+            peer.send(&wire).unwrap();
+            encode("127.0.0.2:443".parse().unwrap(), b"tail", &mut wire).unwrap();
+            peer.send(&wire).unwrap();
+            let mut payload = [0; 4096];
+            let mut buffers = [IoSliceMut::new(&mut payload)];
+            let mut metadata = [udp::RecvMeta::default()];
+            assert_eq!(
+                poll_fn(|cx| socket.poll_recv(cx, &mut buffers, &mut metadata))
+                    .await
+                    .unwrap(),
+                1
+            );
+            if batch {
+                assert_eq!(metadata[0].len, 2401);
+                assert_eq!(metadata[0].stride, 1200);
+                assert_eq!(&buffers[0][..2401], &[0x37; 2401]);
+            } else {
+                assert_eq!(&buffers[0][..metadata[0].len], b"tail");
             }
         }
     }

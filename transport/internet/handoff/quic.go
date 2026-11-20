@@ -71,6 +71,9 @@ type QUICRoutes struct {
 	limit   int
 	ttl     time.Duration
 	nextGC  time.Time
+	// Latest expiry per slot. Updated only when creating a new Initial pin,
+	// under the same lock as switching ownership. Retries do not extend it.
+	initialUntil [256]time.Time
 }
 
 // QUICRouteReader owns decryption scratch for one receive loop. It is not
@@ -96,9 +99,22 @@ func (r *QUICRoutes) Activate(slot byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := *r.slots.Load()
+	if state.current == slot {
+		return
+	}
 	state.current = slot
 	state.live[slot] = true
 	r.slots.Store(&state)
+}
+
+// initialFence snapshots admission and the last possible client-chosen
+// Initial/0-RTT route to slot. It deliberately says nothing about packets
+// matching a server-issued CID or work inside the QUIC engine.
+func (r *QUICRoutes) initialFence(slot byte) (*quicSlots, time.Time, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.slots.Load()
+	return state, r.initialUntil[slot], state.current != slot && state.live[slot]
 }
 
 // Retire must only be called once the owner has no remaining live work.
@@ -177,6 +193,10 @@ func (reader *QUICRouteReader) Route(datagram []byte, now time.Time) (byte, bool
 	if _, existed := r.initial[key]; !existed && len(r.initial) >= r.limit {
 		return 0, false
 	}
-	r.initial[key] = initialOwner{slot: state.current, until: now.Add(r.ttl)}
+	until := now.Add(r.ttl)
+	r.initial[key] = initialOwner{slot: state.current, until: until}
+	if until.After(r.initialUntil[state.current]) {
+		r.initialUntil[state.current] = until
+	}
 	return state.current, true
 }

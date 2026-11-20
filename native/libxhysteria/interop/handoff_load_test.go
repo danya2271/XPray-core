@@ -75,28 +75,46 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 	local := *public.LocalAddr().(*net.UDPAddr)
 	managed := os.Getenv("XHYS_HANDOFF_MODE") == "managed"
 	key := [16]byte{4, 7, 1, 9}
-	var ingress *handoff.UDPIngress
+	var ingress interface {
+		Add(byte) (*os.File, error)
+		Activate(byte) error
+		Dropped() uint64
+		Close() error
+	}
 	if managed {
 		if os.Getenv("XHYS_HANDOFF_TUNE_PUBLIC") == "1" {
 			native.TunePacketSocket(public, true, false)
 		}
-		var masks []finalmask.UDPMask
-		for _, mask := range packetMasks(t, "header") {
-			value, err := mask.GetInstance()
+		if os.Getenv("XHYS_HANDOFF_NATIVE_INGRESS") == "1" {
+			if os.Getenv("XHYS_HANDOFF_PACKET_BATCH") != "1" {
+				t.Fatal("native ingress requires segmented-frame-capable generations")
+			}
+			ingress, err = native.NewNativeIngress(public, key, 0, []native.UDPMaskConfig{
+				{Kind: "wireguard"}, {Kind: "salamander", Password: psk},
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			masks = append(masks, value.(finalmask.UDPMask))
-		}
-		wrapped := finalmask.NewFinalMask(nil, masks, nil, nil, nil,
-			func(context.Context, xnet.Addr) (xnet.PacketConn, error) { return public, nil })
-		masked, err := wrapped.ListenPacket(context.Background(), &local)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ingress, err = handoff.NewUDPIngress(masked, key, 0, 4096, 30*time.Second)
-		if err != nil {
-			t.Fatal(err)
+			defer public.Close()
+		} else {
+			var masks []finalmask.UDPMask
+			for _, mask := range packetMasks(t, "header") {
+				value, err := mask.GetInstance()
+				if err != nil {
+					t.Fatal(err)
+				}
+				masks = append(masks, value.(finalmask.UDPMask))
+			}
+			wrapped := finalmask.NewFinalMask(nil, masks, nil, nil, nil,
+				func(context.Context, xnet.Addr) (xnet.PacketConn, error) { return public, nil })
+			masked, err := wrapped.ListenPacket(context.Background(), &local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ingress, err = handoff.NewUDPIngress(masked, key, 0, 4096, 30*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 		defer ingress.Close()
 	} else {
@@ -126,6 +144,7 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		}
 		arguments := []string{"run", "-config", configPath}
 		var file *os.File
+		var transmit *os.File
 		control := handoff.ControlSocket(filepath.Join(directory, "control.sock"))
 		if managed {
 			file, err = ingress.Add(slot)
@@ -133,7 +152,19 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer file.Close()
-			manifest := handoff.Manifest{Control: string(control), UDP: []handoff.UDPBinding{{Tag: "hy", Address: "127.0.0.1", Port: local.Port, FD: 3, Key: key, Slot: slot}}}
+			manifest := handoff.Manifest{Control: string(control), UDP: []handoff.UDPBinding{{Tag: "hy", Address: "127.0.0.1", Port: local.Port, FD: 3, Key: key, Slot: slot,
+				PacketBatch: os.Getenv("XHYS_HANDOFF_PACKET_BATCH") == "1"}}}
+			if os.Getenv("XHYS_HANDOFF_DIRECT_TX") == "1" {
+				if os.Getenv("XHYS_HANDOFF_NATIVE_INGRESS") != "1" || os.Getenv("XHYS_HANDOFF_BACKEND") == "go" {
+					t.Fatal("direct transmit requires native ingress and server")
+				}
+				transmit, err = public.File()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer transmit.Close()
+				manifest.UDP[0].TransmitFD = 4
+			}
 			data, _ := json.Marshal(manifest)
 			manifestPath := filepath.Join(directory, "manifest.json")
 			if err := os.WriteFile(manifestPath, data, 0600); err != nil {
@@ -153,6 +184,9 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		command.Stdout, command.Stderr = log, log
 		if file != nil {
 			command.ExtraFiles = []*os.File{file}
+			if transmit != nil {
+				command.ExtraFiles = append(command.ExtraFiles, transmit)
+			}
 		}
 		if err := command.Start(); err != nil {
 			log.Close()

@@ -104,6 +104,8 @@ pub struct Config {
     #[serde(default)]
     pub packet_local: String,
     #[serde(default)]
+    pub packet_transmit_fd: i32,
+    #[serde(default)]
     pub quic_generation: Option<crate::generation_cid::Config>,
     pub diagnostic: bool,
     #[serde(default)]
@@ -1027,6 +1029,31 @@ enum NetworkSocket {
     Packet(UnixDatagram),
 }
 
+// Only the packet view receives datagrams. The UDP descriptor is exposed to
+// this endpoint's send path, never its receive poller.
+#[derive(Debug)]
+struct SplitPacketSocket {
+    receive: Arc<PacketSocket>,
+    send: Arc<dyn AsyncUdpSocket>,
+}
+
+impl AsyncUdpSocket for SplitPacketSocket {
+    fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn quinn::UdpPoller>> {
+        self.send.clone().create_io_poller()
+    }
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        self.send.try_send(transmit)
+    }
+    fn poll_recv(&self, cx: &mut std::task::Context<'_>, buffers: &mut [std::io::IoSliceMut<'_>],
+        metadata: &mut [quinn::udp::RecvMeta]) -> std::task::Poll<io::Result<usize>> {
+        self.receive.poll_recv(cx, buffers, metadata)
+    }
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> { self.receive.local_addr() }
+    fn max_transmit_segments(&self) -> usize { self.send.max_transmit_segments() }
+    fn max_receive_segments(&self) -> usize { self.receive.max_receive_segments() }
+    fn may_fragment(&self) -> bool { false }
+}
+
 fn network_socket(config: &Config, descriptor: i32) -> Result<NetworkSocket> {
     let descriptor = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 0) };
     if descriptor < 0 {
@@ -1081,17 +1108,36 @@ fn endpoint(config: &Config, socket: NetworkSocket) -> Result<quinn::Endpoint> {
     let runtime = Arc::new(quinn::TokioRuntime);
     let udp: Arc<dyn AsyncUdpSocket> = match socket {
         NetworkSocket::Packet(socket) => {
-            if !config.salamander.is_empty()
-                || !config.udp_masks.is_empty()
-                || config.port_hopping.is_some()
-            {
-                return Err("packet bridge masks must be applied by Go".into());
+            if config.port_hopping.is_some() {
+                return Err("packet bridge cannot own port hopping".into());
             }
-            Arc::new(PacketSocket::new(
+            let receive = Arc::new(PacketSocket::new(
                 socket,
                 config.packet_local.parse()?,
                 config.packet_batch,
-            )?)
+            )?);
+            if config.packet_transmit_fd != 0 {
+                if config.packet_transmit_fd < 3 || !config.server || config.quic_generation.is_none() {
+                    return Err("direct packet transmit requires a managed server generation".into());
+                }
+                let NetworkSocket::Udp(socket) = network_socket(&Config::default(), config.packet_transmit_fd)? else {
+                    return Err("direct packet transmit needs a public UDP socket".into());
+                };
+                if socket.local_addr()? != receive.local_addr()? || socket.peer_addr().is_ok() {
+                    return Err("direct packet transmit address does not match ingress".into());
+                }
+                let send: Arc<dyn AsyncUdpSocket> = if !config.udp_masks.is_empty() {
+                    Arc::new(MaskSocket::new(socket, &config.udp_masks)?)
+                } else if !config.salamander.is_empty() {
+                    Arc::new(MaskedSocket::new(socket, config.salamander.as_bytes())?)
+                } else { runtime.wrap_udp_socket(socket)? };
+                Arc::new(SplitPacketSocket { receive, send })
+            } else {
+                if !config.salamander.is_empty() || !config.udp_masks.is_empty() {
+                    return Err("relayed packet bridge masks must be applied by ingress".into());
+                }
+                receive
+            }
         }
         NetworkSocket::Udp(socket) => {
             udp_buffers(&socket, config.server, config.diagnostic);
@@ -2170,6 +2216,7 @@ async fn run(
         let _ = status
             .connections
             .set((capacity.max_connections, capacity.connections.clone()));
+        let _ = status.endpoint.set(ep.clone());
         status.running.store(true, Ordering::Release);
     }
     bus.send(Frame::new(READY, 0, Bytes::new())).await?;
@@ -2320,6 +2367,7 @@ async fn run(
 struct GenerationStatus {
     running: AtomicBool,
     connections: std::sync::OnceLock<(usize, Arc<Semaphore>)>,
+    endpoint: std::sync::OnceLock<quinn::Endpoint>,
 }
 
 struct WatchGeneration(Option<Arc<GenerationStatus>>);
@@ -2542,6 +2590,39 @@ pub unsafe extern "C" fn xhys_engine_generation_connections(engine: *const c_voi
     let live = limit.saturating_sub(permits.available_permits()) as i64;
     if status.running.load(Ordering::Acquire) {
         live
+    } else {
+        -1
+    }
+}
+
+/// Snapshot of connection and application work. It excludes Initials that
+/// Quinn has queued but not accepted yet. This is not a retirement fence.
+///
+/// # Safety
+/// `engine` must be null or a live handle. The caller must exclude engine join.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_engine_generation_work(engine: *const c_void) -> i64 {
+    let Some(engine) = (unsafe { engine.cast::<Engine>().as_ref() }) else {
+        return -1;
+    };
+    let Some(status) = engine.generation.as_ref() else {
+        return -1;
+    };
+    if !status.running.load(Ordering::Acquire) {
+        return -1;
+    }
+    let (Some(endpoint), Some((limit, permits))) =
+        (status.endpoint.get(), status.connections.get())
+    else {
+        return -1;
+    };
+    // Count both endpoint and application work conservatively. A connection
+    // can be counted twice; a zero requires both sources to be empty.
+    let work = endpoint
+        .open_connections()
+        .saturating_add(limit.saturating_sub(permits.available_permits()));
+    if status.running.load(Ordering::Acquire) {
+        work.min(i64::MAX as usize) as i64
     } else {
         -1
     }

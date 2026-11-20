@@ -33,6 +33,13 @@ impl Generator {
         self.cipher.encrypt_block((&mut plain).into());
         ConnectionId::new(&plain)
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn decode(&self, cid: &[u8]) -> Option<u8> {
+        let mut plain: [u8; CID_LENGTH] = cid.try_into().ok()?;
+        self.cipher.decrypt_block((&mut plain).into());
+        (&plain[..5] == FORMAT).then_some(plain[5])
+    }
 }
 
 impl ConnectionIdGenerator for Generator {
