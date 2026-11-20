@@ -40,7 +40,7 @@ func run(args []string) error {
 		return err
 	}
 	if len(flags.Args()) != 1 {
-		return errors.New("use serve, status, or upgrade")
+		return errors.New("use serve, recover, status, or upgrade")
 	}
 	if !filepath.IsAbs(*runtime) || filepath.Clean(*runtime) != *runtime {
 		return errors.New("runtime requires a clean absolute path")
@@ -49,10 +49,10 @@ func run(args []string) error {
 	switch flags.Arg(0) {
 	case "status", "upgrade":
 		return request(*runtime, flags.Arg(0), r)
-	case "serve":
-		return serve(*runtime, *probe, r)
+	case "serve", "recover":
+		return serve(*runtime, *probe, r, flags.Arg(0) == "recover")
 	default:
-		return errors.New("use serve, status, or upgrade")
+		return errors.New("use serve, recover, status, or upgrade")
 	}
 }
 
@@ -80,12 +80,11 @@ func claimRuntime(root string) (*os.File, error) {
 		lock.Close()
 		return nil, err
 	}
-	// The marker intentionally survives shutdown/crash. This pilot does not
-	// yet recover listener ownership or child state after a supervisor loss.
+	// Keep the marker after exit. Only explicit recovery can re-open it.
 	return lock, nil
 }
 
-func serve(root, probe string, r release) error {
+func serve(root, probe string, r release, recovering bool) error {
 	if os.Geteuid() == 0 {
 		return errors.New("run the canary under a dedicated unprivileged service account")
 	}
@@ -96,28 +95,49 @@ func serve(root, probe string, r release) error {
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 		return errors.New("probe is not an executable regular file")
 	}
-	lock, err := claimRuntime(root)
+	claim := claimRuntime
+	if recovering {
+		claim = claimRecovery
+	}
+	lock, err := claim(root)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	s, err := newSupervisor(ctx, root, probe, r)
+	path := filepath.Join(root, "supervisor.sock")
+	if recovering {
+		// The supervisor lock is held. Replace only its obsolete management
+		// socket; never remove a generation control socket or public origin.
+		if info, err := os.Lstat(path); err == nil {
+			if info.Mode().Type() != os.ModeSocket {
+				return errors.New("unexpected file at supervisor socket path")
+			}
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	socket, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		return err
 	}
-	defer s.close()
-	socket, err := net.ListenUnix("unix", &net.UnixAddr{Name: filepath.Join(root, "supervisor.sock"), Net: "unix"})
-	if err != nil {
-		cancel()
-		return err
-	}
+	defer socket.Close()
 	if err := os.Chmod(socket.Addr().String(), 0600); err != nil {
-		socket.Close()
-		cancel()
 		return err
 	}
+	start := newSupervisor
+	if recovering {
+		start = recoverSupervisor
+	}
+	s, err := start(ctx, root, probe, r)
+	if err != nil {
+		return err
+	}
+	defer func() { cancel(); s.close() }()
 	server := &http.Server{
 		Handler: s.handler(), ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: time.Second,

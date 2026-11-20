@@ -23,6 +23,10 @@ type Response struct {
 type UDPConnectionStatus struct {
 	Known bool   `json:"known"`
 	Count uint64 `json:"connections"`
+	// Diagnostic snapshot only; does not include all queued datagrams or
+	// pending Initials. Backends may count the same connection twice.
+	WorkKnown     bool   `json:"work_known,omitempty"`
+	TransportWork uint64 `json:"transport_work,omitempty"`
 }
 
 // ListenControl never replaces an existing socket. The caller must create a
@@ -74,6 +78,10 @@ func serveControl(conn net.Conn, generation *Generation) {
 	input := bufio.NewScanner(conn)
 	input.Buffer(make([]byte, 128), 4096)
 	if !input.Scan() {
+		return
+	}
+	if input.Text() == "export-listeners" {
+		exportControl(conn, generation)
 		return
 	}
 	if input.Text() == "quic-status" {

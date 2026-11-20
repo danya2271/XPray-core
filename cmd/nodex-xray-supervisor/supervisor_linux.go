@@ -33,27 +33,32 @@ type release struct {
 }
 
 type generation struct {
-	id      string
-	dir     string
-	hash    string
-	control handoff.ControlSocket
-	cmd     *exec.Cmd
-	done    chan struct{}
-	waitErr error // Written before done closes.
+	id         string
+	dir        string
+	hash       string
+	configHash string
+	control    handoff.ControlSocket
+	pid        int
+	startTicks uint64
+	signal     func(syscall.Signal) error
+	done       chan struct{}
+	waitErr    error // Written before done closes.
 }
 
 type generationStatus struct {
-	ID      string `json:"id"`
-	PID     int    `json:"pid"`
-	SHA256  string `json:"sha256"`
-	Running bool   `json:"running"`
+	ID           string `json:"id"`
+	PID          int    `json:"pid"`
+	SHA256       string `json:"sha256"`
+	ConfigSHA256 string `json:"config_sha256"`
+	StartTicks   uint64 `json:"start_ticks"`
+	Running      bool   `json:"running"`
 }
 
 func (g *generation) status() *generationStatus {
 	if g == nil {
 		return nil
 	}
-	return &generationStatus{ID: g.id, PID: g.cmd.Process.Pid, SHA256: g.hash, Running: g.running()}
+	return &generationStatus{ID: g.id, PID: g.pid, SHA256: g.hash, ConfigSHA256: g.configHash, StartTicks: g.startTicks, Running: g.running()}
 }
 
 func (g *generation) running() bool {
@@ -67,12 +72,12 @@ func (g *generation) running() bool {
 
 func (g *generation) stop() {
 	if g.running() {
-		_ = g.cmd.Process.Signal(syscall.SIGTERM)
+		_ = g.signal(syscall.SIGTERM)
 	}
 	select {
 	case <-g.done:
 	case <-time.After(3 * time.Second):
-		_ = g.cmd.Process.Kill()
+		_ = g.signal(syscall.SIGKILL)
 		<-g.done
 	}
 }
@@ -80,6 +85,7 @@ func (g *generation) stop() {
 type supervisor struct {
 	ctx            context.Context
 	root, probe    string
+	boot           string
 	bindings       []binding
 	listeners      []listener
 	xhttp          bool
@@ -92,6 +98,8 @@ type supervisor struct {
 
 type status struct {
 	Phase     string            `json:"phase"`
+	Sequence  uint64            `json:"sequence"`
+	BootID    string            `json:"boot_id"`
 	Active    *generationStatus `json:"last_confirmed_active,omitempty"`
 	Other     *generationStatus `json:"other,omitempty"`
 	Uncertain bool              `json:"admission_uncertain,omitempty"`
@@ -109,7 +117,8 @@ func (s *supervisor) status() status {
 }
 
 func (s *supervisor) snapshot(phase string) status {
-	return status{phase, s.active.status(), s.other.status(), phase == "switching" || phase == "admission-unknown", s.lastErr}
+	return status{Phase: phase, Sequence: s.seq, BootID: s.boot, Active: s.active.status(), Other: s.other.status(),
+		Uncertain: phase == "switching" || phase == "admission-unknown", Error: s.lastErr}
 }
 
 func (s *supervisor) record(phase string, active, other *generation, err error) error {
@@ -186,7 +195,11 @@ func newSupervisor(ctx context.Context, root, probe string, r release) (*supervi
 	if err != nil {
 		return nil, err
 	}
-	s := &supervisor{ctx: ctx, root: root, probe: probe, bindings: bindings, phase: "starting"}
+	boot, err := bootID()
+	if err != nil {
+		return nil, err
+	}
+	s := &supervisor{ctx: ctx, root: root, probe: probe, bindings: bindings, boot: boot, phase: "starting"}
 	for _, b := range bindings {
 		l, err := listen(b)
 		if err != nil {
@@ -220,8 +233,10 @@ func newSupervisor(ctx context.Context, root, probe string, r release) (*supervi
 }
 
 func (s *supervisor) start(ctx context.Context, r release, config []byte) (*generation, error) {
+	s.mu.Lock()
 	s.seq++ // Only the bootstrap or a single admitted upgrade can call start.
 	id := "g" + strconv.FormatUint(s.seq, 10)
+	s.mu.Unlock()
 	dir := filepath.Join(s.root, id)
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return nil, err
@@ -271,11 +286,18 @@ func (s *supervisor) start(ctx context.Context, r release, config []byte) (*gene
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	g := &generation{id: id, dir: dir, hash: hash, cmd: cmd, control: handoff.ControlSocket(manifest.Control), done: make(chan struct{})}
+	g := &generation{id: id, dir: dir, hash: hash, configHash: configDigest(config),
+		pid: cmd.Process.Pid, signal: func(sig syscall.Signal) error { return cmd.Process.Signal(sig) },
+		control: handoff.ControlSocket(manifest.Control), done: make(chan struct{})}
 	go func() {
 		g.waitErr = cmd.Wait()
 		close(g.done)
 	}()
+	g.startTicks, err = processStart(g.pid)
+	if err != nil {
+		g.stop()
+		return nil, err
+	}
 	ready := time.NewTicker(25 * time.Millisecond)
 	defer ready.Stop()
 	for {
@@ -293,6 +315,8 @@ func (s *supervisor) start(ctx context.Context, r release, config []byte) (*gene
 		}
 	}
 }
+
+func configDigest(config []byte) string { return fmt.Sprintf("%x", sha256.Sum256(config)) }
 
 func snapshotBinary(source, destination string) (string, error) {
 	src, err := os.Open(source)
@@ -337,7 +361,7 @@ func (s *supervisor) verify(ctx context.Context, g *generation) error {
 	// and verify candidate identity (see the operator contract in the docs).
 	cmd := exec.CommandContext(ctx, s.probe, g.id)
 	cmd.Env = append(os.Environ(),
-		"NODEX_CANDIDATE_PID="+strconv.Itoa(g.cmd.Process.Pid),
+		"NODEX_CANDIDATE_PID="+strconv.Itoa(g.pid),
 		"NODEX_CANDIDATE_SHA256="+g.hash)
 	cmd.WaitDelay = time.Second
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
@@ -355,6 +379,12 @@ func (s *supervisor) upgrade(r release) error {
 	}
 	old := s.active
 	s.phase, s.lastErr = "starting", ""
+	// A replacement supervisor must not read a stable journal while this
+	// operation is already starting a second process.
+	if err := saveState(s.root, s.snapshot(s.phase)); err != nil {
+		s.phase, s.lastErr = "blocked", "could not persist upgrade start: "+err.Error()
+		return err
+	}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()

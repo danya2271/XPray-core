@@ -12,9 +12,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -203,11 +205,13 @@ func TestCandidateProbe(t *testing.T) {
 	stream := grpcStream(t, ctx, os.Getenv("NODEX_TEST_GRPC"))
 	grpcPulse(t, stream, marker, 'p')
 	stream.CloseSend()
-	client := unixClient(t, os.Getenv("NODEX_TEST_XHTTP"))
-	down := xhttpRequest(t, ctx, client, "probe-"+id, "", 0)
-	xhttpPulse(t, ctx, client, down, "probe-"+id, "0", marker, 'q')
-	down.Body.Close()
-	if id == "g2" {
+	if path := os.Getenv("NODEX_TEST_XHTTP"); path != "" {
+		client := unixClient(t, path)
+		down := xhttpRequest(t, ctx, client, "probe-"+id, "", 0)
+		xhttpPulse(t, ctx, client, down, "probe-"+id, "0", marker, 'q')
+		down.Body.Close()
+	}
+	if id == "g2" && os.Getenv("NODEX_TEST_GATE") != "" {
 		if err := os.WriteFile(os.Getenv("NODEX_TEST_GATE")+".ready", nil, 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -219,6 +223,147 @@ func TestCandidateProbe(t *testing.T) {
 		}
 		t.Fatal("test did not release probe")
 	}
+}
+
+func TestSupervisorSubprocess(t *testing.T) {
+	args := os.Getenv("NODEX_TEST_SUPERVISOR_ARGS")
+	if args == "" {
+		t.Skip("supervisor subprocess only")
+	}
+	var argv []string
+	if err := json.Unmarshal([]byte(args), &argv); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(argv); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverAfterSupervisorCrash(t *testing.T) {
+	binary := os.Getenv("XRAY_TEST_GENERATION_BINARY")
+	if binary == "" || os.Geteuid() == 0 {
+		t.Skip("requires a managed Xray build and an unprivileged service account")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 35*time.Second)
+	defer cancel()
+	root := socketRoot(t)
+	runtime := filepath.Join(root, "run")
+	public, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, port := public.Addr().String(), public.Addr().(*net.TCPAddr).Port
+	public.Close()
+	t.Setenv("NODEX_TEST_GRPC", address)
+	t.Setenv("NODEX_TEST_XHTTP", "")
+	t.Setenv("NODEX_TEST_GATE", "")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NODEX_TEST_EXEC", executable)
+	probe := filepath.Join(root, "probe")
+	if err := os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestCandidateProbe$'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	makeConfig := func(marker byte) string {
+		out := backend(t, marker)
+		config := fmt.Sprintf(`{"inbounds":[{"tag":"grpc","listen":"127.0.0.1","port":%d,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":%d,"network":"tcp"},"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"canary"}}}],"outbounds":[{"protocol":"freedom"}]}`, port, out)
+		path := filepath.Join(root, "config-"+string(marker)+".json")
+		if err := os.WriteFile(path, []byte(config), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	a, b := makeConfig('A'), makeConfig('B')
+	spawn := func(action, config string) *exec.Cmd {
+		t.Helper()
+		args, _ := json.Marshal([]string{"-runtime", runtime, "-binary", binary, "-config", config, "-probe", probe, action})
+		cmd := exec.Command(executable, "-test.run", "^TestSupervisorSubprocess$")
+		cmd.Env = append(os.Environ(), "NODEX_TEST_SUPERVISOR_ARGS="+string(args))
+		cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if cmd.ProcessState == nil {
+				_ = cmd.Process.Signal(syscall.SIGTERM)
+				_ = cmd.Wait()
+			}
+		})
+		return cmd
+	}
+	client := &http.Client{Timeout: time.Second, Transport: &http.Transport{DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", filepath.Join(runtime, "supervisor.sock"))
+		}}}
+	wait := func(phase, id string) status {
+		t.Helper()
+		deadline := time.Now().Add(12 * time.Second)
+		var state status
+		for time.Now().Before(deadline) {
+			res, err := client.Get("http://nodex.local/status")
+			if err == nil {
+				state = status{}
+				err = json.NewDecoder(res.Body).Decode(&state)
+				res.Body.Close()
+				if err == nil && state.Phase == phase && state.Active != nil && state.Active.ID == id {
+					return state
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("did not reach %s/%s: %+v", phase, id, state)
+		return status{}
+	}
+	first := spawn("serve", a)
+	before := wait("active", "g1")
+	oldCtx, endOld := context.WithCancel(ctx)
+	defer endOld()
+	stream := grpcStream(t, oldCtx, address)
+	grpcPulse(t, stream, 'A', '0')
+	if err := first.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Wait(); err == nil {
+		t.Fatal("supervisor was not killed")
+	}
+	// If a later assertion fails before recovery, do not leak the test Xray.
+	orphaned := true
+	t.Cleanup(func() {
+		if orphaned {
+			if g, err := adopt(context.Background(), runtime, *before.Active); err == nil {
+				g.stop()
+			}
+		}
+	})
+	grpcPulse(t, stream, 'A', '1')
+	wrong := spawn("recover", b)
+	if err := wrong.Wait(); err == nil {
+		t.Fatal("recovered using the wrong config")
+	}
+	grpcPulse(t, stream, 'A', '2')
+	spawn("recover", a)
+	after := wait("active", "g1")
+	orphaned = false
+	if *before.Active != *after.Active {
+		t.Fatalf("recovery replaced the active process: before=%+v after=%+v", *before.Active, *after.Active)
+	}
+	grpcPulse(t, stream, 'A', '3')
+	data, _ := json.Marshal(release{binary, b})
+	response, err := client.Post("http://nodex.local/upgrade", "application/json", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("recovered supervisor refused upgrade: %s", response.Status)
+	}
+	wait("draining", "g2")
+	grpcPulse(t, stream, 'A', '4')
+	grpcPulse(t, grpcStream(t, ctx, address), 'B', '5')
+	endOld()
+	wait("active", "g2")
 }
 
 func TestSupervisorRealGenerations(t *testing.T) {
