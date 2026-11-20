@@ -210,6 +210,9 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		}
 		command := exec.Command(os.Getenv("XHYS_HANDOFF_SERVER_BINARY"), arguments...)
 		command.Env = append(os.Environ(), "XRAY_HYSTERIA_NATIVE=0", "XRAY_NET_DIAG=0")
+		if os.Getenv("XHYS_HANDOFF_DIAGNOSTIC") == "1" {
+			command.Env = append(command.Env, "XRAY_NET_DIAG=1")
+		}
 		if os.Getenv("XHYS_HANDOFF_BACKEND") != "go" {
 			command.Env = append(command.Env, "XRAY_HYSTERIA_NATIVE=1")
 		}
@@ -218,6 +221,9 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 			t.Fatal(err)
 		}
 		command.Stdout, command.Stderr = log, log
+		if os.Getenv("XHYS_HANDOFF_DIAGNOSTIC") == "1" {
+			command.Stdout, command.Stderr = io.MultiWriter(log, os.Stderr), io.MultiWriter(log, os.Stderr)
+		}
 		if file != nil {
 			command.ExtraFiles = inherited
 		}
@@ -553,6 +559,9 @@ func newHandoffLoadFixture(t testing.TB) *handoffLoadFixture {
 			t.Errorf("handoff fixture failed to stop: %v", <-stopped)
 		}
 		cancel()
+		if t.Failed() || os.Getenv("XHYS_HANDOFF_DIAGNOSTIC") == "1" {
+			t.Logf("handoff server diagnostics: %s", diagnostics.String())
+		}
 	})
 	fixture := &handoffLoadFixture{input: input, decoder: json.NewDecoder(output), output: output}
 	if err := fixture.decoder.Decode(&fixture.info); err != nil {
@@ -620,7 +629,11 @@ func benchmarkHandoffLoad(b *testing.B, size int) {
 	}
 	benchAfterDrain := os.Getenv("XHYS_HANDOFF_BENCH_AFTER_DRAIN") == "1" || os.Getenv("XHYS_HANDOFF_BENCH_AFTER_RETIRE") == "1"
 	benchNewGeneration := os.Getenv("XHYS_HANDOFF_BENCH_NEW_GENERATION") == "1" || benchAfterDrain
-	benchSwitch := os.Getenv("XHYS_HANDOFF_BENCH_SWITCH") == "1" || benchNewGeneration
+	benchMixed := os.Getenv("XHYS_HANDOFF_BENCH_MIXED_GENERATIONS") == "1"
+	if benchMixed && benchNewGeneration {
+		b.Fatal("mixed overlap cannot also replace/drain the previous client")
+	}
+	benchSwitch := os.Getenv("XHYS_HANDOFF_BENCH_SWITCH") == "1" || benchNewGeneration || benchMixed
 	if benchSwitch {
 		if os.Getenv("XHYS_HANDOFF_MODE") != "managed" {
 			b.Fatal("benchmark switch requires managed mode")
@@ -633,6 +646,13 @@ func benchmarkHandoffLoad(b *testing.B, size int) {
 			for index := range connections {
 				connections[index].Close()
 				connections[index] = benchmarkDial(b, client, target)
+				connections[index].SetDeadline(time.Now().Add(90 * time.Second))
+				benchmarkExchange(b, connections[index], make([]byte, size), make([]byte, size))
+			}
+		} else if benchMixed {
+			for index := len(connections) / 2; index < len(connections); index++ {
+				connections[index].Close()
+				connections[index] = benchmarkDial(b, nextClient, target)
 				connections[index].SetDeadline(time.Now().Add(90 * time.Second))
 				benchmarkExchange(b, connections[index], make([]byte, size), make([]byte, size))
 			}

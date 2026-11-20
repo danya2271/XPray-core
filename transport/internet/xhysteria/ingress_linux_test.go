@@ -145,6 +145,7 @@ func TestNativeIngressStalledGenerationDoesNotBlockActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer public.Close()
+	TunePacketSocket(public, true, false)
 	key := [16]byte{9, 4, 2}
 	ingress, err := NewNativeIngress(public, key, 0, nil)
 	if err != nil {
@@ -156,6 +157,11 @@ func TestNativeIngressStalledGenerationDoesNotBlockActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stalled.Close()
+	oldView, err := handoff.ImportPacketEndpoint(stalled, *public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldView.Close()
 	healthy, err := ingress.Add(1)
 	if err != nil {
 		t.Fatal(err)
@@ -175,20 +181,40 @@ func TestNativeIngressStalledGenerationDoesNotBlockActivation(t *testing.T) {
 	old[0] = 0x40
 	cid := handoff.NewQUICCIDCodec(key).Generate(0)
 	copy(old[1:], cid[:])
-	deadline := time.Now().Add(3 * time.Second)
-	for ingress.Stats().QueueDrops == 0 {
-		for range 256 {
-			if _, err := client.Write(old); err != nil {
-				t.Fatal(err)
-			}
+	const packets = 768
+	for sequence := range packets {
+		binary.BigEndian.PutUint32(old[24:28], uint32(sequence))
+		if _, err := client.Write(old); err != nil {
+			t.Fatal(err)
 		}
+		if sequence%32 == 31 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for ingress.Stats().QueuedBytes == 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("could not saturate stalled generation: %+v", ingress.Stats())
+			t.Fatal("stalled receiver never created backpressure")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if err := ingress.Activate(1); err != nil {
 		t.Fatal(err)
+	}
+	stats := ingress.Stats()
+	if !stats.Running || stats.QueuedBytes == 0 || stats.PeakQueuedBytes > 512*1024 || stats.Backpressure == 0 || stats.QueueDrops != 0 || ingress.Dropped() != 0 {
+		t.Fatalf("unexpected bounded queue state: %+v", stats)
+	}
+	if err := oldView.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var buffer [2048]byte
+	for sequence := range packets {
+		n, _, err := oldView.ReadFrom(buffer[:])
+		binary.BigEndian.PutUint32(old[24:28], uint32(sequence))
+		if err != nil || !bytes.Equal(buffer[:n], old) {
+			t.Fatalf("old packet lost/reordered after backpressure at %d: %d, %v", sequence, n, err)
+		}
 	}
 	initial := make([]byte, 1200)
 	initial[0], initial[4], initial[5] = 0xc0, 1, 10
@@ -197,14 +223,12 @@ func TestNativeIngressStalledGenerationDoesNotBlockActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	view.SetReadDeadline(time.Now().Add(time.Second))
-	var buffer [2048]byte
 	n, _, err := view.ReadFrom(buffer[:])
 	if err != nil || !bytes.Equal(initial, buffer[:n]) {
 		t.Fatalf("healthy generation blocked by stalled worker: %d, %v", n, err)
 	}
-	stats := ingress.Stats()
-	if !stats.Running || stats.QueuedBytes == 0 || stats.PeakQueuedBytes > 512*1024 || stats.Backpressure == 0 {
-		t.Fatalf("unexpected bounded queue state: %+v", stats)
+	if ingress.Dropped() != 0 {
+		t.Fatalf("ingress dropped packets after receiver resumed: %+v", ingress.Stats())
 	}
 }
 

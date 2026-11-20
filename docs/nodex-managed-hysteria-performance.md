@@ -1,6 +1,146 @@
 # Managed Hysteria performance investigation
 
-## Loss accounting and rejected direct-RX experiment, November 20, 2026
+## Lossless backpressure fixes and qualification, November 20, 2026
+
+Two independently reproduced loss mechanisms are fixed:
+
+* Native ingress previously consumed public datagrams after both the ring and
+  its bounded queue filled, discarding the unqueued tail. It now reports which
+  original packets were accepted and retains the rest in the **existing** RX
+  buffers. Admission is captured at receive time; GRO segments and per-peer
+  ordering survive retries. Fence, retirement and public-RX release cannot
+  overtake a held batch. Other generation groups in that batch can progress.
+* Go ingress previously discarded a datagram when the private Unix send returned
+  `EAGAIN`. The normal nonblocking fast path remains; on backpressure it retains
+  that datagram and retries through Go's netpoll. Admission changes do not wait
+  for the write, but the receive fence does. Closing ingress interrupts the
+  pending write.
+
+The stronger application UDP test also exposed loss **without managed ingress**:
+native direct delivered 1998/2000 replies, with exactly two
+`credit_dropped_total` events and zero QUIC receive/send, relay and public-socket
+drops. Native's Rust-to-Go bridge waited only 2 ms for flow credit and then
+silently discarded the application datagram. It now waits for returned credit
+or flow closure on both client/server and shared/socket bridges. The existing
+bounded flow windows are unchanged; closing a flow wakes the pending acquire.
+
+No ring, private queue, public socket buffer or flow window is enlarged by these
+fixes. No retry timer, application retransmission or per-datagram goroutine is
+added. Hard send errors and kernel overflow remain real losses and are counted;
+zero queue drops alone is **not** an acceptance criterion.
+
+### Completed local checks
+
+The measured binary includes both ingress fixes and the native credit fix.
+Server/generation/echo CPU sets were `0` / `0-3`; client was `8-15`, with native
+client pool size four. Masks were Salamander plus WireGuard header. The public
+managed socket used the existing native buffer policy, not a larger test-only
+buffer. All TCP background flows exchanged 64 KiB in both directions.
+
+* **12/12** nonpaced application UDP checks: three runs each for native ring
+  and Go Unix ingress, on one/four server cores. Every run delivered
+  **6000/6000** distinct 1200-byte replies, with zero relay and public-socket
+  drops. There were 32 continuous unpaced TCP background flows, and an
+  eight-packet UDP response window, without sleep pacing or retransmission.
+  A's UDP flow stayed open before/after cutover; B used a separate client.
+* **4/4** paced UDP checks: both server backends, one/four cores, each
+  **2000/2000** replies and zero relay/public-socket drops.
+* **18/18** long strict TCP checks: three runs for native direct, native mixed
+  A+B and Go mixed A+B, on each core count, 32768 exchanges per run. Every
+  completed run reported zero relay and public-socket drops. Mixed means
+  sixteen TCP flows remain on A and sixteen use B, rather than replacing A.
+* Native Unix ingress without shared ring/direct TX also passed one-core
+  nonpaced **6000/6000** and paced **2000/2000** checks with zero counted drops.
+* Go `-race` handoff/supervisor/Hysteria suites and 121 Rust engine unit tests
+  passed; engine Clippy passed with warnings denied.
+  The native-tagged Go `-race` suite also passed, including xhysteria's
+  stalled-consumer fixture. That fixture now verifies delivery and order of all
+  768 retained datagrams after receiver resumption instead of expecting drops
+  as a signal that the queue is full.
+* Real supervisor lifecycle tests passed for Go and native: two consecutive
+  updates, retained A/B streams, natural drain, direct-RX reacquisition on
+  native, SIGKILL of the supervisor during switching/draining, successful
+  recovery and failed-probe rollback. The persistent broker stayed alive.
+  These do **not** test recovery after killing the broker.
+* Drain under **continuous saturated B traffic** passed on one/four cores:
+  32 live B TCP flows continued while A remained open through the ingress
+  fence, then closed naturally. Both runs reached verified drain and returned
+  B to direct RX without reconnecting B or reporting relay/kernel drops
+  (47210 / 123684 completed exchanges respectively). The test additionally
+  requires at least 128 exchanges after the receive transfer.
+* After the final rebuild, one additional nonpaced UDP run for each
+  backend/core-count combination again delivered **6000/6000**, with zero relay
+  and public-socket drops. TCP/REALITY supervisor generation/probe tests passed.
+
+Long TCP medians from the completed three-round matrix:
+
+| Server cores | Variant | Duplex MB/s | Exchange p99, ms |
+| --- | --- | ---: | ---: |
+| 1 | Native direct | 235.93 | 32.177 |
+| 1 | Native mixed A+B | 227.89 | 35.062 |
+| 1 | Go mixed A+B | 121.61 | 75.589 |
+| 4 | Native direct | 641.60 | 10.582 |
+| 4 | Native mixed A+B | 709.47 | 12.346 |
+| 4 | Go mixed A+B | 320.59 | 29.451 |
+
+The one-core native overlap median is about 3.4% below direct, not zero
+overhead. Mixed uses two generation processes and two client QUIC pools;
+the four-core throughput difference cannot be attributed to relay efficiency
+alone. Lifecycle tests ran simultaneously on disjoint CPU sets `16-23`;
+shared cache/memory and local-machine noise remain. This is loopback evidence,
+not WAN, IPv6, arbitrary UDP flood or production qualification.
+
+A separate **ordinary Go direct** one-core control failed the strict kernel
+gate (`public_udp_drops=1032930`, relay drops zero). The masked ordinary Go
+listener and explicitly tuned managed public socket did not share the same
+buffer policy; this is not a valid direct-versus-managed overhead comparison.
+The failure is retained rather than silently counted as a passing TCP test.
+Native application-credit failures from before the fix are also retained.
+
+### Reproduction and limits
+
+Build both the server and interop driver against the same native archive
+(including `--features engine`). Start from a clean environment, using the
+existing native linker-normalization helper when needed:
+
+```sh
+export XHYS_HANDOFF_SERVER_BINARY=/path/to/xray-native
+export XHYS_HANDOFF_SERVER_CPUS=0 XHYS_HANDOFF_SERVER_PROCS=1
+export XHYS_HANDOFF_MODE=managed XHYS_HANDOFF_BACKEND=native
+export XHYS_HANDOFF_TUNE_PUBLIC=1 XHYS_HANDOFF_REQUIRE_NO_DROPS=1
+export XHYS_HANDOFF_PACKET_BATCH=1 XHYS_HANDOFF_NATIVE_INGRESS=1
+export XHYS_HANDOFF_SHARED_RX=1 XHYS_HANDOFF_DIRECT_TX=1 XHYS_HANDOFF_DIRECT_RX=1
+export XRAY_HYSTERIA_NATIVE=1 XRAY_HYSTERIA_CLIENT_WORKERS=4 XRAY_HYSTERIA_POOL_SIZE=4
+taskset -c 8-15 /path/to/interop.test \
+    -test.run '^TestHandoffSaturatedUDP$' -test.cpu 8 -test.count 3 -test.v
+taskset -c 8-15 /path/to/interop.test \
+    -test.run '^TestHandoffDrainUnderSaturatedLoad$' -test.cpu 8 -test.v
+XHYS_HANDOFF_BENCH_MIXED_GENERATIONS=1 taskset -c 8-15 /path/to/interop.test \
+    -test.run '^$' -test.bench '^BenchmarkHandoffServerTransfer$' \
+    -test.benchtime 32768x -test.cpu 8 -test.count 3 -test.v
+```
+
+For four cores use `SERVER_CPUS=0-3`, `SERVER_PROCS=4`. For Go server set
+`BACKEND=go` and unset `PACKET_BATCH`, `NATIVE_INGRESS`, `SHARED_RX`, `DIRECT_TX`
+and `DIRECT_RX` variables (all prefixed `XHYS_HANDOFF_`). For native Unix ingress
+retain `PACKET_BATCH` and `NATIVE_INGRESS` but unset the three ring/direct flags.
+The driver must use `xhysteria_native,xhysteria_interop` build tags. Diagnostic
+mode `XHYS_HANDOFF_DIAGNOSTIC=1` preserves server engine logs.
+
+Backpressure removes deliberate discard of already-read packets, not UDP's
+finite-capacity limits. A permanently stalled receiver can still overflow the
+kernel/QUIC receive buffer under unbounded offered load. Go's sole public reader
+can head-of-line block on a stalled generation; native groups already retained
+in the same batch can progress, but the next batch waits. Native per-connection
+UDP reception can wait on one flow's credit. These tradeoffs are explicit,
+not an infinite zero-loss guarantee or proof of all-mode production readiness.
+
+Raw logs, failed controls and binary hashes are retained locally under
+`build_assets/handoff-lossless-20261120/` in the primary XPray checkout;
+source fixtures and this report are committed. Historical failures below
+describe older builds and are not erased by these results.
+
+## Historical loss accounting and rejected direct-RX experiment, November 20, 2026
 
 The load fixture now snapshots Linux public-socket `sk_drops` and receive queue
 bytes separately from relay drops. It resolves the exact bind and pins its
@@ -41,14 +181,15 @@ not in the production code.** GRO/Initial regression tests are retained.
 Logs: `/tmp/nodex-fast-rx-compare-20261120/`. These are local measurements,
 not proof that managed direct has no overhead or saturated overlap is fixed.
 
-## Current lifecycle and acceptance status, November 20, 2026
+## Historical pre-fix lifecycle and acceptance status, November 20, 2026
 
 The historical experiments below predate the integrated persistent broker,
 safe engine drain and return-to-direct receive lifecycle. Those statements
 about missing lifecycle support describe the old experiment, not today's
 implementation; see `nodex-managed-lifecycle.md`.
 
-The remaining saturated-overlap loss is **not fixed**. The user's completed
+At the time of the measurements in this section, saturated-overlap loss was
+**not fixed**. The user's completed
 Android comparison (three runs, fresh B client, 32 TCP flows, 64 KiB exchanges,
 Salamander/WireGuard header, matched public socket policy) reports:
 
@@ -118,7 +259,7 @@ matrices; it does not establish a managed latency advantage. This is local
 loopback evidence, not WAN or production acceptance. Logs:
 `/tmp/nodex-retired-final-20261120/`.
 
-Production defaults remain unchanged. Performance acceptance still includes
+Production defaults remain unchanged. The historical performance gate included
 saturated overlap with no additional relay drops and controlled post-drain
 direct baselines on one/four cores. Do not increase queues, weaken strict
 loss assertions, or confuse QUIC retransmission with preserving every
