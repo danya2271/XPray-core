@@ -337,7 +337,7 @@ func TestManagedTransmitDescriptorOwnershipAndAddress(t *testing.T) {
 	}
 	inherited := func(socket *net.UDPConn) int {
 		t.Helper()
-		file, err := socket.File()
+		file, err := DuplicatePacketSocket(socket)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -362,6 +362,18 @@ func TestManagedTransmitDescriptorOwnershipAndAddress(t *testing.T) {
 		t.Fatalf("exporting transmit descriptor: %v", err)
 	}
 	duplicate.Close()
+	raw, err := public.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Control(func(fd uintptr) {
+		flags, err := unix.FcntlInt(fd, unix.F_GETFL, 0)
+		if err != nil || flags&unix.O_NONBLOCK == 0 {
+			t.Errorf("export made the live public socket blocking: flags=%d, %v", flags, err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := view.Close(); err != nil {
 		t.Fatal(err)
 	}

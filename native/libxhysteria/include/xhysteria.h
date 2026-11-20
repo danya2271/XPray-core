@@ -58,6 +58,7 @@ void xhys_engine_join(void *engine);
 /* Live accepted QUIC connections, or -1 if untracked/stopped. Exclude join. */
 int64_t xhys_engine_generation_connections(const void *engine);
 int64_t xhys_engine_generation_work(const void *engine);
+int64_t xhys_engine_release_receive(const void *engine, uint8_t *data, uintptr_t capacity);
 /* Experimental Linux packet ingress; not an activation/retirement API. */
 void *xhys_ingress_start(const uint8_t *config_json, uintptr_t length, int32_t udp_fd);
 bool xhys_ingress_add(void *ingress, uint8_t slot, int32_t worker_fd);
@@ -69,6 +70,7 @@ typedef struct {
 bool xhys_ingress_add_ring(void *ingress, uint8_t slot, int32_t worker_fd,
                           XhysPacketRingDescriptors *out);
 bool xhys_ingress_activate(void *ingress, uint8_t slot);
+bool xhys_ingress_adopt_receive(void *ingress, const uint8_t *snapshot, uintptr_t length);
 uint64_t xhys_ingress_dropped(const void *ingress);
 /* Approximate diagnostics, never use as proof that a generation is drained. */
 typedef struct {

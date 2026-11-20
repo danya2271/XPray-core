@@ -90,7 +90,14 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 			if os.Getenv("XHYS_HANDOFF_PACKET_BATCH") != "1" {
 				t.Fatal("native ingress requires segmented-frame-capable generations")
 			}
-			ingress, err = native.NewNativeIngress(public, key, 0, []native.UDPMaskConfig{
+			create := native.NewNativeIngress
+			if os.Getenv("XHYS_HANDOFF_DIRECT_RX") == "1" {
+				if os.Getenv("XHYS_HANDOFF_SHARED_RX") != "1" || os.Getenv("XHYS_HANDOFF_DIRECT_TX") != "1" || os.Getenv("XHYS_HANDOFF_BACKEND") == "go" {
+					t.Fatal("direct receive requires shared RX, direct TX and native server")
+				}
+				create = native.NewDormantNativeIngress
+			}
+			ingress, err = create(public, key, 0, []native.UDPMaskConfig{
 				{Kind: "wireguard"}, {Kind: "salamander", Password: psk},
 			})
 			if err != nil {
@@ -175,11 +182,12 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 			if len(inherited) == 4 {
 				manifest.UDP[0].RingFDs = []int{4, 5, 6}
 			}
+			manifest.UDP[0].DirectReceive = slot == 0 && os.Getenv("XHYS_HANDOFF_DIRECT_RX") == "1"
 			if os.Getenv("XHYS_HANDOFF_DIRECT_TX") == "1" {
 				if os.Getenv("XHYS_HANDOFF_NATIVE_INGRESS") != "1" || os.Getenv("XHYS_HANDOFF_BACKEND") == "go" {
 					t.Fatal("direct transmit requires native ingress and server")
 				}
-				transmit, err = public.File()
+				transmit, err = handoff.DuplicatePacketSocket(public)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -259,6 +267,24 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 				t.Fatal("switch requires one managed generation")
 			}
 			start(1)
+			if os.Getenv("XHYS_HANDOFF_DIRECT_RX") == "1" {
+				target := fmt.Sprintf("release-receive hy:%d", local.Port)
+				released, err := controls[0].Command(t.Context(), target)
+				if err != nil || len(released.Receive) == 0 {
+					t.Fatalf("releasing direct receive owner: %v", err)
+				}
+				retry, err := controls[0].Command(t.Context(), target)
+				if err != nil || !bytes.Equal(released.Receive, retry.Receive) {
+					t.Fatalf("receive release retry changed snapshot: %v", err)
+				}
+				relay := ingress.(*native.NativeIngress)
+				if err := relay.AdoptReceive(released.Receive); err != nil {
+					t.Fatal(err)
+				}
+				if err := relay.AdoptReceive(released.Receive); err != nil {
+					t.Fatalf("receive adoption retry: %v", err)
+				}
+			}
 			if _, err := controls[0].Command(t.Context(), "pause"); err != nil {
 				t.Fatal(err)
 			}

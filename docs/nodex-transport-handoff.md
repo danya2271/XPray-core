@@ -99,6 +99,15 @@ packet path remains the default. See `nodex-managed-hysteria-performance.md`
 for its bounded-memory ownership model and measurements. It does not provide
 a retirement or supervisor-recovery certificate and must not activate updates.
 
+For an explicit native canary, `direct_receive` may give the initial generation
+exclusive public UDP receive ownership while `NewDormantNativeIngress` stays
+unregistered. Private `release-receive TAG:PORT` returns an idempotent snapshot
+bound to the CID key, local socket and slot, including pending Initial routes.
+The caller must deliver it to `AdoptReceive` before switching admission. It is
+private data; never log it or synthesize an ownership acknowledgement. This
+one-way transition keeps existing work alive but does not support reacquiring
+direct RX, safe QUIC retirement, or crash recovery. It remains a test canary.
+
 - A persistent node supervisor must own shared listening sockets and their
   lifetime. It must start both independent Xray processes with separate local
   API endpoints, immutable config and assets, and inherited listener

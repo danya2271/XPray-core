@@ -31,15 +31,16 @@ type UnixBinding struct {
 }
 
 type UDPBinding struct {
-	Tag         string   `json:"tag"`
-	Address     string   `json:"address"`
-	Port        int      `json:"port"`
-	FD          int      `json:"fd"`
-	Key         [16]byte `json:"key"`
-	Slot        byte     `json:"slot"`
-	PacketBatch bool     `json:"packet_batch,omitempty"`
-	TransmitFD  int      `json:"transmit_fd,omitempty"`
-	RingFDs     []int    `json:"ring_fds,omitempty"`
+	Tag           string   `json:"tag"`
+	Address       string   `json:"address"`
+	Port          int      `json:"port"`
+	FD            int      `json:"fd"`
+	Key           [16]byte `json:"key"`
+	Slot          byte     `json:"slot"`
+	PacketBatch   bool     `json:"packet_batch,omitempty"`
+	TransmitFD    int      `json:"transmit_fd,omitempty"`
+	RingFDs       []int    `json:"ring_fds,omitempty"`
+	DirectReceive bool     `json:"direct_receive,omitempty"`
 }
 
 type Manifest struct {
@@ -62,9 +63,10 @@ type binding struct {
 }
 
 type udpBinding struct {
-	spec   UDPBinding
-	packet net.PacketConn
-	status func() UDPConnectionStatus
+	spec           UDPBinding
+	packet         net.PacketConn
+	status         func() UDPConnectionStatus
+	releaseReceive func() ([]byte, error)
 }
 
 // XHTTP participates in the admission transaction in addition to having
@@ -211,6 +213,14 @@ func ImportGeneration(manifest Manifest) (*Generation, error) {
 				return nil, err
 			}
 		}
+		if spec.DirectReceive {
+			if spec.TransmitFD == 0 || len(spec.RingFDs) == 0 {
+				packet.Close()
+				g.Close()
+				return nil, errors.New("direct managed receive requires native transmit and ring descriptors")
+			}
+			setDirectReceive(packet)
+		}
 		g.udp[key] = &udpBinding{spec: spec, packet: packet}
 	}
 	return g, nil
@@ -235,6 +245,32 @@ func (g *Generation) AttachUDP(tag string, port int, address net.IP,
 	}
 	b.status = status
 	return nil
+}
+
+func (g *Generation) AttachUDPReceiveRelease(tag string, port int, release func() ([]byte, error)) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	b := g.udp[bindingKey{tag, port}]
+	if b == nil || b.status == nil || b.releaseReceive != nil || g.state != "starting" {
+		return errors.New("cannot attach managed receive ownership callback")
+	}
+	b.releaseReceive = release
+	return nil
+}
+
+func (g *Generation) ReleaseUDPReceive(target string) (string, []byte, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.state != "active" && g.state != "paused" {
+		return g.state, nil, errors.New("cannot release receive ownership in current generation state")
+	}
+	for key, b := range g.udp {
+		if fmt.Sprintf("%s:%d", key.tag, key.port) == target && b.spec.DirectReceive && b.releaseReceive != nil {
+			data, err := b.releaseReceive()
+			return g.state, data, err
+		}
+	}
+	return g.state, nil, errors.New("no direct native receive owner for requested UDP binding")
 }
 
 func (g *Generation) UDPStatus() (string, map[string]UDPConnectionStatus) {

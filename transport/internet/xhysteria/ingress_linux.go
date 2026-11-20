@@ -15,6 +15,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"golang.org/x/sys/unix"
 )
 
@@ -51,18 +52,29 @@ func (i *NativeIngress) Stats() NativeIngressStats {
 }
 
 func NewNativeIngress(public *net.UDPConn, key [16]byte, slot byte, masks []UDPMaskConfig) (*NativeIngress, error) {
+	return newNativeIngress(public, key, slot, masks, false)
+}
+
+// NewDormantNativeIngress must not read until AdoptReceive confirms that the
+// sole direct native worker has released the same public socket.
+func NewDormantNativeIngress(public *net.UDPConn, key [16]byte, slot byte, masks []UDPMaskConfig) (*NativeIngress, error) {
+	return newNativeIngress(public, key, slot, masks, true)
+}
+
+func newNativeIngress(public *net.UDPConn, key [16]byte, slot byte, masks []UDPMaskConfig, dormant bool) (*NativeIngress, error) {
 	if public == nil {
 		return nil, errors.New("native ingress requires a public UDP socket")
 	}
 	config, err := json.Marshal(struct {
-		Key   [16]byte        `json:"key"`
-		Slot  byte            `json:"slot"`
-		Masks []UDPMaskConfig `json:"masks,omitempty"`
-	}{key, slot, masks})
+		Key     [16]byte        `json:"key"`
+		Slot    byte            `json:"slot"`
+		Masks   []UDPMaskConfig `json:"masks,omitempty"`
+		Dormant bool            `json:"dormant,omitempty"`
+	}{key, slot, masks, dormant})
 	if err != nil {
 		return nil, err
 	}
-	file, err := public.File()
+	file, err := handoff.DuplicatePacketSocket(public)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +84,20 @@ func NewNativeIngress(public *net.UDPConn, key [16]byte, slot byte, masks []UDPM
 		return nil, errors.New("native managed ingress could not start")
 	}
 	return &NativeIngress{handle: handle}, nil
+}
+
+// AdoptReceive requires the idempotent snapshot returned by the direct
+// generation's release-receive command. Callers must never synthesize it.
+func (i *NativeIngress) AdoptReceive(snapshot []byte) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil || len(snapshot) == 0 || len(snapshot) > 512*1024 {
+		return errors.New("invalid native receive ownership snapshot")
+	}
+	if !bool(C.xhys_ingress_adopt_receive(i.handle, (*C.uint8_t)(unsafe.Pointer(&snapshot[0])), C.uintptr_t(len(snapshot)))) {
+		return errors.New("native receive ownership adoption was not acknowledged")
+	}
+	return nil
 }
 
 func (i *NativeIngress) Add(slot byte) (*os.File, error) {
@@ -86,11 +112,13 @@ func (i *NativeIngress) Add(slot byte) (*os.File, error) {
 	}
 	parent, child := os.NewFile(uintptr(fds[0]), "native-ingress"), os.NewFile(uintptr(fds[1]), "native-generation")
 	defer parent.Close()
+	// A lost acknowledgement cannot prove that the receive owner did not add
+	// this slot. Never reuse it after an uncertain attachment.
+	i.used[slot] = true
 	if !bool(C.xhys_ingress_add(i.handle, C.uint8_t(slot), C.int32_t(parent.Fd()))) {
 		child.Close()
 		return nil, errors.New("native ingress could not attach generation")
 	}
-	i.used[slot] = true
 	return child, nil
 }
 

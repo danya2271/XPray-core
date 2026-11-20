@@ -39,6 +39,8 @@ struct Config {
     slot: u8,
     #[serde(default)]
     masks: Vec<mask_socket::Config>,
+    #[serde(default)]
+    dormant: bool,
 }
 
 #[derive(Default)]
@@ -85,6 +87,7 @@ enum Command {
     Add(u8, UnixDatagram, mpsc::SyncSender<bool>),
     AddRing(u8, UnixDatagram, mpsc::SyncSender<Option<[OwnedFd; 3]>>),
     Activate(u8, mpsc::SyncSender<bool>),
+    AdoptReceive(Vec<u8>, mpsc::SyncSender<bool>),
     Stop,
 }
 
@@ -101,6 +104,67 @@ struct Routes {
     current: u8,
     pins: HashMap<(u32, u8, [u8; 20]), (u8, Instant)>,
     next_gc: Instant,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivePin {
+    version: u32,
+    cid: Vec<u8>,
+    remaining_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiveSnapshot {
+    key: [u8; 16],
+    local: SocketAddr,
+    slot: u8,
+    pins: Vec<ReceivePin>,
+}
+
+fn adopt_receive(
+    routes: &mut Routes,
+    live: &[bool; 256],
+    key: [u8; 16],
+    local: SocketAddr,
+    data: &[u8],
+) -> io::Result<()> {
+    let snapshot: ReceiveSnapshot = serde_json::from_slice(data)?;
+    if snapshot.key != key
+        || snapshot.local != local
+        || snapshot.slot != routes.current
+        || !live[snapshot.slot as usize]
+        || snapshot.pins.len() > PIN_LIMIT
+    {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let now = Instant::now();
+    let mut pins = HashMap::new();
+    for pin in snapshot.pins {
+        if !(8..=20).contains(&pin.cid.len())
+            || ![1, 0x6b3343cf].contains(&pin.version)
+            || pin.remaining_ms == 0
+            || pin.remaining_ms > 30001
+            || routes.codec.decode(&pin.cid).is_some()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut cid = [0; 20];
+        cid[..pin.cid.len()].copy_from_slice(&pin.cid);
+        let key = (pin.version, pin.cid.len() as u8, cid);
+        if pins
+            .insert(
+                key,
+                (snapshot.slot, now + Duration::from_millis(pin.remaining_ms)),
+            )
+            .is_some()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+    }
+    routes.pins = pins;
+    Ok(())
 }
 
 impl Routes {
@@ -515,10 +579,24 @@ async fn run(
     ready: mpsc::SyncSender<bool>,
 ) -> io::Result<()> {
     let local = socket.local_addr()?;
-    let public: Arc<dyn AsyncUdpSocket> = if config.masks.is_empty() {
-        quinn::TokioRuntime.wrap_udp_socket(socket)?
+    // Dormant must mean *unregistered*, not just "do not call recv". Registering
+    // the shared UDP descriptor in another reactor still wakes on every burst
+    // received by the direct worker, adding CPU in stable operation.
+    let wrap = |socket| -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        if config.masks.is_empty() {
+            quinn::TokioRuntime.wrap_udp_socket(socket)
+        } else {
+            Ok(Arc::new(mask_socket::MaskSocket::new(
+                socket,
+                &config.masks,
+            )?))
+        }
+    };
+    let mut raw = Some(socket);
+    let mut public = if config.dormant {
+        None
     } else {
-        Arc::new(mask_socket::MaskSocket::new(socket, &config.masks)?)
+        Some(wrap(raw.take().unwrap())?)
     };
     let mut routes = Routes {
         codec: generation_cid::Generator::new(&generation_cid::Config {
@@ -533,6 +611,7 @@ async fn run(
     let mut slots = Vec::new();
     let mut live = [false; 256];
     let mut outputs = JoinSet::new();
+    let mut adopted: Option<Vec<u8>> = None;
     // Quinn's batched I/O may return GRO data. Preserve each segment's CID
     // ownership rather than forwarding an aggregate to one generation.
     let mut storage: Vec<Vec<u8>> = (0..BATCH).map(|_| vec![0; 65536]).collect();
@@ -552,7 +631,9 @@ async fn run(
                             let socket = Arc::new(socket);
                             peers[index] = Some(Peer { socket: socket.clone(), ring: None, queue: VecDeque::new(), bytes: 0 });
                             slots.push(slot); live[index] = true;
-                            outputs.spawn(egress(socket, public.clone(), health.clone()));
+                            if let Some(public) = &public {
+                                outputs.spawn(egress(socket, public.clone(), health.clone()));
+                            }
                             let _ = ack.send(true);
                         }
                         Err(_) => { let _ = ack.send(false); }
@@ -567,21 +648,41 @@ async fn run(
                         let descriptors = ring.export()?;
                         peers[index] = Some(Peer { socket: socket.clone(), ring: Some(ring), queue: VecDeque::new(), bytes: 0 });
                         slots.push(slot); live[index] = true;
-                        outputs.spawn(egress(socket, public.clone(), health.clone()));
+                        if let Some(public) = &public {
+                            outputs.spawn(egress(socket, public.clone(), health.clone()));
+                        }
                         Ok(descriptors)
                     })();
                     let _ = ack.send(result.ok());
                 }
                 Some(Command::Activate(slot, ack)) => {
-                    let healthy = peers[slot as usize].is_some();
+                    let healthy = public.is_some() && peers[slot as usize].is_some();
                     if healthy { routes.current = slot; }
                     let _ = ack.send(healthy);
+                }
+                Some(Command::AdoptReceive(snapshot, ack)) => {
+                    let valid = if public.is_some() {
+                        adopted.as_ref() == Some(&snapshot)
+                    } else {
+                        adopt_receive(&mut routes, &live, config.key, local, &snapshot).is_ok()
+                    };
+                    if valid && public.is_none() {
+                        let socket = match wrap(raw.take().unwrap()) {
+                            Ok(socket) => socket,
+                            Err(_) => { let _ = ack.send(false); break; }
+                        };
+                        for &slot in &slots {
+                            outputs.spawn(egress(peers[slot as usize].as_ref().unwrap().socket.clone(), socket.clone(), health.clone()));
+                        }
+                        public = Some(socket); adopted = Some(snapshot);
+                    }
+                    let _ = ack.send(valid);
                 }
                 _ => break,
             },
             _ = outputs.join_next(), if !outputs.is_empty() => break,
             _ = poll_fn(|cx| poll_pending(&mut peers, &slots, &health, cx)) => {}
-            received = poll_fn(|cx| public.poll_recv(cx, &mut buffers, &mut metadata)) => {
+            received = poll_fn(|cx| public.as_ref().unwrap().poll_recv(cx, &mut buffers, &mut metadata)), if public.is_some() => {
                 let count = received?;
                 let mut pending: [(SocketAddr, &[u8]); BATCH] = [(local, &[]); BATCH];
                 let mut pending_count = 0;
@@ -712,6 +813,30 @@ pub unsafe extern "C" fn xhys_ingress_activate(handle: *mut c_void, slot: u8) ->
 }
 
 /// # Safety
+/// Exclude ingress join. `data` must point to `length` readable snapshot bytes.
+/// Caller must prove the old native process released public RX first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_adopt_receive(
+    handle: *mut c_void,
+    data: *const u8,
+    length: usize,
+) -> bool {
+    if data.is_null() || length > 512 * 1024 {
+        return false;
+    }
+    let Some(ingress) = (unsafe { handle.cast::<Ingress>().as_ref() }) else {
+        return false;
+    };
+    let snapshot = unsafe { std::slice::from_raw_parts(data, length) }.to_vec();
+    let (tx, rx) = mpsc::sync_channel(1);
+    ingress
+        .commands
+        .send(Command::AdoptReceive(snapshot, tx))
+        .is_ok()
+        && rx.recv_timeout(Duration::from_secs(3)).ok() == Some(true)
+}
+
+/// # Safety
 /// `handle` must identify a live ingress and exclude join.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xhys_ingress_dropped(handle: *const c_void) -> u64 {
@@ -816,6 +941,102 @@ pub unsafe extern "C" fn xhys_ingress_join(handle: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_adoption_preserves_pending_initial_routes_after_activation() {
+        let mut routes = Routes {
+            codec: generation_cid::Generator::new(&generation_cid::Config {
+                key: [1; 16],
+                slot: 0,
+            }),
+            current: 0,
+            pins: HashMap::new(),
+            next_gc: Instant::now(),
+        };
+        let mut live = [false; 256];
+        live[0] = true;
+        live[1] = true;
+        let mut initial = vec![0; 1200];
+        initial[0] = 0xc0;
+        initial[4] = 1;
+        initial[5] = 8;
+        initial[6..14].copy_from_slice(b"original");
+        let snapshot = serde_json::to_vec(&serde_json::json!({"key":vec![1u8;16], "local":"127.0.0.1:443", "slot":0, "pins":[{"version":1,"cid":[111,114,105,103,105,110,97,108],"remaining_ms":1000}]})).unwrap();
+        adopt_receive(
+            &mut routes,
+            &live,
+            [1; 16],
+            "127.0.0.1:443".parse().unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        routes.current = 1;
+        assert_eq!(routes.route(&initial, &live), Some(0));
+        initial[6..14].copy_from_slice(b"new-work");
+        assert_eq!(routes.route(&initial, &live), Some(1));
+    }
+
+    #[test]
+    fn receive_adoption_rejects_incomplete_snapshot_without_mutating_routes() {
+        let mut routes = Routes {
+            codec: generation_cid::Generator::new(&generation_cid::Config {
+                key: [1; 16],
+                slot: 0,
+            }),
+            current: 0,
+            pins: HashMap::new(),
+            next_gc: Instant::now(),
+        };
+        let mut live = [false; 256];
+        live[0] = true;
+        for snapshot in [
+            r#"{"slot":1,"pins":[]}"#,
+            r#"{"slot":0,"pins":[{"version":1,"cid":[1],"remaining_ms":1}]}"#,
+            r#"{"slot":0,"pins":[{"version":0,"cid":[1,2,3,4,5,6,7,8],"remaining_ms":1}]}"#,
+            r#"{"slot":0,"pins":[{"version":1,"cid":[1,2,3,4,5,6,7,8],"remaining_ms":30002}]}"#,
+            r#"{"slot":0,"pins":[{"version":1,"cid":[1,2,3,4,5,6,7,8],"remaining_ms":0}]}"#,
+            r#"{"slot":0,"pins":[],"unexpected":true}"#,
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(snapshot).unwrap();
+            value["key"] = serde_json::json!(vec![1u8; 16]);
+            value["local"] = serde_json::json!("127.0.0.1:443");
+            assert!(
+                adopt_receive(
+                    &mut routes,
+                    &live,
+                    [1; 16],
+                    "127.0.0.1:443".parse().unwrap(),
+                    &serde_json::to_vec(&value).unwrap()
+                )
+                .is_err()
+            );
+            assert!(routes.pins.is_empty());
+        }
+        let valid = serde_json::to_vec(
+            &serde_json::json!({"key":vec![1u8;16],"local":"127.0.0.1:443","slot":0,"pins":[]}),
+        )
+        .unwrap();
+        assert!(
+            adopt_receive(
+                &mut routes,
+                &live,
+                [2; 16],
+                "127.0.0.1:443".parse().unwrap(),
+                &valid
+            )
+            .is_err()
+        );
+        assert!(
+            adopt_receive(
+                &mut routes,
+                &live,
+                [1; 16],
+                "127.0.0.1:444".parse().unwrap(),
+                &valid
+            )
+            .is_err()
+        );
+    }
 
     fn peer() -> (Peer, tokio::net::UnixDatagram) {
         let (sender, receiver) = UnixDatagram::pair().unwrap();

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -37,7 +38,11 @@ func (s ControlSocket) Command(ctx context.Context, command string) (Response, e
 	if _, err := fmt.Fprintln(conn, command); err != nil {
 		return response, err
 	}
-	if err := json.NewDecoder(io.LimitReader(conn, 4096)).Decode(&response); err != nil {
+	limit := int64(4096)
+	if strings.HasPrefix(command, "release-receive ") {
+		limit = 512*1024 + 4096
+	}
+	if err := json.NewDecoder(io.LimitReader(conn, limit)).Decode(&response); err != nil {
 		return response, err
 	}
 	if response.Protocol != ProtocolVersion {

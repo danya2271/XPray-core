@@ -180,3 +180,67 @@ ownership, so stable single-generation operation can avoid a permanent relay.
 Do not simply let two processes read the same public socket: pending Initials,
 already-received packets, admission acknowledgement and rollback all need
 fences before that transition can be called seamless.
+
+## Direct receive lease, November 20, 2026
+
+An additional explicit canary path now starts the initial native generation
+with exclusive public receive ownership (`direct_receive` in the manifest).
+It requires a native shared receive ring and inherited direct-transmit socket.
+`NewDormantNativeIngress` retains the public descriptor without registering it
+in a reactor. Merely skipping `recv` on an already registered descriptor was
+not sufficient: readiness events in the idle reactor still cost CPU.
+
+Before enabling the relay, the caller requests `release-receive TAG:PORT` from
+the private generation control socket. Native code excludes an in-progress
+public read, switches future reads to its packet view, wakes Quinn, and returns
+an idempotent snapshot of pending client-chosen Initial/0-RTT routes. The bounded
+pin table rejects new unpinnable handshakes instead of starting untracked work.
+The snapshot is bound to the CID key, local address and generation slot; it is
+private control data and must not be logged or exposed publicly.
+
+`AdoptReceive` validates and installs that snapshot before registering the UDP
+socket and enabling the ingress receive loop. Only then may the caller activate
+the new generation. A lost acknowledgement means uncertain ownership: retain
+both processes and retry the same operation; never synthesize a snapshot or
+kill the old process. There is no automatic ownership recovery after SIGKILL.
+
+The interop fixture exercises this sequence with `XHYS_HANDOFF_DIRECT_RX=1`
+in addition to shared RX, direct TX and native ingress flags. This is a one-way
+direct-to-relay handoff, **not** a complete node updater. The reverse transition
+is intentionally unavailable until old QUIC/handshake/queue retirement can be
+proven. After a switch, persistent relay performance limitations still apply.
+
+Two additional data-path defects were found during this work:
+
+- Exporting `net.Conn.File().Fd()` could clear `O_NONBLOCK` on the shared socket
+  description and leave a live Go ingress blocked in `recvfrom`, including on
+  close. Packet export now uses `F_DUPFD_CLOEXEC` through `SyscallConn.Control`
+  and preserves file status flags. The ownership test verifies this, and ten
+  `handoff -race` suite repetitions completed without the hang.
+- Managed native direct TX unnecessarily forced PMTU discovery off and MTU
+  1200. It now preserves the configured native policy when sending directly;
+  relayed TX keeps the conservative fixed MTU because it lacks public PMTU
+  feedback. The inherited public socket buffer policy is unchanged.
+
+An interleaved three-round matrix after these fixes measured stable operation:
+
+| Variant | MB/s median | TCP p99, ms median | Counted relay drops | Total server CPU, µs/exchange median |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary native | 593.75 | 21.677 | 0 | 673.49 |
+| Managed native, exclusive direct RX | 603.41 | 21.635 | 0 | 668.11 |
+
+Same 32 TCP flows, 64 KiB, 8192 exchanges, server CPUs 0–3 and client CPUs
+8–15. Throughput ranges were 587.11–615.76 and 581.11–609.22 MB/s respectively.
+These overlapping samples support near-direct steady-state performance in this
+fixture, not a claim that managed is faster or zero-overhead on every host.
+Zero relay counters in this mode are expected because the ingress is dormant;
+they do not measure kernel UDP loss. Switching and saturation must be tested
+separately, and the post-switch relay still fails full-load acceptance.
+
+Three direct-to-relay load-switch runs of the same dormant-ingress build passed:
+2000/2000 paced UDP replies each, zero relay drops before and after the switch,
+old/new generations both live, and 127.46–127.68 MiB/s background duplex TCP.
+UDP p99 was 1.398–3.948 ms (not uniformly 1.4 ms); maximum was
+13.852–27.350 ms. Both release and adoption acknowledgements were retried with
+the identical snapshot. These results still do not certify saturated traffic,
+unbounded handshake duration, rollback, reverse ownership or supervisor loss.

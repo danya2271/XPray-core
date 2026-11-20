@@ -30,6 +30,8 @@ mod masquerade;
 mod packet_socket;
 #[cfg(all(feature = "engine", target_os = "linux"))]
 mod packet_ring;
+#[cfg(all(feature = "engine", target_os = "linux"))]
+mod receive_owner;
 #[cfg(all(feature = "engine", any(target_os = "linux", target_os = "android")))]
 mod shared;
 #[cfg(feature = "probe")]
