@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -154,6 +155,9 @@ type Listener struct {
 	pktConn  net.PacketConn
 	tr       *quic.Transport
 	listener *quic.Listener
+	tracked  bool
+	live     atomic.Uint64
+	closed   atomic.Bool
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
@@ -175,6 +179,7 @@ func (l *Listener) handleClient(conn *quic.Conn) {
 }
 
 func (l *Listener) keepAccepting() {
+	defer l.closed.Store(true)
 	for {
 		conn, err := l.listener.Accept(context.Background())
 		if err != nil {
@@ -183,8 +188,20 @@ func (l *Listener) keepAccepting() {
 			}
 			break
 		}
-		go l.handleClient(conn)
+		if !l.tracked {
+			go l.handleClient(conn)
+			continue
+		}
+		l.live.Add(1)
+		go func() {
+			defer l.live.Add(^uint64(0))
+			l.handleClient(conn)
+		}()
 	}
+}
+
+func (l *Listener) GenerationConnections() (uint64, bool) {
+	return l.live.Load(), l.tracked && !l.closed.Load()
 }
 
 func (l *Listener) Addr() net.Addr {
@@ -192,6 +209,7 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
+	l.closed.Store(true)
 	return errors.Combine(l.listener.Close(), l.tr.Close(), l.pktConn.Close())
 }
 
@@ -301,6 +319,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		pktConn:  pktConn,
 		tr:       tr,
 		listener: listener,
+		tracked:  ingress != nil,
 	}
 
 	go l.keepAccepting()

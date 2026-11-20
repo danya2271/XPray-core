@@ -1,14 +1,14 @@
 # NodeX transport handoff
 
 This branch provides transport building blocks and a managed-process pilot
-for gRPC. Normal `xray run` does not enable managed mode. Do not install this
+for gRPC and XHTTP. Normal `xray run` does not enable managed mode. Do not install this
 with the expectation that restarting the service will preserve a session.
 
 | Transport | Building block | Coverage |
 | --- | --- | --- |
 | gRPC | A paused `handoff.TCPListener` imports a duplicate of the same listen socket. `grpc.ServeListener` serves an existing listener and `Drain` waits for its accepted RPCs. | Two actual `xray run` processes are tested over gRPC and gRPC/REALITY on the same TCP port. Existing RPCs survive cutover and a failed-probe rollback on both processes. |
-| XHTTP | `SetHandoffPeer` seals the previous generation against new session IDs. Unknown IDs are resolved through `HandoffHandler`; known local IDs stay on the fast path. Only requests received by the wrong generation go over its private Unix socket. | Path and header IDs, `packet-up` and `stream-up`, uplink-before-downlink, and loss of the owner lookup socket. The transport tests do not exercise a complete REALITY handshake or Nginx cutover. |
-| Hysteria | `ListenGeneration` accepts a demultiplexed packet socket. Go and Rust issue opaque generation-aware QUIC IDs. `QUICRoutes` pins retransmitted Initials and routes established packets by server CID, independent of the peer address. | A live Hysteria stream stays on A while a new connection reaches B on the same UDP port. Tested with Go, Rust, and Salamander. The test demultiplexer is not the production ingress; tests do not exercise port hopping or a rolling process restart. |
+| XHTTP | Managed processes share TCP or Unix listeners without rebinding. `SetHandoffPeer` seals the previous generation against new IDs. Only requests received by the wrong generation go over its private Unix socket. The retiring process counts both unfinished sessions and active or forwarded requests. | Two processes over XHTTP/REALITY and a shared Unix origin. A response forwarded through A keeps it in drain even if B owns that session. Transport tests also cover header IDs, `stream-up`, uplink-before-downlink, and loss of the lookup socket. A mixed roll through production Nginx is not tested here. |
+| Hysteria | `ListenGeneration` accepts a demultiplexed packet socket. Go and Rust issue opaque generation-aware QUIC IDs. `QUICRoutes` pins retransmitted Initials and routes established packets by server CID, independent of the peer address. `GenerationConnections` distinguishes live accepted QUIC connections from streams and distinguishes a stopped engine from a healthy idle one. | A live Hysteria stream stays on A while a new connection reaches B on the same UDP port. Tested with Go, Rust, and Salamander. Closing an old stream does not count its QUIC connection as closed. The test demultiplexer is not production ingress; tests do not exercise port hopping or a rolling process restart. |
 
 ## Managed-process pilot
 
@@ -19,33 +19,40 @@ Xray never rebinds a managed port in a new process:
 ```json
 {
   "control": "/run/xray-pilot/generation-a/control.sock",
-  "tcp": [{"tag": "inbound-vg-443", "port": 443, "fd": 3}]
+  "tcp": [{"tag": "inbound-vg-443", "port": 443, "fd": 3}],
+  "unix": [{"tag": "inbound-vxt-8443", "path": "/dev/shm/xrxh-8443.socket", "fd": 4}]
 }
 ```
 
 The supervisor must create the parent directory (mode `0700`) and configure a
 separate private API port for each generation. The pilot accepts managed gRPC
-TCP inbounds and a regular `api` on loopback. Any other transport or an
-unclaimed binding prevents readiness; Unix, XHTTP and Hysteria cannot be
-activated in managed mode yet.
+TCP inbounds, XHTTP over TCP or Unix stream sockets, and a regular `api` on
+loopback. Other transports (including Hysteria and XHTTP/3) and unclaimed
+bindings prevent readiness. The supervisor owns both the socket file and its
+permissions; disposing of one process cannot unlink the public Unix origin.
 
-The private socket takes one newline-delimited `status`, `pause`, `resume` or
-`drain` command per connection and sends versioned JSON. `handoff.Switch`
+The private socket takes one newline-delimited command per connection and
+sends versioned JSON. Use `handoff.LinkXHTTP` (`link <peer directory>` on
+each) to validate XHTTP peer configuration before changing admission. Then
+`handoff.Switch` (`status`, `pause`, `resume`)
 checks both generations, switches admission, and runs a caller-supplied probe
 that must establish a new session and distinguish B's result from A's.
 On a failed probe the gates switch back without terminating either process.
 If gate ownership cannot be established, both processes are retained and the
 result is `unknown`; it is not reported as a successful rollback. Only after
 a successful switch has been verified and persisted should the caller issue
-`drain`. It is irreversible for gRPC. A process reporting `drained` reached
-gRPC's graceful shutdown completion; `paused` alone is not safe to stop.
+`drain`. It is irreversible. A process reporting `drained` has received
+completion from every managed transport; `paused` alone is not safe to stop.
+For XHTTP, issue `unlink` on the active generation before stopping the old
+one. The API refuses to unlink a peer that hasn't settled. During a failed
+cutover keep both generations while established work survives.
 
 Test with real processes from the checkout:
 
 ```sh
 CGO_ENABLED=0 go build -tags xray_server -o /tmp/xray-generation ./main
 XRAY_TEST_GENERATION_BINARY=/tmp/xray-generation \
-  go test -race -run '^TestManagedXrayProcesses$' ./transport/internet/grpc
+  go test -race -run '^TestManaged(Xray|XHTTP)Processes$' ./transport/internet/{grpc,splithttp}
 ```
 
 ## Before enabling NodeX activation
@@ -54,15 +61,16 @@ XRAY_TEST_GENERATION_BINARY=/tmp/xray-generation \
   lifetime. It must start both independent Xray processes with separate local
   API endpoints, immutable config and assets, and inherited listener
   descriptors (rather than creating competing listeners on the same port).
-- The supervisor must start private peer sockets for every XHTTP inbound,
-  publish an admission change for all inbounds together, and track generation
-  dependencies including forwarded requests on both sides. A public HTTP
-  server must not expose `HandoffHandler`.
+- The supervisor must link, switch, and unlink XHTTP peers as described above.
+  A public HTTP server must not expose `HandoffHandler`.
 - The UDP ingress must process any masks once, preserve addressing information,
   and provide per-generation socket views without closing unrelated generations.
   CID keys and slot identity must survive supervisor reconnects; slots cannot be
   reused until their old CIDs cannot be received. Retiring a generation requires
   accounting for live QUIC connections, not just currently open proxy streams.
+  `GenerationConnections` is necessary but not sufficient: the supervisor
+  must also fence new work and account for encrypted packets still queued
+  for the generation and Initial/handshake work not accepted by the engine yet.
 - Running-binary readiness, user mutation, traffic accounting, update locking,
   job recovery and verified rollback must be coordinated with NodeX. A health
   check or watchdog must not restart the other generation during a drain.

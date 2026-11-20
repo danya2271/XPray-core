@@ -54,6 +54,8 @@ typedef struct {
 void *xhys_engine_start_shared(const uint8_t *config_json, uintptr_t config_len,
                               int32_t udp_fd, XhysSharedView *view);
 void xhys_engine_join(void *engine);
+/* Live accepted QUIC connections, or -1 if untracked/stopped. Exclude join. */
+int64_t xhys_engine_generation_connections(const void *engine);
 void xhys_shared_release(void *owner);
 
 #ifdef __cplusplus

@@ -538,6 +538,10 @@ func (l *nativeListener) Close() error {
 }
 func (l *nativeListener) Addr() stdnet.Addr { return l.addr }
 
+func (l *nativeListener) GenerationConnections() (uint64, bool) {
+	return l.engine.GenerationConnections()
+}
+
 type nativeInbound struct {
 	*native.Conn
 	user *protocol.MemoryUser

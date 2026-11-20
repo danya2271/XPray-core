@@ -1148,12 +1148,7 @@ fn endpoint(config: &Config, socket: NetworkSocket) -> Result<quinn::Endpoint> {
         endpoint_config
             .cid_generator(move || Box::new(crate::generation_cid::Generator::new(&generation)));
     }
-    let mut ep = quinn::Endpoint::new_with_abstract_socket(
-        endpoint_config,
-        server,
-        udp,
-        runtime,
-    )?;
+    let mut ep = quinn::Endpoint::new_with_abstract_socket(endpoint_config, server, udp, runtime)?;
     if !config.server {
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
             .with_safe_default_protocol_versions()?
@@ -2081,7 +2076,13 @@ fn bridge_tasks(
     }
 }
 
-async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Result<()> {
+async fn run(
+    mut config: Config,
+    socket: NetworkSocket,
+    bridge: Bridge,
+    generation: Option<Arc<GenerationStatus>>,
+) -> Result<()> {
+    let _generation = WatchGeneration(generation.clone());
     let masquerade = if config.server {
         Some(Arc::new(masquerade::Prepared::new(
             config.masquerade.take(),
@@ -2162,6 +2163,14 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
             sessions.clone(),
         ));
         client = Some(connection);
+    }
+    if let Some(status) = generation.as_ref()
+        && let Some(capacity) = bus.capacity.as_ref()
+    {
+        let _ = status
+            .connections
+            .set((capacity.max_connections, capacity.connections.clone()));
+        status.running.store(true, Ordering::Release);
     }
     bus.send(Frame::new(READY, 0, Bytes::new())).await?;
     let mut next_session = 1u32;
@@ -2307,8 +2316,25 @@ async fn run(mut config: Config, socket: NetworkSocket, bridge: Bridge) -> Resul
     result
 }
 
+#[derive(Default)]
+struct GenerationStatus {
+    running: AtomicBool,
+    connections: std::sync::OnceLock<(usize, Arc<Semaphore>)>,
+}
+
+struct WatchGeneration(Option<Arc<GenerationStatus>>);
+
+impl Drop for WatchGeneration {
+    fn drop(&mut self) {
+        if let Some(status) = self.0.as_ref() {
+            status.running.store(false, Ordering::Release);
+        }
+    }
+}
+
 pub struct Engine {
     worker: Option<Worker>,
+    generation: Option<Arc<GenerationStatus>>,
     shared: Option<Arc<shared::Bridge>>,
 }
 
@@ -2359,11 +2385,17 @@ pub unsafe extern "C" fn xhys_engine_start(
         let udp = network_socket(&config, udp_fd)?;
         let (go, native) = UnixStream::pair()?;
         native.set_nonblocking(true)?;
+        let generation = config
+            .quic_generation
+            .as_ref()
+            .map(|_| Arc::new(GenerationStatus::default()));
+        let status = generation.clone();
         let worker = start_worker(&config.clone(), async move {
             let bridge = tokio::net::UnixStream::from_std(native).expect("native bridge");
             let duplicate = unsafe { libc::dup(bridge.as_raw_fd()) };
             let diagnostic = config.diagnostic;
-            let result = match tokio::spawn(run(config, udp, Bridge::Socket(bridge))).await {
+            let result = match tokio::spawn(run(config, udp, Bridge::Socket(bridge), status)).await
+            {
                 Ok(result) => result,
                 Err(_) => Err("native engine panicked".into()),
             };
@@ -2391,6 +2423,7 @@ pub unsafe extern "C" fn xhys_engine_start(
         Ok(Engine {
             worker: Some(worker),
             shared: None,
+            generation,
         })
     });
     match result {
@@ -2443,9 +2476,15 @@ pub unsafe extern "C" fn xhys_engine_start_shared(
         let udp = network_socket(&config, udp_fd)?;
         let bridge = shared::Bridge::new()?;
         let owner = bridge.clone();
+        let generation = config
+            .quic_generation
+            .as_ref()
+            .map(|_| Arc::new(GenerationStatus::default()));
+        let status = generation.clone();
         let worker = start_worker(&config.clone(), async move {
             let diagnostic = config.diagnostic;
-            let result = tokio::spawn(run(config, udp, Bridge::Shared(bridge.clone()))).await;
+            let result =
+                tokio::spawn(run(config, udp, Bridge::Shared(bridge.clone()), status)).await;
             if diagnostic && !matches!(result, Ok(Ok(()))) {
                 eprintln!("[XRAY_NET_DIAG][XHYSTERIA] shared worker: {result:?}");
             }
@@ -2473,6 +2512,7 @@ pub unsafe extern "C" fn xhys_engine_start_shared(
         Ok(Engine {
             worker: Some(worker),
             shared: Some(owner),
+            generation,
         })
     });
     match result {
@@ -2482,6 +2522,30 @@ pub unsafe extern "C" fn xhys_engine_start_shared(
 }
 
 use std::os::fd::AsRawFd;
+
+/// # Safety
+/// `engine` must be null or a live handle. The caller must exclude engine join.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_engine_generation_connections(engine: *const c_void) -> i64 {
+    let Some(engine) = (unsafe { engine.cast::<Engine>().as_ref() }) else {
+        return -1;
+    };
+    let Some(status) = engine.generation.as_ref() else {
+        return -1;
+    };
+    if !status.running.load(Ordering::Acquire) {
+        return -1;
+    }
+    let Some((limit, permits)) = status.connections.get() else {
+        return -1;
+    };
+    let live = limit.saturating_sub(permits.available_permits()) as i64;
+    if status.running.load(Ordering::Acquire) {
+        live
+    } else {
+        -1
+    }
+}
 
 /// The caller must close the Go bridge endpoint before joining.
 ///
