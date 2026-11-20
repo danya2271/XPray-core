@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/xtls/xray-core/transport/internet/handoff"
 	"golang.org/x/sys/unix"
@@ -131,10 +132,10 @@ func adopt(ctx context.Context, root string, saved generationStatus, states ...s
 	if g.configHash == "" {
 		return nil, errors.New("missing generation config identity")
 	}
-	if data, err := os.ReadFile(filepath.Join(dir, "config.json")); err == nil && configDigest(data) != g.configHash {
+	if data, err := os.ReadFile(filepath.Join(dir, "config.json")); err != nil {
+		return nil, fmt.Errorf("generation config snapshot unavailable: %w", err)
+	} else if configDigest(data) != g.configHash {
 		return nil, errors.New("generation config snapshot changed")
-	} else if err != nil && !os.IsNotExist(err) {
-		return nil, err
 	}
 	keep = true
 	go func() {
@@ -373,6 +374,7 @@ func (s *supervisor) reconcileRecovery(ctx context.Context, phase string) error 
 	if err != nil {
 		return err
 	}
+	var recoveryErr error
 	if phase == "draining" || phase == "retiring" {
 		if a.State != "active" || !slices.Contains([]string{"paused", "draining", "drained"}, b.State) {
 			return errors.New("drain journal does not match live admission")
@@ -387,10 +389,33 @@ func (s *supervisor) reconcileRecovery(ctx context.Context, phase string) error 
 					return err
 				}
 			}
-			if err := s.verify(ctx, other); err != nil {
-				return err
+			if probeErr := s.verify(ctx, other); probeErr != nil {
+				// B already accepted real work before the crash. Restore new
+				// admission to A, but preserve both generations' established
+				// work and drain B only after verified rollback.
+				rollback, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				verifyPrevious := func(ctx context.Context) error { return s.verify(ctx, active) }
+				var result handoff.SwitchResult
+				var rollbackErr error
+				if s.broker != nil {
+					result, rollbackErr = handoff.SwitchWithIngress(rollback, other.control, active.control, func(usePrevious bool) error {
+						if usePrevious {
+							return s.activateUDP(rollback, active)
+						}
+						return s.activateUDP(rollback, other)
+					}, verifyPrevious)
+				} else {
+					result, rollbackErr = handoff.Switch(rollback, other.control, active.control, verifyPrevious)
+				}
+				cancel()
+				if result.Active != "candidate" || rollbackErr != nil {
+					failure := errors.Join(probeErr, rollbackErr, errors.New("cannot verify previous generation recovery; retaining both"))
+					return errors.Join(failure, s.record("admission-unknown", active, other, failure))
+				}
+				recoveryErr = fmt.Errorf("recovered candidate probe failed; restored previous admission: %w", probeErr)
+			} else {
+				active, other = other, active
 			}
-			active, other = other, active
 		} else if b.State == "paused" && (a.State == "active" || a.State == "paused") {
 			if s.broker != nil {
 				if err := s.adoptUDPReceive(ctx, active); err != nil {
@@ -421,10 +446,10 @@ func (s *supervisor) reconcileRecovery(ctx context.Context, phase string) error 
 			return fmt.Errorf("cannot reconcile admission: %s/%s", a.State, b.State)
 		}
 	}
-	if err := s.record("draining", active, other, nil); err != nil {
+	if err := s.record("draining", active, other, recoveryErr); err != nil {
 		return err
 	}
 	s.wg.Add(1)
-	go func() { defer s.wg.Done(); s.retire(active, other, nil) }()
+	go func() { defer s.wg.Done(); s.retire(active, other, recoveryErr) }()
 	return nil
 }

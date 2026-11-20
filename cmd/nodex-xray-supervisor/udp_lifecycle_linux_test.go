@@ -158,6 +158,41 @@ func TestHysteriaCandidateProbe(t *testing.T) {
 	connection, stop := hysteriaTunnel(t, t.Context(), config.Binary, config.Root, config.Port)
 	defer stop()
 	hysteriaPulse(t, connection, marker, 'p')
+	if gate := os.Getenv("NODEX_TEST_HY_SWITCH_GATE"); id == "g2" && gate != "" {
+		if _, err := os.Stat(gate + ".fail"); err == nil {
+			t.Fatal("injected candidate failure after supervisor crash")
+		}
+	}
+	if gate := os.Getenv("NODEX_TEST_HY_SWITCH_GATE"); id == "g2" && gate != "" {
+		if _, err := os.Stat(gate); err == nil {
+			if err := os.WriteFile(gate+".ready", nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.NewTimer(15 * time.Second)
+			defer deadline.Stop()
+			for {
+				if _, err := os.Stat(gate); os.IsNotExist(err) {
+					break
+				}
+				select {
+				case <-deadline.C:
+					t.Fatal("switch probe gate was not released")
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+		}
+	}
+}
+
+func TestSupervisorHysteriaSwitchRecovery(t *testing.T) {
+	t.Setenv("NODEX_TEST_CRASH_DURING_SWITCH", "1")
+	TestSupervisorHysteriaGenerations(t)
+}
+
+func TestSupervisorHysteriaSwitchRecoveryRollback(t *testing.T) {
+	t.Setenv("NODEX_TEST_CRASH_DURING_SWITCH", "1")
+	t.Setenv("NODEX_TEST_RECOVERY_PROBE_FAILURE", "1")
+	TestSupervisorHysteriaGenerations(t)
 }
 
 func TestSupervisorHysteriaGenerations(t *testing.T) {
@@ -229,6 +264,14 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			t.Setenv("NODEX_TEST_HY_PROBE", metaPath)
 			executable, _ := os.Executable()
 			t.Setenv("NODEX_TEST_EXEC", executable)
+			switchGate := filepath.Join(root, "switch-gate")
+			switchCrash := os.Getenv("NODEX_TEST_CRASH_DURING_SWITCH") == "1"
+			if switchCrash {
+				if err := os.WriteFile(switchGate, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("NODEX_TEST_HY_SWITCH_GATE", switchGate)
+			}
 			probe := filepath.Join(root, "probe")
 			os.WriteFile(probe, []byte("#!/bin/sh\nNODEX_TEST_PROBE_ID=\"$1\" exec \"$NODEX_TEST_EXEC\" -test.run '^TestHysteriaCandidateProbe$'\n"), 0700)
 			if publicProbe := os.Getenv("NODEX_TEST_PUBLIC_PROBE"); publicProbe != "" {
@@ -297,7 +340,25 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			if response.StatusCode != http.StatusAccepted {
 				t.Fatalf("upgrade: %s", response.Status)
 			}
-			before := wait("draining")
+			var before status
+			if switchCrash {
+				for {
+					if _, err := os.Stat(switchGate + ".ready"); err == nil {
+						break
+					}
+					select {
+					case <-ctx.Done():
+						t.Fatal("candidate probe did not reach the switch gate")
+					case <-time.After(10 * time.Millisecond):
+					}
+				}
+				before = wait("switching")
+				if !before.Uncertain || before.Active.ID != "g1" || before.Other.ID != "g2" {
+					t.Fatalf("test did not interrupt uncommitted admission: %+v", before)
+				}
+			} else {
+				before = wait("draining")
+			}
 			next, stopNext := hysteriaTunnel(t, ctx, binary, root, port)
 			defer stopNext()
 			hysteriaPulse(t, old, 'A', 'b')
@@ -308,13 +369,40 @@ func TestSupervisorHysteriaGenerations(t *testing.T) {
 			first.Wait()
 			hysteriaPulse(t, old, 'A', 'x')
 			hysteriaPulse(t, next, 'B', 'y')
+			if switchCrash {
+				if err := os.Remove(switchGate); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rollbackRecovery := switchCrash && os.Getenv("NODEX_TEST_RECOVERY_PROBE_FAILURE") == "1"
+			if rollbackRecovery {
+				if err := os.WriteFile(switchGate+".fail", nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			spawn("recover", b.Config)
 			after := wait("draining")
-			if before.Active.PID != after.Active.PID || before.Other.PID != after.Other.PID || before.Broker.PID != after.Broker.PID {
+			previousActive, previousOther := before.Active.PID, before.Other.PID
+			if switchCrash && !rollbackRecovery {
+				previousActive, previousOther = previousOther, previousActive
+			}
+			if previousActive != after.Active.PID || previousOther != after.Other.PID || before.Broker.PID != after.Broker.PID {
 				t.Fatalf("recovery replaced UDP ownership: before=%+v after=%+v", before, after)
 			}
 			hysteriaPulse(t, old, 'A', 'z')
 			hysteriaPulse(t, next, 'B', 'w')
+			if rollbackRecovery {
+				if !strings.Contains(after.Error, "restored previous admission") || after.Active.ID != "g1" || after.Other.ID != "g2" {
+					t.Fatalf("recovery did not report verified rollback: %+v", after)
+				}
+				fresh, stopFresh := hysteriaTunnel(t, ctx, binary, root, port)
+				hysteriaPulse(t, fresh, 'A', 'r')
+				stopFresh()
+				stopNext()
+				wait("active")
+				hysteriaPulse(t, old, 'A', 's')
+				return
+			}
 			stopOld()
 			for state().Phase != "active" {
 				current := state()
