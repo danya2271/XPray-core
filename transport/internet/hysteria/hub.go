@@ -304,6 +304,9 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	var pktConn net.PacketConn
 	ingress := generationFromContext(ctx)
 	if ingress != nil {
+		if export, ok := ingress.packet.(interface{ RingFiles() [3]*os.File }); ok && export.RingFiles()[0] != nil {
+			return nil, errors.New("managed packet ring is supported by native Hysteria only")
+		}
 		if export, ok := ingress.packet.(interface{ TransmitFile() (*os.File, error) }); ok {
 			file, err := export.TransmitFile()
 			if err != nil {

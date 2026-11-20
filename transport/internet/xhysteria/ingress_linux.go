@@ -94,6 +94,32 @@ func (i *NativeIngress) Add(slot byte) (*os.File, error) {
 	return child, nil
 }
 
+// AddRing exports a native-only bounded receive ring and a Unix reply channel.
+// Files are returned in worker, memfd, readable-eventfd, writable-eventfd order.
+func (i *NativeIngress) AddRing(slot byte) ([]*os.File, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.handle == nil || i.used[slot] {
+		return nil, errors.New("native managed generation slot unavailable")
+	}
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	parent, child := os.NewFile(uintptr(fds[0]), "native-ingress"), os.NewFile(uintptr(fds[1]), "native-generation")
+	defer parent.Close()
+	var ring C.XhysPacketRingDescriptors
+	// Reserve even if acknowledgement times out: that is uncertain admission,
+	// not permission to reuse the same slot.
+	i.used[slot] = true
+	if !bool(C.xhys_ingress_add_ring(i.handle, C.uint8_t(slot), C.int32_t(parent.Fd()), &ring)) {
+		child.Close()
+		return nil, errors.New("native ring attachment was not acknowledged")
+	}
+	return []*os.File{child, os.NewFile(uintptr(ring.file), "native-packet-ring"),
+		os.NewFile(uintptr(ring.wake), "native-ring-readable"), os.NewFile(uintptr(ring.space), "native-ring-writable")}, nil
+}
+
 func (i *NativeIngress) Activate(slot byte) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()

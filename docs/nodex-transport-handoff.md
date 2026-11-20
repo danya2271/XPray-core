@@ -93,6 +93,12 @@ unshare -Urn sh -c 'ip link set lo up && go test -race -run "^TestManagedHysteri
 
 ## Before enabling NodeX activation
 
+The Linux native ingress also has an explicit experimental shared receive ring
+(`ring_fds` in a batch-enabled manifest). It is native-only; the compatible Unix
+packet path remains the default. See `nodex-managed-hysteria-performance.md`
+for its bounded-memory ownership model and measurements. It does not provide
+a retirement or supervisor-recovery certificate and must not activate updates.
+
 - A persistent node supervisor must own shared listening sockets and their
   lifetime. It must start both independent Xray processes with separate local
   API endpoints, immutable config and assets, and inherited listener

@@ -2,7 +2,7 @@
 //! Control changes are acknowledged by the sole receive owner, between batches.
 //! This module does not certify QUIC retirement or implement crash recovery.
 
-use crate::{generation_cid, mask_socket, packet_socket};
+use crate::{generation_cid, mask_socket, packet_ring, packet_socket};
 use quinn::{AsyncUdpSocket, Runtime, udp};
 use serde::Deserialize;
 use std::{
@@ -83,6 +83,7 @@ pub struct IngressStats {
 
 enum Command {
     Add(u8, UnixDatagram, mpsc::SyncSender<bool>),
+    AddRing(u8, UnixDatagram, mpsc::SyncSender<Option<[OwnedFd; 3]>>),
     Activate(u8, mpsc::SyncSender<bool>),
     Stop,
 }
@@ -159,12 +160,15 @@ impl Routes {
     }
 }
 
-fn frame_shape(packets: &[(SocketAddr, &[u8])]) -> io::Result<(usize, [u8; HEADER])> {
+fn frame_shape(
+    packets: &[(SocketAddr, &[u8])],
+    max_segments: usize,
+) -> io::Result<(usize, [u8; HEADER])> {
     let (address, payload) = packets[0];
     let stride = payload.len();
     let mut count = 1;
     let mut length = stride;
-    while count < 8 && count < packets.len() {
+    while count < max_segments && count < packets.len() {
         let (peer, next) = packets[count];
         if peer != address || next.len() > stride || length + next.len() > 65535 {
             break;
@@ -222,7 +226,7 @@ fn forward(
     let mut frames = 0;
     let mut segments = [0; BATCH];
     while index < packets.len() {
-        let (count, header) = frame_shape(&packets[index..])?;
+        let (count, header) = frame_shape(&packets[index..], 8)?;
         headers[frames] = header;
         vectors[frames][0] = libc::iovec {
             iov_base: headers[frames].as_mut_ptr().cast(),
@@ -252,14 +256,32 @@ struct QueuedFrame {
 
 struct Peer {
     socket: Arc<tokio::net::UnixDatagram>,
+    ring: Option<packet_ring::Sender>,
     queue: VecDeque<QueuedFrame>,
     bytes: usize,
 }
 
 impl Peer {
+    fn try_forward(&mut self, packets: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+        let Some(ring) = self.ring.as_mut() else {
+            return forward(&self.socket, packets);
+        };
+        let mut batch = ring.batch();
+        let mut sent = 0;
+        while sent < packets.len() {
+            let (count, header) = frame_shape(&packets[sent..], 32)?;
+            match batch.push(&header, &packets[sent..sent + count]) {
+                Ok(()) => sent += count,
+                Err(_) if sent != 0 => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(sent)
+    }
+
     fn forward(&mut self, packets: &[(SocketAddr, &[u8])], health: &Health) {
         let sent = if self.queue.is_empty() {
-            match forward(&self.socket, packets) {
+            match self.try_forward(packets) {
                 Ok(sent) => sent,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
                 Err(_) => {
@@ -277,7 +299,9 @@ impl Peer {
             .fetch_add(pending.len() as u64, Ordering::Relaxed);
         let mut index = 0;
         while index < pending.len() {
-            let Ok((count, header)) = frame_shape(&pending[index..]) else {
+            let Ok((count, header)) =
+                frame_shape(&pending[index..], if self.ring.is_some() { 32 } else { 8 })
+            else {
                 health.drop_send(pending.len() - index);
                 break;
             };
@@ -313,6 +337,20 @@ impl Peer {
     }
 
     fn flush(&mut self, health: &Health) -> io::Result<()> {
+        if let Some(ring) = self.ring.as_mut() {
+            let mut sent = 0;
+            let mut batch = ring.batch();
+            for frame in self.queue.iter().take(BATCH) {
+                match batch.push_wire(&frame.wire) {
+                    Ok(()) => sent += 1,
+                    Err(_) if sent != 0 => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            drop(batch);
+            self.release_frames(sent, health);
+            return Ok(());
+        }
         let mut vectors: [libc::iovec; BATCH] = unsafe { std::mem::zeroed() };
         let mut messages: [libc::mmsghdr; BATCH] = unsafe { std::mem::zeroed() };
         let count = self.queue.len().min(BATCH);
@@ -326,6 +364,11 @@ impl Peer {
         }
         // No queue mutation occurs until the borrowed frame pointers are dead.
         let sent = send_messages(&self.socket, &mut messages[..count])?;
+        self.release_frames(sent, health);
+        Ok(())
+    }
+
+    fn release_frames(&mut self, sent: usize, health: &Health) {
         let mut packets = 0;
         let mut bytes = 0;
         for _ in 0..sent {
@@ -340,7 +383,14 @@ impl Peer {
         health
             .forwarded
             .fetch_add(packets as u64, Ordering::Relaxed);
-        Ok(())
+    }
+
+    fn poll_writable(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(ring) = &self.ring {
+            ring.poll_writable(cx)
+        } else {
+            self.socket.poll_send_ready(cx)
+        }
     }
 
     fn discard(&mut self, health: &Health) {
@@ -368,12 +418,12 @@ fn poll_pending(
         if peer.queue.is_empty() {
             continue;
         }
-        match peer.socket.poll_send_ready(cx) {
+        match peer.poll_writable(cx) {
             Poll::Ready(Ok(())) => match peer.flush(health) {
                 Ok(()) => progress = true,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     // try_io cleared readiness. Register the waiter again.
-                    if peer.socket.poll_send_ready(cx).is_ready() {
+                    if peer.poll_writable(cx).is_ready() {
                         cx.waker().wake_by_ref();
                     }
                 }
@@ -492,6 +542,7 @@ async fn run(
     let _ = ready.send(true);
     loop {
         tokio::select! {
+            biased;
             command = commands.recv() => match command {
                 Some(Command::Add(slot, socket, ack)) => {
                     let index = slot as usize;
@@ -499,13 +550,27 @@ async fn run(
                     match tokio::net::UnixDatagram::from_std(socket) {
                         Ok(socket) => {
                             let socket = Arc::new(socket);
-                            peers[index] = Some(Peer { socket: socket.clone(), queue: VecDeque::new(), bytes: 0 });
+                            peers[index] = Some(Peer { socket: socket.clone(), ring: None, queue: VecDeque::new(), bytes: 0 });
                             slots.push(slot); live[index] = true;
                             outputs.spawn(egress(socket, public.clone(), health.clone()));
                             let _ = ack.send(true);
                         }
                         Err(_) => { let _ = ack.send(false); }
                     }
+                }
+                Some(Command::AddRing(slot, socket, ack)) => {
+                    let index = slot as usize;
+                    if peers[index].is_some() { let _ = ack.send(None); continue; }
+                    let result = (|| -> io::Result<_> {
+                        let socket = Arc::new(tokio::net::UnixDatagram::from_std(socket)?);
+                        let ring = packet_ring::Sender::new()?;
+                        let descriptors = ring.export()?;
+                        peers[index] = Some(Peer { socket: socket.clone(), ring: Some(ring), queue: VecDeque::new(), bytes: 0 });
+                        slots.push(slot); live[index] = true;
+                        outputs.spawn(egress(socket, public.clone(), health.clone()));
+                        Ok(descriptors)
+                    })();
+                    let _ = ack.send(result.ok());
                 }
                 Some(Command::Activate(slot, ack)) => {
                     let healthy = peers[slot as usize].is_some();
@@ -514,6 +579,8 @@ async fn run(
                 }
                 _ => break,
             },
+            _ = outputs.join_next(), if !outputs.is_empty() => break,
+            _ = poll_fn(|cx| poll_pending(&mut peers, &slots, &health, cx)) => {}
             received = poll_fn(|cx| public.poll_recv(cx, &mut buffers, &mut metadata)) => {
                 let count = received?;
                 let mut pending: [(SocketAddr, &[u8]); BATCH] = [(local, &[]); BATCH];
@@ -541,8 +608,6 @@ async fn run(
                     peers[pending_slot as usize].as_mut().unwrap().forward(&pending[..pending_count], &health);
                 }
             }
-            _ = poll_fn(|cx| poll_pending(&mut peers, &slots, &health, cx)) => {}
-            _ = outputs.join_next(), if !outputs.is_empty() => break,
         }
     }
     outputs.abort_all();
@@ -587,8 +652,7 @@ pub unsafe extern "C" fn xhys_ingress_start(
     let Ok(worker) = std::thread::Builder::new()
         .name("xhys-ingress".into())
         .spawn(move || {
-            if let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+            if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
@@ -653,6 +717,57 @@ pub unsafe extern "C" fn xhys_ingress_activate(handle: *mut c_void, slot: u8) ->
 pub unsafe extern "C" fn xhys_ingress_dropped(handle: *const c_void) -> u64 {
     unsafe { handle.cast::<Ingress>().as_ref() }
         .map_or(0, |i| i.health.drops.load(Ordering::Relaxed))
+}
+
+#[repr(C)]
+pub struct RingDescriptors {
+    file: i32,
+    wake: i32,
+    space: i32,
+}
+
+/// # Safety
+/// Exclude ingress join. `out` must be writable; returned descriptors belong
+/// to the caller. A missing acknowledgement leaves ownership uncertain.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xhys_ingress_add_ring(
+    handle: *mut c_void,
+    slot: u8,
+    descriptor: i32,
+    out: *mut RingDescriptors,
+) -> bool {
+    use std::os::fd::IntoRawFd;
+    let Some(ingress) = (unsafe { handle.cast::<Ingress>().as_ref() }) else {
+        return false;
+    };
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return false;
+    };
+    let fd = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return false;
+    }
+    let socket = UnixDatagram::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if socket.peer_addr().is_err() || socket.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    if ingress
+        .commands
+        .send(Command::AddRing(slot, socket, tx))
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(Some([file, wake, space])) = rx.recv_timeout(Duration::from_secs(3)) else {
+        return false;
+    };
+    *out = RingDescriptors {
+        file: file.into_raw_fd(),
+        wake: wake.into_raw_fd(),
+        space: space.into_raw_fd(),
+    };
+    true
 }
 
 /// # Safety
@@ -722,6 +837,7 @@ mod tests {
         (
             Peer {
                 socket: Arc::new(tokio::net::UnixDatagram::from_std(sender).unwrap()),
+                ring: None,
                 queue: VecDeque::new(),
                 bytes: 0,
             },

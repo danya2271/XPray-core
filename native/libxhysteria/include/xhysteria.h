@@ -61,6 +61,13 @@ int64_t xhys_engine_generation_work(const void *engine);
 /* Experimental Linux packet ingress; not an activation/retirement API. */
 void *xhys_ingress_start(const uint8_t *config_json, uintptr_t length, int32_t udp_fd);
 bool xhys_ingress_add(void *ingress, uint8_t slot, int32_t worker_fd);
+typedef struct {
+    int32_t file;
+    int32_t wake;
+    int32_t space;
+} XhysPacketRingDescriptors;
+bool xhys_ingress_add_ring(void *ingress, uint8_t slot, int32_t worker_fd,
+                          XhysPacketRingDescriptors *out);
 bool xhys_ingress_activate(void *ingress, uint8_t slot);
 uint64_t xhys_ingress_dropped(const void *ingress);
 /* Approximate diagnostics, never use as proof that a generation is drained. */

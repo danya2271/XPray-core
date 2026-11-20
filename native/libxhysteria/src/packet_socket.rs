@@ -19,6 +19,8 @@ pub struct PacketSocket {
     socket: Arc<tokio::net::UnixDatagram>,
     local: SocketAddr,
     batch: bool,
+    #[cfg(target_os = "linux")]
+    ring: Option<std::sync::Mutex<crate::packet_ring::Receiver>>,
 }
 
 impl PacketSocket {
@@ -27,7 +29,18 @@ impl PacketSocket {
             socket: Arc::new(tokio::net::UnixDatagram::from_std(socket)?),
             local,
             batch,
+            #[cfg(target_os = "linux")]
+            ring: None,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_ring(mut self, descriptors: [i32; 3]) -> io::Result<Self> {
+        let [file, wake, space] = descriptors;
+        self.ring = Some(std::sync::Mutex::new(crate::packet_ring::Receiver::import(
+            file, wake, space,
+        )?));
+        Ok(self)
     }
 }
 
@@ -115,10 +128,19 @@ fn send_frame(
     }
 }
 
-fn parse_frame(
+pub(crate) fn parse_frame(
     header: &mut [u8; HEADER],
     length: usize,
     batch: bool,
+) -> Option<(SocketAddr, usize)> {
+    parse_frame_limit(header, length, batch, MAX_BATCH)
+}
+
+pub(crate) fn parse_frame_limit(
+    header: &mut [u8; HEADER],
+    length: usize,
+    batch: bool,
+    max_segments: usize,
 ) -> Option<(SocketAddr, usize)> {
     if length == 0 || length > MAX_PACKET {
         return None;
@@ -127,7 +149,7 @@ fn parse_frame(
         let stride = u16::from_be_bytes(header[20..22].try_into().unwrap()) as usize;
         if stride == 0
             || stride > length
-            || length.div_ceil(stride) > MAX_BATCH
+            || length.div_ceil(stride) > max_segments
             || u16::from_be_bytes(header[22..24].try_into().unwrap()) as usize != length
         {
             return None;
@@ -312,6 +334,13 @@ impl AsyncUdpSocket for PacketSocket {
                 "empty packet receive batch",
             )));
         }
+        #[cfg(target_os = "linux")]
+        if let Some(ring) = &self.ring {
+            return ring
+                .lock()
+                .map_err(|_| io::Error::other("packet ring receive lock poisoned"))?
+                .poll_recv(context, buffers, metadata, self.local);
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let mut received = 0;
@@ -406,6 +435,10 @@ impl AsyncUdpSocket for PacketSocket {
         if self.batch { MAX_BATCH } else { 1 }
     }
     fn max_receive_segments(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        if self.ring.is_some() {
+            return 32;
+        }
         if self.batch { MAX_BATCH } else { 1 }
     }
     fn may_fragment(&self) -> bool {

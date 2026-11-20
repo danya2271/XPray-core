@@ -26,6 +26,14 @@ The worktree adds explicit, opt-in experiments, not production activation:
   Only the ingress receives from that descriptor. Its bound address must match
   the ingress; an unsupported backend or mask configuration is rejected. The
   default remains relay egress, and ordinary native startup remains unchanged.
+- Optional `ring_fds` passes a sealed memfd and two nonblocking eventfds to a
+  Linux native generation. `NativeIngress.AddRing` creates a fixed SPSC receive
+  ring (32 frames, approximately 2 MiB mapped capacity) instead of Unix packet
+  sends. Frames may contain up to 32 equal-stride datagrams with a short last
+  segment; the Unix format retains its limit of eight. Data is copied into the
+  ring and then into Quinn buffers, **not** advertised as zero-copy. Publication
+  and wakeups are coalesced per ready batch, with no fill timer. Go QUIC rejects
+  this manifest; omitted `ring_fds` retains the compatible Unix path.
 
 The native relay now retries transient Unix socket backpressure with a separate
 bounded queue per generation (512 KiB and 256 frames). The healthy fast path
@@ -129,3 +137,46 @@ CPU, then its median. Retry improves tail latency and reduces drops, but the
 full-load queue reaches its bound. All remaining counted drops in that matrix
 are queue overflow, not Unix send errors. Do not enlarge queues and call this
 fixed; managed throughput still trails direct by about 18%.
+
+## Shared receive ring, November 20, 2026
+
+The ring avoids the per-frame Unix `sendmmsg`/`recvmmsg` data path. It validates
+the sealed size, header ABI, distinct eventfd descriptors and one-shot consumer
+claim. Atomic indices protect each slot; tests exercise full/empty transitions,
+wraparound, malformed and short frames, 32 segment boundaries, partial batch
+publication, duplicate consumer rejection, and wakeup on peer closure.
+The ingress uses one runtime thread and drains ready worker queues before
+reading another public batch, while prioritizing control commands.
+
+The final interleaved three-round matrix (same CPUs, flows and exchange count)
+produced the following medians:
+
+| Variant | MB/s | TCP p99, ms | Relay drops | Total server CPU, µs/exchange |
+| --- | ---: | ---: | ---: | ---: |
+| Direct native | 607.22 | 20.456 | 0 | 670.35 |
+| Shared RX + direct TX | 544.10 | 32.765 | 99 | 737.29 |
+
+The full-load ring variant still drops 99–140 datagrams per run when the
+fallback queue fills. It remains about 10% below direct throughput and about
+10% above direct CPU cost per exchange; TCP tail latency is not acceptable.
+This is progress over the original relay, **not** release acceptance.
+Do not compare these sequential local matrices as though they were one
+simultaneous controlled benchmark or substitute them for the user's baseline.
+
+Three load-switch tests of the verified ring build each received 2000/2000 UDP
+replies with zero relay drops, old/new QUIC generations alive, and
+127.51–127.61 MiB/s background TCP. UDP p99 was 1.287–1.335 ms. The fallback
+queue was unused in those tests. This does not erase the saturation failure.
+
+Add `XHYS_HANDOFF_SHARED_RX=1` to the reproduction environment to use the ring.
+It requires the native ingress, batch capability and native server; direct TX
+is independent. There is no production supervisor or TUI activation for it.
+An ordinary receiver close wakes the sender, but SIGKILL and supervisor
+reconnect still need an explicit persistent ownership protocol. A ring head/
+tail snapshot is not proof that Quinn handshakes or sessions have drained.
+
+Further throughput work should establish safe exclusive public UDP receive
+ownership, so stable single-generation operation can avoid a permanent relay.
+Do not simply let two processes read the same public socket: pending Initials,
+already-received packets, admission acknowledgement and rollback all need
+fences before that transition can be called seamless.

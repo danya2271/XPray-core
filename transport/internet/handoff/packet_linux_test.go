@@ -4,13 +4,98 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestManagedPacketRingManifestOptIn(t *testing.T) {
+	raw, err := json.Marshal(UDPBinding{Tag: "hy", Port: 443, FD: 3})
+	if err != nil || bytes.Contains(raw, []byte("ring_fds")) {
+		t.Fatalf("legacy manifest unexpectedly requires packet rings: %s, %v", raw, err)
+	}
+	raw, err = json.Marshal(UDPBinding{Tag: "hy", Port: 443, FD: 3, RingFDs: []int{4, 5, 6}})
+	if err != nil || !bytes.Contains(raw, []byte(`"ring_fds":[4,5,6]`)) {
+		t.Fatalf("explicit packet ring descriptors not serialized: %s, %v", raw, err)
+	}
+}
+
+func TestManagedPacketRingDescriptorsAndOwnership(t *testing.T) {
+	const size = 192 + 32*65600
+	for _, kind := range []string{"valid", "unsealed", "wrong-event", "blocking-event"} {
+		t.Run(kind, func(t *testing.T) {
+			fds := [3]int{}
+			var err error
+			fds[0], err = unix.MemfdCreate("packet-ring-test", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := unix.Ftruncate(fds[0], size); err != nil {
+				t.Fatal(err)
+			}
+			if kind != "unsealed" {
+				if _, err := unix.FcntlInt(uintptr(fds[0]), unix.F_ADD_SEALS, unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_SEAL); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for index := 1; index < 3; index++ {
+				flags := unix.EFD_NONBLOCK | unix.EFD_CLOEXEC
+				if kind == "blocking-event" && index == 2 {
+					flags = unix.EFD_CLOEXEC
+				}
+				fds[index], err = unix.Eventfd(0, flags)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if kind == "wrong-event" {
+				unix.Close(fds[2])
+				fds[2], err = unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			worker, peer, err := packetPair()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			defer worker.Close()
+			endpoint, err := ImportPacketEndpoint(worker, net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 443})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = attachPacketRing(endpoint, fds)
+			if (err == nil) != (kind == "valid") {
+				t.Fatalf("descriptor validation: %v", err)
+			}
+			for index, file := range endpoint.RingFiles() {
+				if file == nil || int(file.Fd()) != fds[index] {
+					t.Fatal("endpoint lost descriptor ownership")
+				}
+			}
+			endpoint.Close()
+			for _, fd := range fds {
+				if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+					t.Fatalf("ring descriptor was not closed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func packetPair() (*os.File, *os.File, error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(fds[0]), "packet-worker-test"), os.NewFile(uintptr(fds[1]), "packet-relay-test"), nil
+}
 
 func TestManagedPacketBatchPreservesDatagrams(t *testing.T) {
 	public, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
