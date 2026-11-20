@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"time"
 )
 
@@ -52,6 +53,15 @@ type SwitchResult struct {
 	// Active is "candidate", "previous", or "unknown" (retain both).
 	Active     string
 	RolledBack bool
+}
+
+// LinkXHTTP prepares both directions without changing either admission gate.
+// A second call with the same paths is harmless, including after a lost ACK.
+func LinkXHTTP(ctx context.Context, previous, candidate ControlSocket) error {
+	if err := expect(ctx, candidate, "link "+filepath.Dir(string(previous)), "paused"); err != nil {
+		return fmt.Errorf("link candidate to previous XHTTP generation: %w", err)
+	}
+	return expect(ctx, previous, "link "+filepath.Dir(string(candidate)), "active")
 }
 
 // Switch verifies both readiness states, pauses A, resumes B, and probes the

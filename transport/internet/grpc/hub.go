@@ -50,8 +50,9 @@ func (l Listener) Close() error {
 // Drain sends GOAWAY and waits for existing RPCs to end on their own. Only
 // call it after the replacement can serve new connections. Close remains the
 // immediate shutdown path, e.g. if systemd is stopping the entire service.
-func (l *Listener) Drain() {
+func (l *Listener) Drain() error {
 	l.s.GracefulStop()
+	return nil
 }
 
 func (l Listener) Addr() net.Addr {

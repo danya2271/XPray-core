@@ -9,11 +9,17 @@ import (
 	"time"
 )
 
-// TCPListener gates Accept without modifying the underlying TCP listen queue.
+type gatedSocket interface {
+	net.Listener
+	File() (*os.File, error)
+	SetDeadline(time.Time) error
+}
+
+// TCPListener gates Accept without modifying the underlying listen queue.
 // Each generation owns its own Go listener (and poller) for the same socket.
 // Accepted connections are returned unchanged; the gate is not a TCP proxy.
 type TCPListener struct {
-	socket *net.TCPListener
+	socket gatedSocket
 	change sync.Mutex
 	mu     sync.Mutex
 	state  *sync.Cond
@@ -23,9 +29,33 @@ type TCPListener struct {
 }
 
 func NewTCPListener(socket *net.TCPListener, active bool) *TCPListener {
+	return newGatedListener(socket, active)
+}
+
+func newGatedListener(socket gatedSocket, active bool) *TCPListener {
 	l := &TCPListener{socket: socket, active: active}
 	l.state = sync.NewCond(&l.mu)
 	return l
+}
+
+// ImportUnixListener leaves the socket path owned by the supervisor, not by
+// either generation. No additional local forwarding hop is introduced.
+func ImportUnixListener(file *os.File) (*TCPListener, error) {
+	l, err := net.FileListener(file)
+	if err != nil {
+		return nil, err
+	}
+	socket, ok := l.(*net.UnixListener)
+	if !ok || l.Addr().Network() != "unix" {
+		l.Close()
+		return nil, errors.New("handoff descriptor is not a Unix stream listener")
+	}
+	socket.SetUnlinkOnClose(false)
+	if err := validateListeningSocket(socket); err != nil {
+		socket.Close()
+		return nil, err
+	}
+	return newGatedListener(socket, false), nil
 }
 
 // ImportTCPListener duplicates the passed listener descriptor. It does not
@@ -65,7 +95,7 @@ func (l *TCPListener) Accept() (net.Conn, error) {
 		}
 		l.accept++
 		l.mu.Unlock()
-		conn, err := l.socket.AcceptTCP()
+		conn, err := l.socket.Accept()
 		l.mu.Lock()
 		l.accept--
 		l.state.Broadcast()

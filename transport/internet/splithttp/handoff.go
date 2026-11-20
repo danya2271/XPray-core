@@ -13,6 +13,9 @@ import (
 
 const (
 	handoffLookup = "XRAY-SESSION-OWNER"
+	handoffStatus = "XRAY-SESSION-STATUS"
+	handoffConfig = "XRAY-SESSION-CONFIG"
+	handoffDigest = "X-Xray-Handoff-Config"
 	handoffRemote = "X-Xray-Handoff-Remote-Addr"
 	handoffProto  = "X-Xray-Handoff-Proto"
 )
@@ -38,6 +41,11 @@ func (l *Listener) SetHandoffPeer(socket string, acceptsNew bool) error {
 	if l.isH3 || l.handler == nil || !filepath.IsAbs(socket) {
 		return fmt.Errorf("XHTTP handoff requires a TCP/Unix inbound and an absolute peer socket path")
 	}
+	l.handler.setPeer(newHandoffPeer(socket, acceptsNew))
+	return nil
+}
+
+func newHandoffPeer(socket string, acceptsNew bool) *handoffPeer {
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)
 	dialer := &net.Dialer{Timeout: 2 * time.Second}
@@ -66,8 +74,7 @@ func (l *Listener) SetHandoffPeer(socket string, acceptsNew bool) error {
 			request.Out.Header.Set(handoffProto, strconv.Itoa(request.In.ProtoMajor))
 		},
 	}
-	l.handler.setPeer(peer)
-	return nil
+	return peer
 }
 
 // ClearHandoffPeer returns to local-only routing after the other generation
@@ -88,6 +95,23 @@ func (h *requestHandler) setPeer(peer *handoffPeer) {
 func (l *Listener) HandoffHandler() http.Handler {
 	h := l.handler
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == handoffConfig {
+			if l.peerDigest == "" {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			w.Header().Set(handoffDigest, l.peerDigest)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method == handoffStatus {
+			if h.life != nil && h.life.isSettled() {
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				w.WriteHeader(http.StatusConflict)
+			}
+			return
+		}
 		if r.Method == handoffLookup {
 			if _, ok := h.sessions.Load(r.URL.Query().Get("id")); ok {
 				w.WriteHeader(http.StatusNoContent)
@@ -102,6 +126,21 @@ func (l *Listener) HandoffHandler() http.Handler {
 		r.Header.Del(handoffProto)
 		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), forwardedRequest{}, true)))
 	})
+}
+
+func (p *handoffPeer) hasDrained() (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	r, err := http.NewRequestWithContext(ctx, handoffStatus, "http://xray-handoff.local/", nil)
+	if err != nil {
+		return false, err
+	}
+	response, err := p.transport.RoundTrip(r)
+	if err != nil {
+		return false, err
+	}
+	response.Body.Close()
+	return response.StatusCode == http.StatusNoContent, nil
 }
 
 func (p *handoffPeer) owns(ctx context.Context, id string) (bool, error) {
@@ -155,13 +194,13 @@ func (h *requestHandler) resolveSession(w http.ResponseWriter, r *http.Request, 
 			}
 			if id != "" && !forwarded {
 				owns, err := peer.owns(r.Context(), id)
+				if h.peer.Load() != peer {
+					continue
+				}
 				if err != nil {
 					// An unavailable peer is not equivalent to an unknown ID.
 					w.WriteHeader(http.StatusServiceUnavailable)
 					return nil, true
-				}
-				if h.peer.Load() != peer {
-					continue
 				}
 				if owns {
 					forwardToPeer(peer, w, r)

@@ -3,12 +3,15 @@ package handoff
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -20,9 +23,16 @@ type TCPBinding struct {
 	FD   int    `json:"fd"`
 }
 
+type UnixBinding struct {
+	Tag  string `json:"tag"`
+	Path string `json:"path"`
+	FD   int    `json:"fd"`
+}
+
 type Manifest struct {
-	Control string       `json:"control"`
-	TCP     []TCPBinding `json:"tcp"`
+	Control string        `json:"control"`
+	TCP     []TCPBinding  `json:"tcp"`
+	Unix    []UnixBinding `json:"unix,omitempty"`
 }
 
 type bindingKey struct {
@@ -33,13 +43,26 @@ type bindingKey struct {
 type binding struct {
 	listener *TCPListener
 	claimed  bool
-	drain    func()
+	drain    func() error
+	xhttp    XHTTP
+}
+
+// XHTTP participates in the admission transaction in addition to having
+// a public listener. Linking peers alone does not change admission.
+type XHTTP interface {
+	Drain() error
+	StartHandoff(path string) error
+	LinkHandoffPeer(path string) error
+	UnlinkHandoffPeer() error
+	SetHandoffAdmission(active bool) error
+	HandoffPeerLinked() bool
 }
 
 type Generation struct {
 	mu       sync.Mutex
 	state    string
 	bindings map[bindingKey]*binding
+	control  string
 }
 
 func ReadManifest(file io.Reader) (Manifest, error) {
@@ -64,26 +87,58 @@ func ReadManifest(file io.Reader) (Manifest, error) {
 }
 
 func ImportGeneration(manifest Manifest) (*Generation, error) {
-	if len(manifest.TCP) == 0 || len(manifest.TCP) > 128 {
-		return nil, errors.New("handoff requires 1–128 TCP bindings")
+	count := len(manifest.TCP) + len(manifest.Unix)
+	if count == 0 || count > 128 {
+		return nil, errors.New("handoff requires 1–128 stream bindings")
 	}
-	seen := make(map[int]bool, len(manifest.TCP))
-	g := &Generation{state: "starting", bindings: make(map[bindingKey]*binding, len(manifest.TCP))}
-	for _, spec := range manifest.TCP {
-		key := bindingKey{spec.Tag, spec.Port}
-		if spec.Tag == "" || spec.Port < 1 || spec.Port > 65535 || spec.FD < 3 || seen[spec.FD] || g.bindings[key] != nil {
-			g.Close()
-			return nil, fmt.Errorf("invalid or duplicate handoff binding for %q port %d", spec.Tag, spec.Port)
+	if err := PrivateSocketDirectory(filepath.Dir(manifest.Control)); err != nil {
+		return nil, err
+	}
+	seen := make(map[int]bool, count)
+	g := &Generation{state: "starting", control: manifest.Control, bindings: make(map[bindingKey]*binding, count)}
+	add := func(key bindingKey, fd int, path string) error {
+		if key.tag == "" || fd < 3 || seen[fd] || g.bindings[key] != nil {
+			return fmt.Errorf("invalid or duplicate handoff binding for %q port %d", key.tag, key.port)
 		}
-		seen[spec.FD] = true
-		file := os.NewFile(uintptr(spec.FD), "xray-inherited-listener")
-		listener, err := ImportTCPListener(file)
-		file.Close()
+		seen[fd] = true
+		file := os.NewFile(uintptr(fd), "xray-inherited-listener")
+		defer file.Close()
+		var listener *TCPListener
+		var err error
+		if path == "" {
+			listener, err = ImportTCPListener(file)
+		} else {
+			listener, err = ImportUnixListener(file)
+		}
 		if err != nil {
-			g.Close()
-			return nil, fmt.Errorf("importing handoff socket for %q: %w", spec.Tag, err)
+			return fmt.Errorf("importing handoff socket for %q: %w", key.tag, err)
+		}
+		if path != "" && listener.Addr().String() != path {
+			listener.Close()
+			return fmt.Errorf("Unix handoff descriptor does not match path %q", path)
 		}
 		g.bindings[key] = &binding{listener: listener}
+		return nil
+	}
+	for _, spec := range manifest.TCP {
+		if spec.Port < 1 || spec.Port > 65535 {
+			g.Close()
+			return nil, fmt.Errorf("invalid handoff port %d", spec.Port)
+		}
+		if err := add(bindingKey{spec.Tag, spec.Port}, spec.FD, ""); err != nil {
+			g.Close()
+			return nil, err
+		}
+	}
+	for _, spec := range manifest.Unix {
+		if !filepath.IsAbs(spec.Path) || filepath.Clean(spec.Path) != spec.Path {
+			g.Close()
+			return nil, errors.New("Unix handoff binding requires a clean absolute path")
+		}
+		if err := add(bindingKey{spec.Tag, 0}, spec.FD, spec.Path); err != nil {
+			g.Close()
+			return nil, err
+		}
 	}
 	return g, nil
 }
@@ -126,7 +181,39 @@ func (g *Generation) ClaimTCP(tag string, address net.IP, port int) (*TCPListene
 	return b.listener, nil
 }
 
-func (g *Generation) AttachDrain(tag string, port int, drain func()) error {
+func (g *Generation) ClaimUnix(tag, address string) (*TCPListener, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	b := g.bindings[bindingKey{tag, 0}]
+	path, _, _ := strings.Cut(address, ",")
+	if b == nil || b.claimed || g.state != "starting" || b.listener.Addr().String() != path {
+		return nil, fmt.Errorf("no unclaimed Unix handoff binding for %q at %q", tag, path)
+	}
+	b.claimed = true
+	return b.listener, nil
+}
+
+func peerName(key bindingKey) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", key.tag, key.port)))
+	return fmt.Sprintf("xh-%x", digest[:8])
+}
+
+func (g *Generation) AttachXHTTP(tag string, port int, xhttp XHTTP) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	key := bindingKey{tag, port}
+	b := g.bindings[key]
+	if b == nil || !b.claimed || b.drain != nil || g.state != "starting" {
+		return fmt.Errorf("cannot attach XHTTP handoff to %q port %d", tag, port)
+	}
+	if err := xhttp.StartHandoff(filepath.Join(filepath.Dir(g.control), peerName(key))); err != nil {
+		return err
+	}
+	b.xhttp, b.drain = xhttp, xhttp.Drain
+	return nil
+}
+
+func (g *Generation) AttachDrain(tag string, port int, drain func() error) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	b := g.bindings[bindingKey{tag, port}]
@@ -162,6 +249,24 @@ func (g *Generation) Command(command string) (string, error) {
 		if g.state != "active" && g.state != "paused" {
 			return g.state, fmt.Errorf("cannot %s admission in %s", command, g.state)
 		}
+		if (command == "pause" && g.state == "paused") || (command == "resume" && g.state == "active") {
+			return g.state, nil
+		}
+		if command == "pause" {
+			for _, b := range g.bindings {
+				if b.xhttp != nil && !b.xhttp.HandoffPeerLinked() {
+					return g.state, errors.New("cannot pause before linking every XHTTP inbound")
+				}
+			}
+		}
+		for _, b := range g.bindings {
+			if b.xhttp != nil {
+				if err := b.xhttp.SetHandoffAdmission(command == "resume"); err != nil {
+					g.state = "uncertain"
+					return g.state, err
+				}
+			}
+		}
 		for _, b := range g.bindings {
 			var err error
 			if command == "pause" {
@@ -187,27 +292,63 @@ func (g *Generation) Command(command string) (string, error) {
 			return g.state, fmt.Errorf("cannot drain a generation in %s", g.state)
 		}
 		g.state = "draining"
-		drain := make([]func(), 0, len(g.bindings))
+		drain := make([]func() error, 0, len(g.bindings))
 		for _, b := range g.bindings {
 			drain = append(drain, b.drain)
 		}
 		go g.finishDrain(drain)
+	case "unlink":
+		if g.state != "active" {
+			return g.state, errors.New("only an active generation can unlink its retired peer")
+		}
+		for _, b := range g.bindings {
+			if b.xhttp != nil {
+				if err := b.xhttp.UnlinkHandoffPeer(); err != nil {
+					return g.state, err
+				}
+			}
+		}
 	default:
-		return g.state, errors.New("unknown generation command")
+		dir, link := strings.CutPrefix(command, "link ")
+		if !link || (g.state != "paused" && g.state != "active") {
+			return g.state, errors.New("unknown or unavailable generation command")
+		}
+		if dir == filepath.Dir(g.control) {
+			return g.state, errors.New("cannot link a generation to itself")
+		}
+		if err := PrivateSocketDirectory(dir); err != nil {
+			return g.state, err
+		}
+		for key, b := range g.bindings {
+			if b.xhttp != nil {
+				if err := b.xhttp.LinkHandoffPeer(filepath.Join(dir, peerName(key))); err != nil {
+					return g.state, err
+				}
+			}
+		}
 	}
 	return g.state, nil
 }
 
-func (g *Generation) finishDrain(callbacks []func()) {
+func (g *Generation) finishDrain(callbacks []func() error) {
 	var group sync.WaitGroup
+	failures := make(chan error, len(callbacks))
 	for _, callback := range callbacks {
-		group.Go(callback)
+		group.Go(func() {
+			if err := callback(); err != nil {
+				failures <- err
+			}
+		})
 	}
 	group.Wait()
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.state == "draining" {
-		g.state = "drained"
+		if len(failures) == 0 {
+			g.state = "drained"
+		} else {
+			g.state = "drain_failed"
+		}
 	}
 }
 
