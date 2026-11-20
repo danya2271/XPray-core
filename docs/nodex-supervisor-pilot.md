@@ -44,10 +44,15 @@ it does not preserve. It does not accept an ordinary NodeX config with its
 management API: user updates and traffic accounting have not been integrated.
 
 The runtime marker intentionally survives shutdown and prevents starting over
-live or uncertain state. There is no automated listener/child recovery yet.
-Children are not tied to the requesting client or forcibly killed when the
-supervisor is abruptly lost, but a crash can leave admission and peer state
-uncertain. Do not delete the marker and rebind to "recover" a live node.
+live or uncertain state. The explicit `recover` command supports a confirmed
+single active TCP generation: it acquires the supervisor lock, obtains copies
+of the same listening sockets from the surviving Xray, and validates the boot
+ID, process start time, executable hash, and exact config snapshot. Signals
+and exit observation use a pidfd, never a possibly reused numeric PID.
+Recovery neither rebinds public sockets nor changes admission. A rejected
+recovery leaves the surviving Xray alone. Configurations without a matching
+config snapshot, and states with a pending switch, drain or UDP generation,
+remain blocked. Do not delete the marker and rebind to "recover" a live node.
 An orderly supervisor termination stops both children and therefore is **not**
 a seamless update operation.
 
@@ -75,6 +80,12 @@ CGO_ENABLED=0 go build -tags xray_server -o /tmp/xray-managed ./main
 /tmp/nodex-xray-supervisor -runtime /run/user/1000/nodex-canary \
   -binary /absolute/releases/new-xray \
   -config /absolute/private/new-config.json upgrade
+
+# After abrupt supervisor loss, only from a confirmed single-active state:
+/tmp/nodex-xray-supervisor -runtime /run/user/1000/nodex-canary \
+  -binary /absolute/releases/active-xray \
+  -config /absolute/private/exact-active-config.json \
+  -probe /absolute/private/verify-new-tunnels recover
 ```
 
 ### Probe contract
@@ -104,11 +115,31 @@ work remain live after rollback; rejects a concurrent upgrade during drain;
 then rolls to C and verifies A's work survives until client completion. It also
 checks detached request lifetime, persisted state, release cleanup, unsupported
 config rejection, and refusal to replace an existing Unix listener.
+It also kills the supervisor with SIGKILL, checks a surviving gRPC session,
+rejects recovery with the wrong config, recovers the original process without
+rebinding, and completes a later upgrade while preserving the old session.
+
+`nginx_canary_test.py` additionally accepts a DanVlessBot
+`vless_xhttp_tls_test` executable with the `--streaming-fixture` entrypoint. It
+uses the NodeX-generated Nginx configuration and real VLESS clients, proves new
+connections reached B using distinct backend responses, and keeps old VXT
+`stream-up` and white `packet-up` tunnels exchanging data on A until closure:
+
+```sh
+python3 cmd/nodex-xray-supervisor/nginx_canary_test.py \
+  /tmp/xray-managed /tmp/nodex-xray-supervisor \
+  /absolute/DanVlessBot/build/vless_xhttp_tls_test
+# Repeat with --http2-upstream to exercise the generated HTTP/2 origin route.
+```
+
+This optional integration fixture is provided by the companion repository;
+older builds without that entrypoint cannot run the test. The supervisor code
+does not modify or install the generated Nginx configuration on real nodes.
 
 ## Required before production enablement
 
-1. Recover listening descriptors, generation ownership, and pending jobs after
-   supervisor loss without rebinding or terminating active work.
+1. Extend recovery to pending switches/drains and UDP ingress ownership without
+   rebinding or terminating active work; single-active TCP recovery exists.
 2. Add managed NodeX API endpoints, fan-out user mutations, and aggregate/final
    statistics from every live generation without duplication.
 3. Fence and settle Hysteria Initial/handshake work and ingress queues before
