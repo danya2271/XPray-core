@@ -164,7 +164,7 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 	}
 	var saved status
 	if err := json.Unmarshal(data, &saved); err != nil || saved.Active == nil || saved.Sequence == 0 ||
-		!slices.Contains([]string{"active", "starting", "preparing", "switching", "draining", "retiring", "admission-unknown"}, saved.Phase) {
+		!slices.Contains([]string{"active", "starting", "preparing", "switching", "draining", "retiring", "admission-unknown", "broker-recovering"}, saved.Phase) {
 		return nil, errors.New("unsupported or incomplete supervisor recovery journal")
 	}
 	boot, err := bootID()
@@ -326,6 +326,7 @@ func recoverSupervisor(ctx context.Context, root, probe string, r release) (*sup
 	if err := s.reconcileRecovery(timeout, saved.Phase); err != nil {
 		return nil, err
 	}
+	s.watchBroker()
 	keep = true
 	return s, nil
 }
@@ -367,6 +368,20 @@ func (s *supervisor) reconcileRecovery(ctx context.Context, phase string) error 
 	if other == nil {
 		if a.State != "active" {
 			return errors.New("single recovered generation is not active")
+		}
+		if phase == "broker-recovering" {
+			for _, binding := range s.bindings {
+				if binding.transport != "hysteria" {
+					continue
+				}
+				if !binding.native || s.broker == nil {
+					return errors.New("interrupted broker recovery requires native direct receive")
+				}
+				response, _, err := s.broker.command(ctx, brokerRequest{Operation: "status", Tag: binding.tag})
+				if err != nil || !response.Direct || response.Current != active.slot {
+					return errors.Join(err, errors.New("interrupted broker recovery did not retain direct receive"))
+				}
+			}
 		}
 		return s.record("active", active, nil, nil)
 	}

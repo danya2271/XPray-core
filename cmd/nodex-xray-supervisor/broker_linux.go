@@ -26,8 +26,15 @@ import (
 // routing keys, slots and packet channels; no state is reconstructed by binding
 // a replacement socket after a supervisor failure.
 type brokerConfig struct {
-	Nonce    [32]byte        `json:"nonce"`
-	Bindings []brokerBinding `json:"bindings"`
+	Nonce    [32]byte              `json:"nonce"`
+	Bindings []brokerBinding       `json:"bindings"`
+	Direct   []brokerDirectRestore `json:"direct,omitempty"`
+}
+
+type brokerDirectRestore struct {
+	Tag            string `json:"tag"`
+	Slot           byte   `json:"slot"`
+	ReservedBefore uint16 `json:"reserved_before"`
 }
 
 type brokerBinding struct {
@@ -53,6 +60,8 @@ type nativePacketIngress interface {
 	AddDirectRing(byte) ([]*os.File, error)
 	AdoptReceive([]byte) error
 	ReleasePublic(byte, [16]byte) (bool, error)
+	ExportDirect(byte) ([]*os.File, error)
+	RestoreDirect(byte, []*os.File) error
 }
 
 type brokerPeer struct {
@@ -63,12 +72,13 @@ type brokerPeer struct {
 }
 
 type brokerEndpoint struct {
-	config  brokerBinding
-	public  *net.UDPConn
-	ingress packetIngress
-	peers   map[byte]*brokerPeer
-	current byte
-	direct  bool
+	config         brokerBinding
+	public         *net.UDPConn
+	ingress        packetIngress
+	peers          map[byte]*brokerPeer
+	current        byte
+	direct         bool
+	reservedBefore uint16
 }
 
 type packetBroker struct {
@@ -97,7 +107,13 @@ type brokerResponse struct {
 }
 
 func newPacketBroker(config brokerConfig, files []*os.File) (*packetBroker, error) {
-	if config.Nonce == [32]byte{} || len(files) == 0 || len(files) != len(config.Bindings) || len(files) > 128 {
+	restoring := len(config.Direct) != 0
+	count := len(config.Bindings)
+	expected := count
+	if restoring {
+		expected *= 5
+	}
+	if config.Nonce == [32]byte{} || count == 0 || count > 128 || len(files) != expected || (restoring && len(config.Direct) != count) {
 		return nil, errors.New("invalid broker launch manifest")
 	}
 	b := &packetBroker{nonce: config.Nonce, endpoints: make(map[string]*brokerEndpoint)}
@@ -162,6 +178,18 @@ func newPacketBroker(config brokerConfig, files []*os.File) (*packetBroker, erro
 		if err != nil {
 			return nil, err
 		}
+		if restoring {
+			saved := config.Direct[index]
+			if !binding.Native || saved.Tag != binding.Tag || saved.ReservedBefore == 0 || saved.ReservedBefore > 256 || uint16(saved.Slot) >= saved.ReservedBefore {
+				return nil, errors.New("invalid direct broker recovery binding")
+			}
+			base := count + index*4
+			if err := endpoint.ingress.(nativePacketIngress).RestoreDirect(saved.Slot, files[base:base+4]); err != nil {
+				return nil, err
+			}
+			endpoint.current, endpoint.reservedBefore = saved.Slot, saved.ReservedBefore
+			endpoint.peers[saved.Slot] = &brokerPeer{admitted: true}
+		}
 	}
 	keep = true
 	return b, nil
@@ -204,8 +232,28 @@ func (b *packetBroker) command(ctx context.Context, request brokerRequest) (brok
 	switch request.Operation {
 	case "status":
 		response.Ready = true
+	case "checkpoint-direct":
+		if !e.config.Native || !e.direct || e.current != request.Slot || peer == nil || peer.retired || peer.fence != [16]byte{} {
+			return fail(errors.New("broker checkpoint requires stable native direct receive"))
+		}
+		files, err := e.ingress.(nativePacketIngress).ExportDirect(request.Slot)
+		if err != nil {
+			return fail(err)
+		}
+		public, err := handoff.DuplicatePacketSocket(e.public)
+		if err != nil {
+			for _, file := range files {
+				file.Close()
+			}
+			return fail(err)
+		}
+		response.Ready = true
+		return response, append([]*os.File{public}, files...)
 	case "add":
 		if peer == nil {
+			if uint16(request.Slot) < e.reservedBefore {
+				return fail(errors.New("recovered broker routing slot cannot be reused"))
+			}
 			var files []*os.File
 			if e.config.Native {
 				files, err = e.ingress.(nativePacketIngress).AddDirectRing(request.Slot)
@@ -366,6 +414,13 @@ func (b *packetBroker) serve(ctx context.Context, path string) error {
 				return
 			}
 			response, files := b.command(ctx, request)
+			if request.Operation == "checkpoint-direct" {
+				defer func() {
+					for _, file := range files {
+						file.Close()
+					}
+				}()
+			}
 			data, err := json.Marshal(response)
 			if err != nil {
 				return

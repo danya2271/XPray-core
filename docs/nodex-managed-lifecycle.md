@@ -3,8 +3,10 @@
 `cmd/nodex-xray-supervisor` manages independent Linux Xray generations.
 It is opt-in: installing these binaries does not import an unmanaged process,
 enable the managed systemd unit, or make an ordinary restart seamless.
-**Production acceptance remains incomplete**, particularly saturated Hysteria
-overlap and the full failure/network matrix. This document supersedes lifecycle
+**Production acceptance remains incomplete**, particularly broker failure during
+relay/overlap and the full failure/network matrix. The November 20 lossless
+backpressure checks passed saturated TCP/response-window UDP workloads, not
+arbitrary flood or WAN qualification. This document supersedes lifecycle
 restrictions in the historical TCP pilot and relay experiment notes.
 
 ## Implemented lifecycle
@@ -93,7 +95,53 @@ The companion NodeX service uses `KillMode=process`,
 recovery exits 23 and retains live processes instead of repeatedly retrying an
 uncertain transition. An **explicit SIGTERM/service stop intentionally stops
 generations**: do not restart this service to update Xray or the supervisor.
-Failure of the UDP broker itself is not transparently recovered.
+### Broker failure in stable native direct mode
+
+The supervisor retains a checkpoint of the public UDP socket and existing
+producer-side Unix socket/ring/eventfd descriptors while exactly one native
+generation owns direct public reception. `broker_recovery_ready=true` in status
+means those descriptors are held. No extra reader, packet copies or per-packet
+monitoring is introduced. The monitor waits for process exit through pidfd,
+without a periodic timer or repeated `/proc` reads while the broker lives.
+
+After confirmed broker death, a replacement reattaches the **same** empty, open,
+sealed packet ring. It never reinitializes indices or consumer ownership,
+creates a competing UDP socket, or replaces the live Xray process. The
+replacement keeps the old CID key/current slot and reserves all previous
+attempted slots. The supervisor checkpoints it again for subsequent failure.
+The startup gate is released only after its process identity is journaled.
+
+The checkpoint is invalidated before a new generation starts. Go relay,
+native relay/overlap, mixed Go/native bindings, or simultaneous loss of broker
+and supervisor are **not** recovered by this direct-only path. A dead broker
+without a valid checkpoint blocks further updates without signalling live
+Xray; it does not repair the failed relay's data path. A closed/nonempty ring
+is rejected rather than declared losslessly recovered.
+
+Interrupted `broker-recovering` can reconnect to an already-launched healthy
+replacement after supervisor recovery; the journal still must match its
+PID/start ticks, binary/config hash, binding and direct slot. If the replacement
+never crossed its startup gate, recovery refuses to invent missing ownership.
+
+Validation on November 21: the native lifecycle test injected three broker
+SIGKILLs, retained existing TCP tunnels, recovered the same Xray PIDs, and
+completed two subsequent generation updates plus supervisor SIGKILL recovery.
+The separate application UDP test ran three times; each delivered 4000/4000
+1200-byte replies across three broker deaths without retransmission or Xray
+replacement. This is local response-window/paced UDP, not saturated WAN proof.
+The one-core overlap/direct-reacquire load regression delivered 6000/6000 UDP
+replies with zero relay/kernel drops and drained under 32 continuous TCP flows.
+122 native Rust tests, engine Clippy and native/non-native Go race suites passed.
+
+```sh
+XRAY_TEST_GENERATION_BINARY=/path/to/xray-native XRAY_TEST_MANAGED_NATIVE=1 \
+  NODEX_TEST_PUBLIC_PROBE=/path/to/nodex-xray-probe \
+  /path/to/native-supervisor.test \
+  -test.run '^TestSupervisorHysteriaBrokerDirectRecovery$' -test.v -test.timeout 160s
+XRAY_TEST_GENERATION_BINARY=/path/to/xray-native /path/to/native-supervisor.test \
+  -test.run '^TestNativeDirectBrokerRecoveryPreservesApplicationUDP$' \
+  -test.v -test.count 3 -test.timeout 60s
+```
 
 ## Management API and metrics
 
@@ -216,9 +264,9 @@ python3 cmd/nodex-xray-supervisor/nginx_canary_test.py \
 # Set NODEX_TEST_PUBLIC_PROBE=/tmp/nodex-xray-probe to verify the packaged probe too.
 ```
 
-Before enabling by default: eliminate measured saturated overlap UDP drops
-and the remaining one-core direct-path overhead, qualify public probes and systemd
+Before enabling by default: extend loss-free overlap checks to sustained UDP/WAN,
+reduce the remaining one-core overhead, qualify public probes and systemd
 privileges/assets, exercise every ownership failure boundary and UDP broker
-failure, extend the network/mask matrix, and provide a deliberate initial
+failure during relay/overlap, extend the network/mask matrix, and provide a deliberate initial
 migration/slot-rotation procedure. See
 `nodex-managed-hysteria-performance.md` for measurements.
