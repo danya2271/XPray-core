@@ -361,6 +361,33 @@ func TestRecoverAfterSupervisorCrash(t *testing.T) {
 		t.Fatal("recovered using the wrong config")
 	}
 	grpcPulse(t, stream, 'A', '2')
+	snapshotPath := filepath.Join(runtime, "g1", "config.json")
+	snapshot, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(snapshotPath, snapshotPath+".retained"); err != nil {
+		t.Fatal(err)
+	}
+	missing := spawn("recover", a)
+	if err := missing.Wait(); err == nil {
+		t.Fatal("recovered without the generation's config snapshot")
+	}
+	grpcPulse(t, stream, 'A', 'm')
+	if err := os.WriteFile(snapshotPath, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tampered := spawn("recover", a)
+	if err := tampered.Wait(); err == nil {
+		t.Fatal("recovered with a changed generation config snapshot")
+	}
+	grpcPulse(t, stream, 'A', 't')
+	if err := os.WriteFile(snapshotPath, snapshot, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(snapshotPath + ".retained"); err != nil {
+		t.Fatal(err)
+	}
 	second := spawn("recover", a)
 	after := wait("active", "g1")
 	orphaned = false
