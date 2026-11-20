@@ -1,5 +1,11 @@
 # NodeX transport handoff
 
+> Historical transport pilot. For current safe UDP retirement, native
+> return-to-direct RX, persistent supervisor/broker recovery and management
+> API integration, see [nodex-managed-lifecycle.md](nodex-managed-lifecycle.md).
+> The old restrictions below are retained as implementation history, not the
+> current feature matrix. Saturated overlap losses remain unresolved.
+
 This branch provides a managed-process pilot for gRPC, XHTTP and Hysteria. It
 does not enable managed mode for a normal `xray run` or make a service restart
 seamless. Automatic retirement of a generation with Hysteria is not enabled.

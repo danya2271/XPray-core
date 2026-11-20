@@ -1,5 +1,11 @@
 # NodeX TCP supervisor canary
 
+> Historical TCP-only pilot notes. The current integrated lifecycle, including
+> Go/native Hysteria drain, persistent broker recovery, API/counters and the
+> opt-in NodeX/TUI path, is documented in
+> [nodex-managed-lifecycle.md](nodex-managed-lifecycle.md). Restrictions below
+> describe the original pilot; production acceptance is still incomplete.
+
 `cmd/nodex-xray-supervisor` owns listening sockets across independent managed
 Xray processes. It is an opt-in Linux canary, **not a production NodeX updater**.
 It does not alter `xray.service`, stop an existing unmanaged Xray, or activate a

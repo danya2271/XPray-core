@@ -1,5 +1,90 @@
 # Managed Hysteria performance investigation
 
+## Current lifecycle and acceptance status, November 20, 2026
+
+The historical experiments below predate the integrated persistent broker,
+safe engine drain and return-to-direct receive lifecycle. Those statements
+about missing lifecycle support describe the old experiment, not today's
+implementation; see `nodex-managed-lifecycle.md`.
+
+The remaining saturated-overlap loss is **not fixed**. The user's completed
+Android comparison (three runs, fresh B client, 32 TCP flows, 64 KiB exchanges,
+Salamander/WireGuard header, matched public socket policy) reports:
+
+| Saturated variant | Duplex MB/s | Exchange p99, ms | Drops |
+| --- | ---: | ---: | --- |
+| Native direct, 4 server cores | 586 | 21.7 | Baseline |
+| Native ring, 4 server cores | 548 | 28.5 | 0–356 per run |
+| Native direct, 1 server core | 219 | 56 | Baseline |
+| Native ring, 1 server core | 197 | 79 | Still present |
+| Go direct, 1 server core | 109 | 51 | Baseline |
+
+Fresh-B **paced** UDP tests completed on both four and one server cores:
+ring and receive-lease variants each delivered 6000/6000 replies over three
+runs with zero counted ingress drops. Ordinary native/Go relays failed strict
+checks. This is moderate paced traffic, **not saturated UDP acceptance**.
+
+Our lifecycle checkout also produced single exploratory fresh-B samples:
+4 cores direct/ring/lease 564.33/483.14/486.50 MB/s with ring/lease drops
+163/398; 1 core 230.61/195.53/193.06 MB/s with drops 2172/2010.
+These are not medians and ran on a shared local machine. Do not treat them as
+a controlled comparison with the user's matrix. The raw exploratory logs are
+local `/tmp/nodex-final-load/`, not committed release evidence.
+
+The fixture accepts `XHYS_HANDOFF_BENCH_AFTER_DRAIN=1` (managed + shared RX +
+direct TX): switch to B, close A's client, wait for verified natural drain,
+require `receive-direct`, and only then start measurement. This is separate
+from fresh-B overlap (`XHYS_HANDOFF_BENCH_NEW_GENERATION=1`). A completed
+transfer test alone does not prove post-drain throughput matches native.
+
+The completed local interleaved three-round post-drain matrix used the same
+native binary, 32 flows, 64 KiB exchanges and 4096 exchanges per run. Server
+CPU sets were 0–3 / 0, client 8–15. Every run required `receive-direct` before
+measurement; all twelve passed with zero counted ingress drops:
+
+| Server cores | Variant | Median MB/s | Median exchange p99, ms |
+| --- | --- | ---: | ---: |
+| 4 | Ordinary native direct | 560.51 | 24.438 |
+| 4 | Native after drain/direct reacquire | 561.78 | 24.830 |
+| 1 | Ordinary native direct | 230.68 | 49.846 |
+| 1 | Native after drain/direct reacquire | 218.99 | 52.964 |
+
+The one-core result is about 5% lower, not zero overhead. This fixture retains
+the already-drained old process for diagnostics; the actual supervisor also
+stops/removes it after the certificate. Further isolated post-retirement
+measurements are needed. Local raw logs:
+`/tmp/nodex-postdrain-final-20261120/`. Earlier failed fixture attempts are
+excluded, retained at `/tmp/nodex-postdrain-20261120/` and
+`/tmp/nodex-postdrain-{verified,fixed}.log`; they failed before measurement.
+These runs do not erase the saturated **overlap** failures above.
+
+`XHYS_HANDOFF_BENCH_AFTER_RETIRE=1` additionally requires the old generation's
+`drained` certificate, sends SIGTERM and waits for its successful exit before
+measuring B. A second interleaved three-round matrix (same CPU sets, workload
+and binary) completed all twelve runs with zero counted ingress drops:
+
+| Server cores | Variant | Median MB/s | Median exchange p99, ms | Server total CPU, µs/exchange |
+| --- | --- | ---: | ---: | ---: |
+| 4 | Ordinary native direct | 545.29 | 41.713 | 741.74 |
+| 4 | Native after old process exit | 547.35 | 23.969 | 729.79 |
+| 1 | Ordinary native direct | 230.52 | 66.558 | 511.56 |
+| 1 | Native after old process exit | 220.83 | 51.598 | 532.31 |
+
+CPU is the median per-run sum of generation plus supervisor/echo CPU. On one
+core throughput remains ~4.2% lower and CPU/exchange ~4.1% higher even after
+old process exit. The short-run p99 baseline varies across these separate
+matrices; it does not establish a managed latency advantage. This is local
+loopback evidence, not WAN or production acceptance. Logs:
+`/tmp/nodex-retired-final-20261120/`.
+
+Production defaults remain unchanged. Performance acceptance still includes
+saturated overlap with no additional relay drops and controlled post-drain
+direct baselines on one/four cores. Do not increase queues, weaken strict
+loss assertions, or confuse QUIC retransmission with preserving every
+application datagram.
+
+## Historical experiments
+
 The original managed Hysteria relay is not suitable for enabling native NodeX
 updates by default. The reported 32-flow, 64 KiB duplex regression was reproduced
 locally: about 270 MB/s, 102 ms p99, and 78,695 relay drops for 8192 exchanges.

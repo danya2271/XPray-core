@@ -43,6 +43,7 @@ type handoffLoadSnapshot struct {
 	Drops         uint64
 	Counts        []uint64
 	Ingress       native.NativeIngressStats
+	Drain         string
 }
 
 type handoffLoadInfo struct {
@@ -138,6 +139,7 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		t.Fatal("invalid process CPU clock tick frequency")
 	}
 	var processes []*exec.Cmd
+	stopped := make(map[int]bool)
 	var controls []handoff.ControlSocket
 	start := func(slot byte) {
 		directory := filepath.Join(root, strconv.Itoa(int(slot)))
@@ -161,7 +163,11 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 				if !ok || os.Getenv("XHYS_HANDOFF_PACKET_BATCH") != "1" || os.Getenv("XHYS_HANDOFF_BACKEND") == "go" {
 					t.Fatal("shared receive requires native ingress, batch and native server")
 				}
-				inherited, err = relay.AddRing(slot)
+				if os.Getenv("XHYS_HANDOFF_DIRECT_TX") == "1" {
+					inherited, err = relay.AddDirectRing(slot)
+				} else {
+					inherited, err = relay.AddRing(slot)
+				}
 				if err == nil {
 					file = inherited[0]
 				}
@@ -221,8 +227,10 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		processes = append(processes, command)
 		controls = append(controls, control)
 		t.Cleanup(func() {
-			command.Process.Kill()
-			command.Wait()
+			if !stopped[int(slot)] {
+				command.Process.Kill()
+				command.Wait()
+			}
 			log.Close()
 			if t.Failed() {
 				data, _ := os.ReadFile(log.Name())
@@ -261,6 +269,8 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	scanner := bufio.NewScanner(os.Stdin)
+	var drainToken [16]byte
+	copy(drainToken[:], []byte("test-drain-token"))
 	for scanner.Scan() {
 		if scanner.Text() == "switch" {
 			if !managed || len(processes) != 1 {
@@ -296,9 +306,118 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 			}
 		}
 		var snapshot handoffLoadSnapshot
+		if scanner.Text() == "return-direct" {
+			relay, ok := ingress.(*native.NativeIngress)
+			if !ok || len(processes) != 2 {
+				t.Fatal("return-direct requires native managed generations")
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				retired, err := relay.Retire(0, drainToken)
+				if err != nil {
+					t.Fatalf("retiring old ingress route: %v", err)
+				}
+				if retired {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("old ingress route did not settle")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			var token [16]byte
+			copy(token[:], []byte("return-rx-token!"))
+			deadline = time.Now().Add(5 * time.Second)
+			for {
+				ready, err := relay.ReleasePublic(1, token)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ready {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("ingress did not release public receive")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if ready, err := relay.ReleasePublic(1, token); err != nil || !ready {
+				t.Fatalf("release retry: %v", err)
+			}
+			for {
+				response, err := controls[1].Command(t.Context(), fmt.Sprintf("acquire-receive hy:%d %x", local.Port, token))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if response.State == "receive-direct" {
+					snapshot.Drain = response.State
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("new generation did not acquire public receive")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if os.Getenv("XHYS_HANDOFF_BENCH_AFTER_RETIRE") == "1" {
+				state, err := controls[0].Command(t.Context(), "status")
+				if err != nil || state.State != "drained" {
+					t.Fatalf("refusing to stop uncertified generation: %+v, %v", state, err)
+				}
+				if err := processes[0].Process.Signal(syscall.SIGTERM); err != nil {
+					t.Fatal(err)
+				}
+				stopped[0] = true // Wait below owns process exit, including timeout.
+				done := make(chan error, 1)
+				go func() { done <- processes[0].Wait() }()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatalf("certified old generation shutdown: %v", err)
+					}
+				case <-time.After(5 * time.Second):
+					processes[0].Process.Kill()
+					<-done
+					t.Fatal("certified old generation did not stop")
+				}
+			}
+		}
+		if scanner.Text() == "drain" {
+			if !managed || len(processes) != 2 {
+				t.Fatal("drain requires two managed generations")
+			}
+			var fenced bool
+			var err error
+			if relay, ok := ingress.(*native.NativeIngress); ok {
+				fenced, err = relay.FenceGeneration(0, drainToken)
+			} else {
+				fenced, err = ingress.(*handoff.UDPIngress).FenceGeneration(t.Context(), 0, drainToken)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.Drain = "ingress-waiting"
+			if fenced {
+				response, err := controls[0].Command(t.Context(), fmt.Sprintf("drain-udp hy:%d %x", local.Port, drainToken))
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot.Drain = response.State
+				if response.State == "udp-drained" {
+					response, err = controls[0].Command(t.Context(), "drain")
+					if err != nil {
+						t.Fatal(err)
+					}
+					snapshot.Drain = response.State
+				}
+			}
+		}
 		snapshot.SupervisorCPU = processCPU()
 		_, snapshot.SupervisorRSS = handoffProcessUsage(t, os.Getpid(), ticks)
 		for index, process := range processes {
+			if stopped[index] {
+				snapshot.Counts = append(snapshot.Counts, 0)
+				continue
+			}
 			cpu, rss := handoffProcessUsage(t, process.Process.Pid, ticks)
 			snapshot.ServerCPU += cpu
 			snapshot.ServerRSS += rss
@@ -309,7 +428,12 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 				}
 				status := response.UDP[fmt.Sprintf("hy:%d", local.Port)]
 				if !status.Known {
-					t.Fatal("generation connection count is unknown")
+					// Ordinary drain closes the old listener only after the
+					// engine/queue certificate; its diagnostic hook is then gone.
+					state, stateErr := controls[index].Command(t.Context(), "status")
+					if stateErr != nil || state.State != "drained" || status.Count != 0 {
+						t.Fatalf("generation %d connection count is unknown outside confirmed drain: %+v, %v", index, state, stateErr)
+					}
 				}
 				snapshot.Counts = append(snapshot.Counts, status.Count)
 			}
@@ -359,6 +483,7 @@ type handoffLoadFixture struct {
 	info    handoffLoadInfo
 	input   io.WriteCloser
 	decoder *json.Decoder
+	output  io.Reader
 }
 
 func newHandoffLoadFixture(t testing.TB) *handoffLoadFixture {
@@ -420,7 +545,7 @@ func newHandoffLoadFixture(t testing.TB) *handoffLoadFixture {
 		}
 		cancel()
 	})
-	fixture := &handoffLoadFixture{input: input, decoder: json.NewDecoder(output)}
+	fixture := &handoffLoadFixture{input: input, decoder: json.NewDecoder(output), output: output}
 	if err := fixture.decoder.Decode(&fixture.info); err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +559,8 @@ func (fixture *handoffLoadFixture) snapshot(t testing.TB, command string) handof
 	}
 	var result handoffLoadSnapshot
 	if err := fixture.decoder.Decode(&result); err != nil {
-		t.Fatal(err)
+		diagnostic, _ := io.ReadAll(io.LimitReader(io.MultiReader(fixture.decoder.Buffered(), fixture.output), 8192))
+		t.Fatalf("fixture %s: %v: %s", command, err, diagnostic)
 	}
 	return result
 }
@@ -482,6 +608,62 @@ func benchmarkHandoffLoad(b *testing.B, size int) {
 	startedEngines := native.Stats().StartedEngines - engines
 	if backend := os.Getenv("XRAY_HYSTERIA_NATIVE"); backend == "1" && startedEngines == 0 || backend == "0" && startedEngines != 0 {
 		b.Fatal("load generator used an unexpected Hysteria backend")
+	}
+	benchAfterDrain := os.Getenv("XHYS_HANDOFF_BENCH_AFTER_DRAIN") == "1" || os.Getenv("XHYS_HANDOFF_BENCH_AFTER_RETIRE") == "1"
+	benchNewGeneration := os.Getenv("XHYS_HANDOFF_BENCH_NEW_GENERATION") == "1" || benchAfterDrain
+	benchSwitch := os.Getenv("XHYS_HANDOFF_BENCH_SWITCH") == "1" || benchNewGeneration
+	if benchSwitch {
+		if os.Getenv("XHYS_HANDOFF_MODE") != "managed" {
+			b.Fatal("benchmark switch requires managed mode")
+		}
+		fixture.snapshot(b, "switch")
+		previousClient := client
+		nextClient := fixture.client(b)
+		if benchNewGeneration {
+			client = nextClient
+			for index := range connections {
+				connections[index].Close()
+				connections[index] = benchmarkDial(b, client, target)
+				connections[index].SetDeadline(time.Now().Add(90 * time.Second))
+				benchmarkExchange(b, connections[index], make([]byte, size), make([]byte, size))
+			}
+		} else {
+			probe := benchmarkDial(b, nextClient, target)
+			b.Cleanup(func() { probe.Close() })
+			probe.SetDeadline(time.Now().Add(90 * time.Second))
+			benchmarkExchange(b, probe, make([]byte, 4096), make([]byte, 4096))
+		}
+		status := fixture.snapshot(b, "stats")
+		if len(status.Counts) != 2 || status.Counts[0] == 0 || status.Counts[1] == 0 {
+			b.Fatalf("benchmark generations are not both alive: %+v", status)
+		}
+		if benchAfterDrain {
+			if os.Getenv("XHYS_HANDOFF_SHARED_RX") != "1" || os.Getenv("XHYS_HANDOFF_DIRECT_TX") != "1" {
+				b.Fatal("post-drain direct receive requires shared RX and direct TX")
+			}
+			previousClient.Close()
+			deadline := time.Now().Add(50 * time.Second)
+			for {
+				// Initial-pin expiry must not make B's measured streams idle.
+				for _, connection := range connections {
+					benchmarkExchange(b, connection, []byte{1}, make([]byte, 1))
+				}
+				state := fixture.snapshot(b, "drain").Drain
+				if state == "drained" {
+					break
+				}
+				if (state != "ingress-waiting" && state != "udp-waiting" && state != "draining") || time.Now().After(deadline) {
+					b.Fatalf("old generation did not drain before measurement: %s", state)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			if state := fixture.snapshot(b, "return-direct").Drain; state != "receive-direct" {
+				b.Fatalf("new generation did not reacquire direct receive: %s", state)
+			}
+			for _, connection := range connections {
+				benchmarkExchange(b, connection, make([]byte, size), make([]byte, size))
+			}
+		}
 	}
 	before := fixture.snapshot(b, "stats")
 	var next atomic.Uint32
@@ -555,6 +737,13 @@ func TestHandoffUnderLoad(t *testing.T) {
 	}
 	udp := open(client, "udp", fixture.info.UDP)
 	defer udp.Close()
+	udpClients := []net.Conn{udp}
+	activeUDP := udp
+	defer func() {
+		for _, connection := range udpClients {
+			connection.Close()
+		}
+	}()
 	warm := bytes.Repeat([]byte{0xa5}, 4096)
 	if _, err := udp.Write(warm); err != nil {
 		t.Fatal(err)
@@ -593,27 +782,32 @@ func TestHandoffUnderLoad(t *testing.T) {
 	defer workers.Wait()
 	defer close(stop)
 	const packets = 2000
-	seen := make([]bool, packets)
+	seen := make([]atomic.Bool, packets)
 	sentAt := make([]atomic.Int64, packets)
 	epoch := time.Now()
-	latencies := make(chan []int64, 1)
-	go func() {
-		var samples []int64
-		payload := make([]byte, 4096)
-		for {
-			if _, err := io.ReadFull(udp, payload); err != nil {
-				break
+	latencies := make(chan []int64, 2)
+	readerCount := 0
+	var samples []int64
+	startUDPReader := func(connection net.Conn) {
+		readerCount++
+		go func() {
+			var samples []int64
+			payload := make([]byte, 4096)
+			for {
+				if _, err := io.ReadFull(connection, payload); err != nil {
+					break
+				}
+				sequence := int(binary.BigEndian.Uint32(payload))
+				if sequence >= packets || !bytes.Equal(payload[4:], warm[4:]) || !seen[sequence].CompareAndSwap(false, true) {
+					t.Error("invalid or duplicate UDP reply")
+					break
+				}
+				samples = append(samples, time.Since(epoch).Nanoseconds()-sentAt[sequence].Load())
 			}
-			sequence := int(binary.BigEndian.Uint32(payload))
-			if sequence >= packets || !bytes.Equal(payload[4:], warm[4:]) || seen[sequence] {
-				t.Error("invalid or duplicate UDP reply")
-				break
-			}
-			seen[sequence] = true
-			samples = append(samples, time.Since(epoch).Nanoseconds()-sentAt[sequence].Load())
-		}
-		latencies <- samples
-	}()
+			latencies <- samples
+		}()
+	}
+	startUDPReader(udp)
 	before := fixture.snapshot(t, "stats")
 	started := time.Now()
 	ticker := time.NewTicker(5 * time.Millisecond)
@@ -621,6 +815,23 @@ func TestHandoffUnderLoad(t *testing.T) {
 	for sequence := range packets {
 		<-ticker.C
 		if sequence == 600 && os.Getenv("XHYS_HANDOFF_MODE") == "managed" {
+			drainDeadline := time.Now().Add(100 * time.Millisecond)
+			for time.Now().Before(drainDeadline) {
+				allReceived := true
+				for prior := range sequence {
+					if !seen[prior].Load() {
+						allReceived = false
+						break
+					}
+				}
+				if allReceived {
+					break
+				}
+				time.Sleep(100 * time.Microsecond)
+			}
+			udp.Close()
+			samples = append(samples, <-latencies...)
+			readerCount--
 			fixture.snapshot(t, "switch")
 			next := fixture.client(t)
 			probe := open(next, "tcp", fixture.info.TCP)
@@ -635,23 +846,30 @@ func TestHandoffUnderLoad(t *testing.T) {
 			if len(status.Counts) != 2 || status.Counts[0] == 0 || status.Counts[1] == 0 {
 				t.Fatalf("old and new QUIC connections not both alive: %+v", status)
 			}
+			activeUDP = open(next, "udp", fixture.info.UDP)
+			udpClients = append(udpClients, activeUDP)
+			startUDPReader(activeUDP)
 		}
 		binary.BigEndian.PutUint32(warm, uint32(sequence))
 		sentAt[sequence].Store(time.Since(epoch).Nanoseconds())
-		if _, err := udp.Write(warm); err != nil {
+		if _, err := activeUDP.Write(warm); err != nil {
 			t.Fatal(err)
 		}
 	}
 	seconds := time.Since(started).Seconds()
 	background := float64(total.Load()) / (1 << 20) / seconds
 	time.Sleep(time.Second)
-	udp.Close()
-	samples := <-latencies
+	for _, connection := range udpClients {
+		connection.Close()
+	}
+	for range readerCount {
+		samples = append(samples, <-latencies...)
+	}
 	after := fixture.snapshot(t, "stats")
 	var missing []int
 	missingBefore, missingAfter := 0, 0
-	for sequence, received := range seen {
-		if !received {
+	for sequence := range seen {
+		if !seen[sequence].Load() {
 			if len(missing) < 32 {
 				missing = append(missing, sequence)
 			}
@@ -676,5 +894,83 @@ func TestHandoffUnderLoad(t *testing.T) {
 	case err := <-errors:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestHandoffDrainRetainsLiveConnections(t *testing.T) {
+	if os.Getenv("XHYS_HANDOFF_MODE") != "managed" {
+		t.Skip("managed drain integration")
+	}
+	fixture := newHandoffLoadFixture(t)
+	clientA := fixture.client(t)
+	open := func(client *core.Instance) net.Conn {
+		t.Helper()
+		target, err := xnet.ParseDestination("tcp:" + fixture.info.TCP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := core.Dial(t.Context(), client, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	pulse := func(conn net.Conn) {
+		t.Helper()
+		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write([]byte("still-live")); err != nil {
+			t.Fatal(err)
+		}
+		var reply [10]byte
+		if _, err := io.ReadFull(conn, reply[:]); err != nil || string(reply[:]) != "still-live" {
+			t.Fatalf("live connection interrupted: %q %v", reply, err)
+		}
+	}
+	a := open(clientA)
+	pulse(a)
+	fixture.snapshot(t, "switch")
+	clientB := fixture.client(t)
+	b := open(clientB)
+	pulse(b)
+	// Let original Initial pins expire without imposing a session lifetime.
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		state := fixture.snapshot(t, "drain").Drain
+		if state == "udp-waiting" {
+			break
+		}
+		if state != "ingress-waiting" {
+			t.Fatalf("drained live A: %s", state)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ingress never became fenceable")
+		}
+		pulse(a)
+		pulse(b)
+		time.Sleep(250 * time.Millisecond)
+	}
+	pulse(a)
+	pulse(b)
+	a.Close()
+	clientA.Close()
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		state := fixture.snapshot(t, "drain").Drain
+		pulse(b)
+		if state == "drained" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("A did not drain naturally: %s", state)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	pulse(b)
+	if os.Getenv("XHYS_HANDOFF_SHARED_RX") == "1" && os.Getenv("XHYS_HANDOFF_DIRECT_TX") == "1" {
+		if result := fixture.snapshot(t, "return-direct"); result.Drain != "receive-direct" {
+			t.Fatalf("new generation did not return direct: %+v", result)
+		}
+		pulse(b)
 	}
 }
