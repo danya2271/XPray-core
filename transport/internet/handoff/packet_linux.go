@@ -133,6 +133,7 @@ type PacketEndpoint struct {
 	rxPeer                       netip.AddrPort
 	transmit                     *net.UDPConn
 	ring                         [3]*os.File
+	directReceive                bool
 }
 
 func importUDPPacket(fd *os.File, local net.UDPAddr) (net.PacketConn, error) {
@@ -152,7 +153,29 @@ func ImportPacketEndpoint(fd *os.File, local net.UDPAddr) (*PacketEndpoint, erro
 	return &PacketEndpoint{conn: socket, local: local}, nil
 }
 
-func (e *PacketEndpoint) File() (*os.File, error) { return e.conn.File() }
+// DuplicatePacketSocket preserves O_NONBLOCK on the shared open file
+// description. net.Conn.File().Fd() may make another live Go reader block.
+func DuplicatePacketSocket(socket interface {
+	SyscallConn() (syscall.RawConn, error)
+}) (*os.File, error) {
+	raw, err := socket.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	fd := -1
+	var duplicateErr error
+	if err := raw.Control(func(descriptor uintptr) {
+		fd, duplicateErr = unix.FcntlInt(descriptor, unix.F_DUPFD_CLOEXEC, 3)
+	}); err != nil {
+		return nil, err
+	}
+	if duplicateErr != nil {
+		return nil, duplicateErr
+	}
+	return os.NewFile(uintptr(fd), "xray-nonblocking-packet-duplicate"), nil
+}
+
+func (e *PacketEndpoint) File() (*os.File, error) { return DuplicatePacketSocket(e.conn) }
 func (e *PacketEndpoint) Close() error {
 	for _, file := range e.ring {
 		if file != nil {
@@ -192,6 +215,9 @@ func attachPacketRing(packet net.PacketConn, descriptors [3]int) error {
 // RingFiles belongs to this endpoint. The native setup duplicates the files
 // before Close. Go QUIC must reject a ring rather than waiting on its empty RX.
 func (e *PacketEndpoint) RingFiles() [3]*os.File { return e.ring }
+func (e *PacketEndpoint) DirectReceive() bool    { return e.directReceive }
+
+func setDirectReceive(packet net.PacketConn) { packet.(*PacketEndpoint).directReceive = true }
 
 func attachUDPTransmit(packet net.PacketConn, descriptor int) error {
 	f := os.NewFile(uintptr(descriptor), "xray-inherited-udp-transmit")
@@ -215,7 +241,7 @@ func (e *PacketEndpoint) TransmitFile() (*os.File, error) {
 	if e.transmit == nil {
 		return nil, nil
 	}
-	return e.transmit.File()
+	return DuplicatePacketSocket(e.transmit)
 }
 func (e *PacketEndpoint) LocalAddr() net.Addr                { return &e.local }
 func (e *PacketEndpoint) SetReadDeadline(t time.Time) error  { return e.conn.SetReadDeadline(t) }

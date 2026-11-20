@@ -19,3 +19,5 @@ func attachUDPTransmit(net.PacketConn, int) error {
 func attachPacketRing(net.PacketConn, [3]int) error {
 	return errors.New("managed packet ring requires Linux")
 }
+
+func setDirectReceive(net.PacketConn) {}

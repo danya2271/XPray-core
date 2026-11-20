@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,7 @@ type Response struct {
 	Error      string                         `json:"error,omitempty"`
 	UDP        map[string]UDPConnectionStatus `json:"udp,omitempty"`
 	UDPManaged bool                           `json:"udp_managed,omitempty"`
+	Receive    json.RawMessage                `json:"receive,omitempty"`
 }
 
 type UDPConnectionStatus struct {
@@ -87,6 +89,15 @@ func serveControl(conn net.Conn, generation *Generation) {
 	if input.Text() == "quic-status" {
 		state, counts := generation.UDPStatus()
 		json.NewEncoder(conn).Encode(Response{Protocol: ProtocolVersion, State: state, UDP: counts, UDPManaged: len(counts) != 0})
+		return
+	}
+	if target, ok := strings.CutPrefix(input.Text(), "release-receive "); ok {
+		state, snapshot, err := generation.ReleaseUDPReceive(target)
+		response := Response{Protocol: ProtocolVersion, State: state, Receive: snapshot, UDPManaged: true}
+		if err != nil {
+			response.Error = err.Error()
+		}
+		json.NewEncoder(conn).Encode(response)
 		return
 	}
 	state, err := generation.Command(input.Text())

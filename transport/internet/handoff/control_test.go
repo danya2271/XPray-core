@@ -21,6 +21,33 @@ func TestReadManifest(t *testing.T) {
 	}
 }
 
+func TestReceiveReleaseRequiresExplicitNativeOwner(t *testing.T) {
+	key := bindingKey{"hy", 443}
+	g := &Generation{state: "active", udp: map[bindingKey]*udpBinding{
+		key: {spec: UDPBinding{Tag: "hy", Port: 443}},
+	}}
+	calls := 0
+	release := func() ([]byte, error) {
+		calls++
+		return []byte(`{"slot":0,"pins":[]}`), nil
+	}
+	g.udp[key].releaseReceive = release
+	if _, _, err := g.ReleaseUDPReceive("hy:443"); err == nil || calls != 0 {
+		t.Fatal("released a generation without a direct receive lease")
+	}
+	g.udp[key].spec.DirectReceive = true
+	if _, _, err := g.ReleaseUDPReceive("other:443"); err == nil || calls != 0 {
+		t.Fatal("released wrong UDP binding")
+	}
+	if state, data, err := g.ReleaseUDPReceive("hy:443"); err != nil || state != "active" || len(data) == 0 || calls != 1 {
+		t.Fatalf("explicit release failed: %s %s %v", state, data, err)
+	}
+	g.state = "draining"
+	if _, _, err := g.ReleaseUDPReceive("hy:443"); err == nil || calls != 1 {
+		t.Fatal("released receive ownership while draining")
+	}
+}
+
 func TestPrivateControlSocket(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("test uses Linux filesystem permissions for Unix sockets")

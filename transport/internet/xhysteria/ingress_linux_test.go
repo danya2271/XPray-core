@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"net"
 	"os"
 	"testing"
@@ -204,5 +205,88 @@ func TestNativeIngressStalledGenerationDoesNotBlockActivation(t *testing.T) {
 	stats := ingress.Stats()
 	if !stats.Running || stats.QueuedBytes == 0 || stats.PeakQueuedBytes > 512*1024 || stats.Backpressure == 0 {
 		t.Fatalf("unexpected bounded queue state: %+v", stats)
+	}
+}
+
+func TestDormantNativeIngressDoesNotReadUntilConfirmedAdoption(t *testing.T) {
+	public, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Close()
+	key := [16]byte{5, 1, 9}
+	ingress, err := NewDormantNativeIngress(public, key, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ingress.Close()
+	file, err := ingress.Add(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	view, err := handoff.ImportPacketEndpoint(file, *public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	client, err := net.DialUDP("udp4", nil, public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := ingress.Activate(0); err == nil {
+		t.Fatal("dormant ingress allowed activation")
+	}
+	// Model the sole direct reader explicitly. This synthetic fixture snapshot
+	// is never a production substitute for release-receive.
+	if _, err := client.Write([]byte("direct-only")); err != nil {
+		t.Fatal(err)
+	}
+	public.SetReadDeadline(time.Now().Add(time.Second))
+	var buffer [2048]byte
+	n, _, err := public.ReadFromUDP(buffer[:])
+	if err != nil || string(buffer[:n]) != "direct-only" {
+		t.Fatalf("dormant ingress competed with direct reader: %d, %v", n, err)
+	}
+	public.SetReadDeadline(time.Time{})
+	if ingress.Stats().Received != 0 {
+		t.Fatal("dormant ingress received public traffic")
+	}
+	snapshot := func(key [16]byte, local string) []byte {
+		data, err := json.Marshal(struct {
+			Key   [16]byte `json:"key"`
+			Local string   `json:"local"`
+			Slot  byte     `json:"slot"`
+			Pins  []any    `json:"pins"`
+		}{key, local, 0, []any{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	if err := ingress.AdoptReceive(snapshot([16]byte{6}, public.LocalAddr().String())); err == nil {
+		t.Fatal("adopted receive from another CID key")
+	}
+	if err := ingress.AdoptReceive(snapshot(key, "127.0.0.1:1")); err == nil {
+		t.Fatal("adopted receive from another socket")
+	}
+	data := snapshot(key, public.LocalAddr().String())
+	if err := ingress.AdoptReceive(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingress.AdoptReceive(data); err != nil {
+		t.Fatalf("same adoption retry failed: %v", err)
+	}
+	initial := make([]byte, 1200)
+	initial[0], initial[4], initial[5] = 0xc0, 1, 8
+	copy(initial[6:], "new-work")
+	if _, err := client.Write(initial); err != nil {
+		t.Fatal(err)
+	}
+	view.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err = view.ReadFrom(buffer[:])
+	if err != nil || !bytes.Equal(initial, buffer[:n]) {
+		t.Fatalf("adopted ingress did not receive: %d, %v", n, err)
 	}
 }

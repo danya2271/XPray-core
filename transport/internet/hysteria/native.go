@@ -551,6 +551,10 @@ func (l *nativeListener) GenerationStatus() handoff.UDPConnectionStatus {
 	}
 }
 
+func (l *nativeListener) ReleaseGenerationReceive() ([]byte, error) {
+	return l.engine.ReleaseGenerationReceive()
+}
+
 type nativeInbound struct {
 	*native.Conn
 	user *protocol.MemoryUser
@@ -667,6 +671,9 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 					config.PacketTransmitFD = int(transmit.Fd())
 				}
 				config.PacketLocal = local.String()
+				if exporter, ok := raw.(interface{ DirectReceive() bool }); ok {
+					config.PacketDirectReceive = exporter.DirectReceive()
+				}
 				if exporter, ok := raw.(interface{ RingFiles() [3]*os.File }); ok {
 					for index, file := range exporter.RingFiles() {
 						if file != nil {
@@ -675,7 +682,12 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 					}
 				}
 				config.PacketBatch = ingressBatch(ctx)
-				config.DisablePMTUD = true
+				// Direct native TX uses the same public masked UDP socket and
+				// MTU feedback as ordinary native. A relayed send path cannot
+				// report public PMTU errors and keeps the conservative MTU.
+				if transmit == nil {
+					config.DisablePMTUD = true
+				}
 				engine, err := native.Start(ctx, config, file, local, nil, func(conn *native.Conn) { handler(&nativeInbound{Conn: conn, user: conn.User}) })
 				if err != nil {
 					return nil, err

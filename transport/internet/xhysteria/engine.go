@@ -94,6 +94,7 @@ type Config struct {
 	PacketLocal               string                                    `json:"packet_local,omitempty"`
 	PacketTransmitFD          int                                       `json:"packet_transmit_fd,omitempty"`
 	PacketRingFDs             [3]int                                    `json:"packet_ring_fds,omitempty"`
+	PacketDirectReceive       bool                                      `json:"packet_direct_receive,omitempty"`
 	QUICGeneration            *QUICGenerationConfig                     `json:"quic_generation,omitempty"`
 	Diagnostic                bool                                      `json:"diagnostic"`
 	ExternalAuth              bool                                      `json:"external_auth"`
@@ -522,6 +523,20 @@ func (e *Engine) GenerationWork() (uint64, bool) {
 		return 0, false
 	}
 	return uint64(count), true
+}
+
+func (e *Engine) ReleaseGenerationReceive() ([]byte, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.handle == nil {
+		return nil, net.ErrClosed
+	}
+	buffer := make([]byte, 512*1024)
+	size := int64(C.xhys_engine_release_receive(e.handle, (*C.uint8_t)(unsafe.Pointer(&buffer[0])), C.uintptr_t(len(buffer))))
+	if size < 0 || size > int64(len(buffer)) {
+		return nil, errors.New("native generation cannot confirm public UDP receive release")
+	}
+	return buffer[:size], nil
 }
 
 func (e *Engine) Close() error {
