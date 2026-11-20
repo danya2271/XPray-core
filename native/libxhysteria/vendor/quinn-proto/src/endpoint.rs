@@ -919,6 +919,11 @@ impl Endpoint {
         self.connections.len()
     }
 
+    /// Includes queued Initials not counted by open_connections.
+    pub fn incoming_connections(&self) -> usize {
+        self.incoming_buffers.len()
+    }
+
     /// Counter for the number of bytes currently used
     /// in the buffers for Initial and 0-RTT messages for pending incoming connections
     pub fn incoming_buffer_bytes(&self) -> u64 {
