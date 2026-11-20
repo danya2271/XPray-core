@@ -28,6 +28,28 @@ type NativeIngress struct {
 	used   [256]bool
 }
 
+// NativeIngressStats is approximate telemetry, not a QUIC drain certificate.
+type NativeIngressStats struct {
+	Received, Forwarded, Backpressure  uint64
+	QueueDrops, SendDrops, EgressDrops uint64
+	QueuedBytes, PeakQueuedBytes       uint64
+	Running                            bool
+}
+
+func (i *NativeIngress) Stats() NativeIngressStats {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	var stats C.XhysIngressStats
+	if i.handle == nil || !bool(C.xhys_ingress_stats(i.handle, &stats)) {
+		return NativeIngressStats{}
+	}
+	return NativeIngressStats{
+		Received: uint64(stats.received), Forwarded: uint64(stats.forwarded), Backpressure: uint64(stats.backpressure),
+		QueueDrops: uint64(stats.queue_drops), SendDrops: uint64(stats.send_drops), EgressDrops: uint64(stats.egress_drops),
+		QueuedBytes: uint64(stats.queued_bytes), PeakQueuedBytes: uint64(stats.peak_queued_bytes), Running: stats.running != 0,
+	}
+}
+
 func NewNativeIngress(public *net.UDPConn, key [16]byte, slot byte, masks []UDPMaskConfig) (*NativeIngress, error) {
 	if public == nil {
 		return nil, errors.New("native ingress requires a public UDP socket")

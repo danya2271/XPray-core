@@ -137,3 +137,72 @@ func TestNativeIngressPinsMasksAndSegmentedReply(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeIngressStalledGenerationDoesNotBlockActivation(t *testing.T) {
+	public, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer public.Close()
+	key := [16]byte{9, 4, 2}
+	ingress, err := NewNativeIngress(public, key, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ingress.Close()
+	stalled, err := ingress.Add(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalled.Close()
+	healthy, err := ingress.Add(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer healthy.Close()
+	view, err := handoff.ImportPacketEndpoint(healthy, *public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	client, err := net.DialUDP("udp4", nil, public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	old := make([]byte, 1200)
+	old[0] = 0x40
+	cid := handoff.NewQUICCIDCodec(key).Generate(0)
+	copy(old[1:], cid[:])
+	deadline := time.Now().Add(3 * time.Second)
+	for ingress.Stats().QueueDrops == 0 {
+		for range 256 {
+			if _, err := client.Write(old); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("could not saturate stalled generation: %+v", ingress.Stats())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := ingress.Activate(1); err != nil {
+		t.Fatal(err)
+	}
+	initial := make([]byte, 1200)
+	initial[0], initial[4], initial[5] = 0xc0, 1, 10
+	copy(initial[6:], "new-client")
+	if _, err := client.Write(initial); err != nil {
+		t.Fatal(err)
+	}
+	view.SetReadDeadline(time.Now().Add(time.Second))
+	var buffer [2048]byte
+	n, _, err := view.ReadFrom(buffer[:])
+	if err != nil || !bytes.Equal(initial, buffer[:n]) {
+		t.Fatalf("healthy generation blocked by stalled worker: %d, %v", n, err)
+	}
+	stats := ingress.Stats()
+	if !stats.Running || stats.QueuedBytes == 0 || stats.PeakQueuedBytes > 512*1024 || stats.Backpressure == 0 {
+		t.Fatalf("unexpected bounded queue state: %+v", stats)
+	}
+}
