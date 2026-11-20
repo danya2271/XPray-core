@@ -170,6 +170,180 @@ type delayedFenceSocket struct {
 	release  chan struct{}
 }
 
+type observedPacketSocket struct {
+	net.PacketConn
+	read chan struct{}
+}
+
+func (s *observedPacketSocket) ReadFrom(payload []byte) (int, net.Addr, error) {
+	n, from, err := s.PacketConn.ReadFrom(payload)
+	if err == nil {
+		select {
+		case s.read <- struct{}{}:
+		default:
+		}
+	}
+	return n, from, err
+}
+
+func TestUDPIngressBackpressureRetainsPacketAndDefersFence(t *testing.T) {
+	public, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := &observedPacketSocket{PacketConn: public, read: make(chan struct{}, 1)}
+	key := [16]byte{7}
+	ingress, err := NewUDPIngress(observed, key, 0, 8, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ingress.Close()
+	file, err := ingress.Add(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	worker, err := net.FileConn(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+	forNext, err := ingress.Add(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forNext.Close()
+	var filled int
+	if err := ingress.peers.Load()[0].raw.Control(func(fd uintptr) {
+		err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
+		if err != nil {
+			return
+		}
+		for {
+			if sendErr := unix.Send(int(fd), make([]byte, 1200), unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL); sendErr != nil {
+				if !errors.Is(sendErr, unix.EAGAIN) {
+					err = sendErr
+				}
+				break
+			}
+			filled++
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err != nil || filled == 0 {
+		t.Fatalf("could not fill worker socket: filled=%d, %v", filled, err)
+	}
+	client, err := net.DialUDP("udp4", nil, public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	packet := append(shortPacket(NewQUICCIDCodec(key), 0), 0x71)
+	if _, err := client.Write(packet); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-observed.read:
+	case <-time.After(time.Second):
+		t.Fatal("public datagram not read")
+	}
+	if err := ingress.Activate(1); err != nil {
+		t.Fatal("blocked receive prevented admission switch:", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	fenced := make(chan error, 1)
+	go func() { _, err := ingress.FenceInitials(ctx, 0); fenced <- err }()
+	select {
+	case err := <-fenced:
+		t.Fatalf("fenced before held datagram was delivered: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if ingress.Dropped() != 0 {
+		t.Fatal("backpressure discarded the held datagram")
+	}
+	if err := worker.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 2048)
+	for range filled {
+		if _, err := worker.Read(buffer); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := worker.Read(buffer)
+	if err != nil || !bytes.Equal(buffer[packetHeaderSize:n], packet) {
+		t.Fatalf("held datagram lost or changed: %d, %v", n, err)
+	}
+	if err := <-fenced; err != nil {
+		t.Fatal(err)
+	}
+	if ingress.Dropped() != 0 {
+		t.Fatal("ingress reported loss after successful retry")
+	}
+}
+
+func TestUDPIngressCloseInterruptsBackpressure(t *testing.T) {
+	public, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := &observedPacketSocket{PacketConn: public, read: make(chan struct{}, 1)}
+	ingress, err := NewUDPIngress(observed, [16]byte{7}, 0, 8, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ingress.Close()
+	file, err := ingress.Add(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close() // Keep the receiver alive and deliberately unread.
+	if err := ingress.peers.Load()[0].raw.Control(func(fd uintptr) {
+		err = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
+		if err != nil {
+			return
+		}
+		for {
+			if sendErr := unix.Send(int(fd), make([]byte, 1200), unix.MSG_DONTWAIT|unix.MSG_NOSIGNAL); sendErr != nil {
+				if !errors.Is(sendErr, unix.EAGAIN) {
+					err = sendErr
+				}
+				return
+			}
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := net.DialUDP("udp4", nil, public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Write(shortPacket(NewQUICCIDCodec([16]byte{7}), 0)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-observed.read:
+	case <-time.After(time.Second):
+		t.Fatal("public datagram not read")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- ingress.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("socket shutdown did not interrupt the held write")
+	}
+}
+
 func (s *delayedFenceSocket) ReadFrom(p []byte) (int, net.Addr, error) {
 	n, addr, err := s.PacketConn.ReadFrom(p)
 	var timeout net.Error
@@ -393,7 +567,7 @@ func TestManagedTransmitDescriptorOwnershipAndAddress(t *testing.T) {
 	}
 }
 
-func TestUDPIngressIsolatesBackpressure(t *testing.T) {
+func TestUDPIngressResumesAfterBackpressureWithoutDropping(t *testing.T) {
 	local := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
 	public, err := net.ListenUDP("udp4", local)
 	if err != nil {
@@ -410,7 +584,12 @@ func TestUDPIngressIsolatesBackpressure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer old.Close() // Deliberately never read from this endpoint.
+	defer old.Close()
+	oldWorker, err := ImportPacketEndpoint(old, *public.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldWorker.Close()
 	if _, err := ingress.Add(1); err == nil {
 		t.Fatal("accepted duplicate generation slot")
 	}
@@ -435,38 +614,40 @@ func TestUDPIngressIsolatesBackpressure(t *testing.T) {
 	defer client.Close()
 	codec := NewQUICCIDCodec(key)
 	stale := shortPacket(codec, 1)
-	for range 2000 {
+	for range 128 {
 		if _, err := client.Write(stale); err != nil {
 			t.Fatal(err)
 		}
 	}
-	deadline := time.Now().Add(time.Second)
-	for ingress.Dropped() == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if ingress.Dropped() == 0 {
-		t.Fatal("old worker's bounded queue did not fill")
+	time.Sleep(20 * time.Millisecond)
+	if ingress.Dropped() != 0 {
+		t.Fatal("backpressure dropped an old-generation packet")
 	}
 	if err := ingress.Activate(2); err != nil {
 		t.Fatal(err)
+	}
+	if err := oldWorker.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var received [2048]byte
+	for sequence := range 128 {
+		n, _, err := oldWorker.ReadFrom(received[:])
+		if err != nil || !bytes.Equal(received[:n], stale) {
+			t.Fatalf("old generation packet %d was lost: %d, %v", sequence, n, err)
+		}
 	}
 	initial := initialPacket(1, 0, "new-client-id")
 	var data [2048]byte
 	var n int
 	var address net.Addr
-	deadline = time.Now().Add(time.Second)
-	// The real UDP socket can also drop during the flood. Retry the Initial,
-	// like a client, instead of relying on arrival of the first datagram.
-	for {
-		if _, err = client.Write(initial); err != nil {
-			t.Fatal(err)
-		}
-		worker.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
-		n, address, err = worker.ReadFrom(data[:])
-		if err == nil || time.Now().After(deadline) {
-			break
-		}
+	deadline := time.Now().Add(time.Second)
+	if _, err = client.Write(initial); err != nil {
+		t.Fatal(err)
 	}
+	if err := worker.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	n, address, err = worker.ReadFrom(data[:])
 	if err != nil || !bytes.Equal(data[:n], initial) || address.String() != client.LocalAddr().String() {
 		t.Fatalf("candidate ingress received %d bytes from %v: %v", n, address, err)
 	}
@@ -476,6 +657,9 @@ func TestUDPIngressIsolatesBackpressure(t *testing.T) {
 	client.SetReadDeadline(time.Now().Add(time.Second))
 	if n, err := client.Read(data[:]); err != nil || string(data[:n]) != "ok" {
 		t.Fatalf("candidate egress received %q: %v", data[:n], err)
+	}
+	if ingress.Dropped() != 0 {
+		t.Fatal("resumed ingress reported packet loss")
 	}
 }
 
