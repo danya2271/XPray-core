@@ -1,5 +1,6 @@
 //! Opt-in managed ingress. Masks and batched public UDP I/O stay in Rust.
-//! Control changes are acknowledged by the sole receive owner, between batches.
+//! Admission changes are acknowledged by the sole receive owner. Held batches
+//! retain their receive-time admission; ownership fences wait for their delivery.
 //! This module does not certify QUIC retirement or implement crash recovery.
 
 use crate::{generation_cid, mask_socket, packet_ring, packet_socket};
@@ -201,7 +202,17 @@ fn adopt_receive(
 }
 
 impl Routes {
+    #[cfg(test)]
     fn route(&mut self, packet: &[u8], live: &[bool; 256]) -> Option<u8> {
+        self.route_with_admission(packet, live, self.current)
+    }
+
+    fn route_with_admission(
+        &mut self,
+        packet: &[u8],
+        live: &[bool; 256],
+        admission: u8,
+    ) -> Option<u8> {
         let first = *packet.first()?;
         if first & 0x80 == 0 {
             if packet.len() < 18 {
@@ -248,12 +259,12 @@ impl Routes {
         if !self.pins.contains_key(&key) && self.pins.len() >= PIN_LIMIT {
             return None;
         }
-        if !live[self.current as usize] {
+        if !live[admission as usize] {
             return None;
         }
         self.pins
-            .insert(key, (self.current, now + Duration::from_secs(30)));
-        Some(self.current)
+            .insert(key, (admission, now + Duration::from_secs(30)));
+        Some(admission)
     }
 }
 
@@ -291,10 +302,11 @@ fn frame_shape(
 fn group_ring_packets<'a>(
     packets: &[(SocketAddr, &'a [u8])],
     grouped: &mut [(SocketAddr, &'a [u8]); BATCH],
-) {
+) -> [u8; BATCH] {
     debug_assert!(packets.len() <= BATCH);
     let mut consumed = 0u32;
     let mut written = 0;
+    let mut order = [0u8; BATCH];
     for (index, &(address, _)) in packets.iter().enumerate() {
         if consumed & (1 << index) != 0 {
             continue;
@@ -302,12 +314,14 @@ fn group_ring_packets<'a>(
         for (peer_index, &packet) in packets.iter().enumerate().skip(index) {
             if consumed & (1 << peer_index) == 0 && packet.0 == address {
                 grouped[written] = packet;
+                order[written] = peer_index as u8;
                 written += 1;
                 consumed |= 1 << peer_index;
             }
         }
     }
     debug_assert_eq!(written, packets.len());
+    order
 }
 
 fn send_messages(
@@ -409,7 +423,7 @@ impl Peer {
     }
 
     #[cfg(test)]
-    fn forward(&mut self, packets: &[(SocketAddr, &[u8])], health: &Health) {
+    fn forward(&mut self, packets: &[(SocketAddr, &[u8])], health: &Health) -> u32 {
         self.forward_with_destination(packets, health, None)
     }
 
@@ -418,24 +432,38 @@ impl Peer {
         packets: &[(SocketAddr, &[u8])],
         health: &Health,
         destination: Option<IpAddr>,
-    ) {
+    ) -> u32 {
         if packets.is_empty() {
-            return;
+            return 0;
         }
+        assert!(packets.len() <= BATCH);
         let mut grouped = [(packets[0].0, &[][..]); BATCH];
-        let packets = if self.ring.is_some() && packets.len() <= BATCH {
-            group_ring_packets(packets, &mut grouped);
+        let mut order = std::array::from_fn(|index| index as u8);
+        let packets = if self.ring.is_some() {
+            order = group_ring_packets(packets, &mut grouped);
             &grouped[..packets.len()]
         } else {
             packets
         };
+        let accepted = self.forward_ordered(packets, health, destination);
+        order[..accepted]
+            .iter()
+            .fold(0, |mask, &index| mask | (1u32 << index))
+    }
+
+    fn forward_ordered(
+        &mut self,
+        packets: &[(SocketAddr, &[u8])],
+        health: &Health,
+        destination: Option<IpAddr>,
+    ) -> usize {
         let sent = if self.queue.is_empty() {
             match self.try_forward(packets, destination) {
                 Ok(sent) => sent,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
                 Err(_) => {
                     health.drop_send(packets.len());
-                    return;
+                    return packets.len();
                 }
             }
         } else {
@@ -443,16 +471,13 @@ impl Peer {
         };
         health.forwarded.fetch_add(sent as u64, Ordering::Relaxed);
         let pending = &packets[sent..];
-        health
-            .backpressure
-            .fetch_add(pending.len() as u64, Ordering::Relaxed);
         let mut index = 0;
         while index < pending.len() {
             let Ok((count, header)) =
                 frame_shape(&pending[index..], if self.ring.is_some() { 32 } else { 8 })
             else {
                 health.drop_send(pending.len() - index);
-                break;
+                return packets.len();
             };
             let length = HEADER
                 + pending[index..index + count]
@@ -460,10 +485,9 @@ impl Peer {
                     .map(|p| p.1.len())
                     .sum::<usize>();
             if self.queue.len() == QUEUE_FRAMES || self.bytes + length > QUEUE_BYTES {
-                health
-                    .queue_drops
-                    .fetch_add(count as u64, Ordering::Relaxed);
-                health.drops.fetch_add(count as u64, Ordering::Relaxed);
+                // The receive owner retains the unaccepted tail in its
+                // existing RX buffers. Never consume and drop on backpressure.
+                break;
             } else {
                 let mut wire = Vec::with_capacity(length);
                 wire.extend_from_slice(&header);
@@ -481,9 +505,11 @@ impl Peer {
                     .fetch_add(length as u64, Ordering::Relaxed)
                     + length as u64;
                 health.peak_queued_bytes.fetch_max(total, Ordering::Relaxed);
+                health.backpressure.fetch_add(count as u64, Ordering::Relaxed);
             }
             index += count;
         }
+        sent + index
     }
 
     fn flush(&mut self, health: &Health) -> io::Result<()> {
@@ -554,8 +580,8 @@ impl Peer {
     }
 }
 
-// One readiness turn per generation, never wait for one worker in the public
-// receive branch. Admission commands and healthy workers remain independent.
+// One readiness turn per generation. Admission commands and healthy workers
+// within a held batch remain independent; a full batch pauses public reception.
 fn poll_pending(
     peers: &mut [Option<Peer>; 256],
     slots: &[u8],
@@ -593,6 +619,168 @@ fn poll_pending(
         Poll::Ready(())
     } else {
         Poll::Pending
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HeldPacket {
+    buffer: usize,
+    start: usize,
+    end: usize,
+    slot: u8,
+    address: SocketAddr,
+    destination: Option<IpAddr>,
+}
+
+struct ReceivedBatch {
+    count: usize,
+    index: usize,
+    offset: usize,
+    admission: u8,
+    held: [Option<HeldPacket>; BATCH],
+}
+
+impl ReceivedBatch {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            index: 0,
+            offset: 0,
+            admission: 0,
+            held: [None; BATCH],
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.index < self.count || self.held.iter().any(Option::is_some)
+    }
+
+    fn received(&mut self, count: usize, admission: u8) {
+        assert!(!self.pending());
+        self.count = count;
+        self.index = 0;
+        self.offset = 0;
+        self.admission = admission;
+    }
+
+    fn prepare(
+        &mut self,
+        buffers: &[IoSliceMut<'_>],
+        metadata: &[udp::RecvMeta],
+        routes: &mut Routes,
+        live: &[bool; 256],
+        local: SocketAddr,
+        health: &Health,
+    ) {
+        if self.held.iter().any(Option::is_some) {
+            return;
+        }
+        let mut written = 0;
+        while self.index < self.count && written < BATCH {
+            let meta = metadata[self.index];
+            if meta.stride == 0 || self.offset >= meta.len {
+                self.index += 1;
+                self.offset = 0;
+                continue;
+            }
+            let start = self.offset;
+            let end = start.saturating_add(meta.stride).min(meta.len);
+            self.offset = end;
+            let payload = &buffers[self.index][start..end];
+            let Some(slot) = routes.route_with_admission(payload, live, self.admission) else {
+                continue;
+            };
+            let destination = local.ip().is_unspecified().then_some(meta.dst_ip).flatten();
+            if local.ip().is_unspecified() && destination.is_none() {
+                health.drop_send(1);
+                continue;
+            }
+            let address = if local.is_ipv4() {
+                match meta.addr {
+                    SocketAddr::V6(address) if address.ip().to_ipv4_mapped().is_some() => {
+                        SocketAddr::new(address.ip().to_ipv4_mapped().unwrap().into(), address.port())
+                    }
+                    other => other,
+                }
+            } else {
+                meta.addr
+            };
+            self.held[written] = Some(HeldPacket {
+                buffer: self.index,
+                start,
+                end,
+                slot,
+                address,
+                destination,
+            });
+            written += 1;
+        }
+    }
+
+    fn poll_forward(
+        &mut self,
+        buffers: &[IoSliceMut<'_>],
+        peers: &mut [Option<Peer>; 256],
+        health: &Health,
+        cx: &mut Context<'_>,
+    ) -> Poll<()> {
+        let mut grouped = 0u32;
+        let mut progressed = false;
+        for index in 0..BATCH {
+            let Some(first) = self.held[index] else {
+                continue;
+            };
+            if grouped & (1 << index) != 0 {
+                continue;
+            }
+            let mut packets = [(first.address, &[][..]); BATCH];
+            let mut positions = [0usize; BATCH];
+            let mut count = 0;
+            for (position, held) in self.held.iter().enumerate().skip(index) {
+                let Some(packet) = held else {
+                    continue;
+                };
+                if packet.slot == first.slot && packet.destination == first.destination {
+                    grouped |= 1 << position;
+                    positions[count] = position;
+                    packets[count] = (
+                        packet.address,
+                        &buffers[packet.buffer][packet.start..packet.end],
+                    );
+                    count += 1;
+                }
+            }
+            let Some(peer) = peers[first.slot as usize].as_mut() else {
+                // An admitted receiver disappearing is a real send failure,
+                // never successful delivery or a reason to change ownership.
+                health.drop_send(count);
+                for &position in &positions[..count] {
+                    self.held[position] = None;
+                }
+                progressed = true;
+                continue;
+            };
+            let accepted =
+                peer.forward_with_destination(&packets[..count], health, first.destination);
+            for (packet, &position) in positions[..count].iter().enumerate() {
+                if accepted & (1 << packet) != 0 {
+                    self.held[position] = None;
+                    progressed = true;
+                }
+            }
+            if accepted != u32::MAX >> (BATCH - count) {
+                // Register space readiness even if the bounded queue is full.
+                // poll_pending flushes that queue before this branch is polled.
+                if peer.poll_writable(cx).is_ready() {
+                    cx.waker().wake_by_ref();
+                }
+            }
+        }
+        if progressed {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -708,9 +896,11 @@ async fn run(
     let mut storage: Vec<Vec<u8>> = (0..BATCH).map(|_| vec![0; 65536]).collect();
     let mut buffers: Vec<IoSliceMut<'_>> = storage.iter_mut().map(|p| IoSliceMut::new(p)).collect();
     let mut metadata = [udp::RecvMeta::default(); BATCH];
+    let mut received_batch = ReceivedBatch::new();
     health.running.store(true, Ordering::Release);
     let _ = ready.send(true);
     loop {
+        received_batch.prepare(&buffers, &metadata, &mut routes, &live, local, &health);
         tokio::select! {
             biased;
             command = commands.recv() => match command {
@@ -779,7 +969,7 @@ async fn run(
                     let now = Instant::now();
                     let pinned = routes.pins.values().any(|&(owner, until)| owner == slot && now < until);
                     let Some(peer) = peers[slot as usize].as_mut() else { let _ = ack.send(false); continue; };
-                    if public.is_none() || routes.current == slot || pinned || token == [0;16] {
+                    if received_batch.pending() || public.is_none() || routes.current == slot || pinned || token == [0;16] {
                         let _ = ack.send(false); continue;
                     }
                     if let Some(previous) = peer.fence {
@@ -797,7 +987,7 @@ async fn run(
                 }
                 Some(Command::Retire(slot, token, ack)) => {
                     if let Some(previous) = retired[slot as usize] { let _ = ack.send(previous == token); continue; }
-                    let valid = routes.current != slot && peers[slot as usize].as_ref().is_some_and(|p| p.fence == Some(token) && p.queue.is_empty());
+                    let valid = !received_batch.pending() && routes.current != slot && peers[slot as usize].as_ref().is_some_and(|p| p.fence == Some(token) && p.queue.is_empty());
                     if valid {
                         live[slot as usize] = false;
                         retired[slot as usize] = Some(token);
@@ -828,7 +1018,7 @@ async fn run(
                     // egress. Only direct-TX peers have no relay replies to lose.
                     let direct_transmit = slots.iter().all(|&slot| peers[slot as usize].as_ref().unwrap().direct_transmit);
                     let Some(peer) = peers[slot as usize].as_mut() else { let _ = ack.send(false); continue; };
-                    if public.is_none() || routes.current != slot || !only_current || !direct_transmit || peer.ring.is_none() || !peer.queue.is_empty() || token == [0;16] {
+                    if received_batch.pending() || public.is_none() || routes.current != slot || !only_current || !direct_transmit || peer.ring.is_none() || !peer.queue.is_empty() || token == [0;16] {
                         let _ = ack.send(false); continue;
                     }
                     let duplicate = unsafe { libc::fcntl(public_descriptor, libc::F_DUPFD_CLOEXEC, 3) };
@@ -849,36 +1039,25 @@ async fn run(
                 _ => break,
             },
             _ = outputs.join_next(), if !outputs.is_empty() => break,
-            _ = poll_fn(|cx| poll_pending(&mut peers, &slots, &health, cx)) => {}
-            received = poll_fn(|cx| public.as_ref().unwrap().poll_recv(cx, &mut buffers, &mut metadata)), if public.is_some() => {
-                let count = received?;
-                let mut pending: [(SocketAddr, &[u8]); BATCH] = [(local, &[]); BATCH];
-                let mut pending_count = 0;
-                let mut pending_slot = 0;
-                let mut pending_destination=None;
-                for index in 0..count {
-                    let meta = metadata[index];
-                    if meta.stride == 0 { continue; }
-                    health.received.fetch_add(meta.len.div_ceil(meta.stride) as u64, Ordering::Relaxed);
-                    for payload in buffers[index][..meta.len].chunks(meta.stride) {
-                        let Some(slot) = routes.route(payload, &live) else { continue; };
-                        let destination=local.ip().is_unspecified().then_some(meta.dst_ip).flatten();
-                        if local.ip().is_unspecified() && destination.is_none(){health.drop_send(1);continue;}
-                        if pending_count != 0 && (pending_slot != slot || pending_count == BATCH || pending_destination!=destination) {
-                            peers[pending_slot as usize].as_mut().unwrap().forward_with_destination(&pending[..pending_count], &health,pending_destination);
-                            pending_count = 0;
-                        }
-                        pending_slot = slot;
-                        pending_destination=destination;
-                        let address = if local.is_ipv4() {
-                            match meta.addr { SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some() => SocketAddr::new(a.ip().to_ipv4_mapped().unwrap().into(), a.port()), other => other }
-                        } else { meta.addr };
-                        pending[pending_count] = (address, payload);
-                        pending_count += 1;
-                    }
+            received = poll_fn(|cx| {
+                if poll_pending(&mut peers, &slots, &health, cx).is_ready() {
+                    return Poll::Ready(Ok(None));
                 }
-                if pending_count != 0 {
-                    peers[pending_slot as usize].as_mut().unwrap().forward_with_destination(&pending[..pending_count], &health,pending_destination);
+                if received_batch.pending() {
+                    return received_batch.poll_forward(&buffers, &mut peers, &health, cx)
+                        .map(|()| Ok(None));
+                }
+                match &public {
+                    Some(socket) => socket.poll_recv(cx, &mut buffers, &mut metadata).map(|result| result.map(Some)),
+                    None => Poll::Pending,
+                }
+            }) => {
+                if let Some(count) = received? {
+                    for meta in &metadata[..count] {
+                        if meta.stride == 0 { continue; }
+                        health.received.fetch_add(meta.len.div_ceil(meta.stride) as u64, Ordering::Relaxed);
+                    }
+                    received_batch.received(count, routes.current);
                 }
             }
         }
@@ -1275,6 +1454,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ring_partial_acceptance_preserves_original_packet_positions() {
+        let (mut peer, _) = peer();
+        let mut sender = packet_ring::Sender::new().unwrap();
+        let descriptors = sender.export().unwrap();
+        let mut receiver = packet_ring::Receiver::import(
+            descriptors[0].as_raw_fd(),
+            descriptors[1].as_raw_fd(),
+            descriptors[2].as_raw_fd(),
+        )
+        .unwrap();
+        let a: SocketAddr = "127.0.0.1:123".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:456".parse().unwrap();
+        let payload = [0x71u8; 1200];
+        let header = packet_socket::encode_header(a, payload.len()).unwrap();
+        while sender.batch().push(&header, &[(a, &payload)]).is_ok() {}
+        peer.ring = Some(sender);
+        let health = Health::default();
+        let queued = [(a, payload.as_slice()); BATCH];
+        while peer.forward(&queued, &health) != 0 {}
+        // Leave room for exactly A's grouped frame, but not B's frame.
+        let remaining = QUEUE_BYTES - peer.bytes;
+        let reserved = HEADER + payload.len() * 2;
+        let filler = vec![0x72u8; remaining - reserved - HEADER];
+        assert_eq!(peer.forward(&[(a, &filler)], &health), 1);
+        assert_eq!(QUEUE_BYTES - peer.bytes, reserved);
+        let packets = [
+            (a, payload.as_slice()),
+            (b, &payload),
+            (a, &payload),
+            (b, &payload),
+        ];
+        assert_eq!(peer.forward(&packets, &health), 0b0101);
+        assert_eq!(peer.queue.back().unwrap().packets, 2);
+        let mut buffer = [0u8; 65535];
+        let mut buffers = [IoSliceMut::new(&mut buffer)];
+        let mut metadata = [udp::RecvMeta::default()];
+        poll_fn(|cx| receiver.poll_recv(cx, &mut buffers, &mut metadata, a))
+            .await
+            .unwrap();
+        peer.flush(&health).unwrap();
+        assert_eq!(peer.forward(&[packets[1], packets[3]], &health), 0b11);
+        assert_eq!(health.drops.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn receive_adoption_preserves_pending_initial_routes_after_activation() {
         let mut routes = Routes {
@@ -1608,13 +1832,14 @@ mod tests {
         for port in 1..=QUEUE_FRAMES * 2 {
             let mut peer = address;
             peer.set_port(port as u16);
-            blocked.forward(&[(peer, &payload)], &health);
+            let accepted = blocked.forward(&[(peer, &payload)], &health);
+            assert_eq!(accepted, u32::from(port <= QUEUE_FRAMES));
         }
         assert!(blocked.bytes <= QUEUE_BYTES);
         assert_eq!(blocked.queue.len(), QUEUE_FRAMES);
         assert_eq!(
             health.queue_drops.load(Ordering::Relaxed),
-            QUEUE_FRAMES as u64
+            0
         );
         healthy.forward(&[(address, &payload)], &health);
         let mut peers = std::array::from_fn(|_| None);
@@ -1632,5 +1857,187 @@ mod tests {
         .unwrap();
         assert!(!peers[0].as_ref().unwrap().queue.is_empty());
         assert_eq!(health.forwarded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn held_rx_batch_retries_without_loss_and_serves_another_generation() {
+        let (mut blocked, receiver) = peer();
+        let saturated = saturate(&blocked).await;
+        let (healthy, healthy_receiver) = peer();
+        let health = Health::default();
+        let address: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let payload = [0x71u8; 1200];
+        for port in 1..=QUEUE_FRAMES {
+            let peer = SocketAddr::new(address.ip(), port as u16);
+            assert_eq!(blocked.forward(&[(peer, &payload)], &health), 1);
+        }
+        let mut peers = std::array::from_fn(|_| None);
+        peers[0] = Some(blocked);
+        peers[1] = Some(healthy);
+        let mut wire = [0x55u8; 2400];
+        wire[1200..].fill(0x66);
+        let buffers = [IoSliceMut::new(&mut wire)];
+        let mut batch = ReceivedBatch::new();
+        batch.held[0] = Some(HeldPacket {
+            buffer: 0,
+            start: 0,
+            end: 1200,
+            slot: 0,
+            address,
+            destination: None,
+        });
+        batch.held[1] = Some(HeldPacket {
+            buffer: 0,
+            start: 1200,
+            end: 2400,
+            slot: 1,
+            address,
+            destination: None,
+        });
+        poll_fn(|cx| batch.poll_forward(&buffers, &mut peers, &health, cx)).await;
+        assert!(batch.pending());
+        assert!(batch.held[0].is_some());
+        assert!(batch.held[1].is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !peers[1].as_ref().unwrap().queue.is_empty() {
+                poll_fn(|cx| poll_pending(&mut peers, &[0, 1], &health, cx)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut received = [0; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(1), healthy_receiver.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(received[HEADER..n].iter().all(|&byte| byte == 0x66));
+        assert_eq!(health.drops.load(Ordering::Relaxed), 0);
+        let reader = tokio::spawn(async move {
+            let mut frame = [0; 2048];
+            for _ in 0..saturated {
+                receiver.recv(&mut frame).await.unwrap();
+            }
+            for sequence in 0..=QUEUE_FRAMES {
+                let n = receiver.recv(&mut frame).await.unwrap();
+                let expected = if sequence == QUEUE_FRAMES { 0x55 } else { 0x71 };
+                assert!(frame[HEADER..n].iter().all(|&byte| byte == expected));
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while batch.pending() || !peers[0].as_ref().unwrap().queue.is_empty() {
+                poll_fn(|cx| {
+                    if poll_pending(&mut peers, &[0, 1], &health, cx).is_ready() {
+                        return Poll::Ready(());
+                    }
+                    batch.poll_forward(&buffers, &mut peers, &health, cx)
+                })
+                .await;
+            }
+            reader.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(health.drops.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            health.forwarded.load(Ordering::Relaxed),
+            (QUEUE_FRAMES + 2) as u64
+        );
+        assert_eq!(health.queued_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn held_initial_uses_receive_time_admission_after_control_switch() {
+        let address: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let mut routes = Routes {
+            codec: generation_cid::Generator::new(&generation_cid::Config {
+                key: [1; 16],
+                slot: 0,
+            }),
+            current: 1,
+            pins: HashMap::new(),
+            next_gc: Instant::now(),
+            leases: [0; 256],
+        };
+        let live = [true; 256];
+        let mut wire = [0; 1200];
+        wire[0] = 0xc0;
+        wire[4] = 1;
+        wire[5] = 8;
+        wire[6..14].copy_from_slice(b"held-cid");
+        let buffers = [IoSliceMut::new(&mut wire)];
+        let metadata = [udp::RecvMeta {
+            addr: address,
+            len: 1200,
+            stride: 1200,
+            ecn: None,
+            dst_ip: Some(address.ip()),
+        }];
+        let mut batch = ReceivedBatch::new();
+        batch.received(1, 0);
+        batch.prepare(
+            &buffers,
+            &metadata,
+            &mut routes,
+            &live,
+            address,
+            &Health::default(),
+        );
+        assert_eq!(batch.held[0].unwrap().slot, 0);
+        assert!(batch.pending());
+    }
+
+    #[test]
+    fn held_gro_batch_preserves_every_segment_and_receive_time_admission() {
+        let address: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let mut routes = Routes {
+            codec: generation_cid::Generator::new(&generation_cid::Config {
+                key: [1; 16],
+                slot: 0,
+            }),
+            current: 1,
+            pins: HashMap::new(),
+            next_gc: Instant::now(),
+            leases: [0; 256],
+        };
+        let live = [true; 256];
+        // GRO can contain more than BATCH segments and a shorter final segment.
+        let mut wire = vec![0u8; 40 * 1500 - 20];
+        for (index, segment) in wire.chunks_mut(1500).enumerate() {
+            segment[0] = 0xc0;
+            segment[4] = 1;
+            segment[5] = 8;
+            segment[6..14].copy_from_slice(&(index as u64).to_be_bytes());
+        }
+        let buffers = [IoSliceMut::new(&mut wire)];
+        let metadata = [udp::RecvMeta {
+            addr: address,
+            len: buffers[0].len(),
+            stride: 1500,
+            ecn: None,
+            dst_ip: Some(address.ip()),
+        }];
+        let health = Health::default();
+        let mut batch = ReceivedBatch::new();
+        batch.received(1, 0);
+        let mut seen = Vec::new();
+        while batch.pending() {
+            batch.prepare(&buffers, &metadata, &mut routes, &live, address, &health);
+            let retained = batch.held;
+            // Preparing again must not overwrite any unaccepted packet.
+            batch.prepare(&buffers, &metadata, &mut routes, &live, address, &health);
+            for (before, after) in retained.iter().zip(&batch.held) {
+                assert_eq!(before.map(|p| p.start), after.map(|p| p.start));
+            }
+            for packet in batch.held.iter_mut() {
+                if let Some(packet) = packet.take() {
+                    assert_eq!(packet.slot, 0);
+                    let payload = &buffers[packet.buffer][packet.start..packet.end];
+                    seen.push(u64::from_be_bytes(payload[6..14].try_into().unwrap()));
+                    assert_eq!(payload.len(), if seen.len() == 40 { 1480 } else { 1500 });
+                }
+            }
+        }
+        assert_eq!(seen, (0..40).collect::<Vec<u64>>());
+        assert_eq!(health.drops.load(Ordering::Relaxed), 0);
     }
 }
