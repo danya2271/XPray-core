@@ -1,0 +1,139 @@
+//go:build xhysteria_native && cgo && linux && !android
+
+package xhysteria
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"net"
+	"os"
+	"testing"
+	"time"
+
+	xnet "github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet/finalmask"
+	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/header"
+	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
+	"github.com/xtls/xray-core/transport/internet/handoff"
+)
+
+func TestNativeIngressPinsMasksAndSegmentedReply(t *testing.T) {
+	for _, masked := range []bool{false, true} {
+		name := "plain"
+		if masked {
+			name = "salamander-wireguard"
+		}
+		t.Run(name, func(t *testing.T) {
+			public, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer public.Close()
+			var config []UDPMaskConfig
+			if masked {
+				config = []UDPMaskConfig{{Kind: "wireguard"}, {Kind: "salamander", Password: "test-password"}}
+			}
+			key := [16]byte{1, 2, 3}
+			ingress, err := NewNativeIngress(public, key, 0, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ingress.Close()
+			if err := ingress.Activate(0); err == nil {
+				t.Fatal("activated missing generation")
+			}
+			views := make([]*handoff.PacketEndpoint, 2)
+			var files []*os.File
+			defer func() {
+				for _, file := range files {
+					file.Close()
+				}
+			}()
+			for slot := range views {
+				file, err := ingress.Add(byte(slot))
+				if err != nil {
+					t.Fatal(err)
+				}
+				files = append(files, file)
+				view, err := handoff.ImportPacketEndpoint(file, *public.LocalAddr().(*net.UDPAddr))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer view.Close()
+				views[slot] = view
+			}
+			if _, err := ingress.Add(1); err == nil {
+				t.Fatal("reused generation slot")
+			}
+			client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var packet net.PacketConn = client
+			if masked {
+				packet, err = finalmask.NewFinalMask(nil, []finalmask.UDPMask{
+					&salamander.Config{Password: "test-password"}, &header.Config{ID: int32(header.WIREGUARD)},
+				}, nil, nil, nil, func(context.Context, xnet.Addr) (xnet.PacketConn, error) { return client, nil }).ListenPacket(t.Context(), client.LocalAddr())
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer packet.Close()
+			initial := func(id string) []byte {
+				p := make([]byte, 1200)
+				p[0], p[4], p[5] = 0xc0, 1, byte(len(id))
+				copy(p[6:], id)
+				return p
+			}
+			check := func(data []byte, slot int) {
+				t.Helper()
+				if _, err := packet.WriteTo(data, public.LocalAddr()); err != nil {
+					t.Fatal(err)
+				}
+				views[slot].SetReadDeadline(time.Now().Add(time.Second))
+				buffer := make([]byte, 2048)
+				n, from, err := views[slot].ReadFrom(buffer)
+				if err != nil || !bytes.Equal(data, buffer[:n]) || from.String() != packet.LocalAddr().String() {
+					t.Fatalf("routed to %d: %d bytes from %v, %v", slot, n, from, err)
+				}
+			}
+			check(initial("client-old"), 0)
+			if err := ingress.Activate(1); err != nil {
+				t.Fatal(err)
+			}
+			check(initial("client-old"), 0)
+			check(initial("client-new"), 1)
+			cid := handoff.NewQUICCIDCodec(key).Generate(0)
+			established := append([]byte{0x40}, cid[:]...)
+			established = append(established, 1)
+			check(established, 0)
+			// Send a native-style segmented frame on the generation side.
+			worker, err := net.FileConn(files[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer worker.Close()
+			payload := bytes.Repeat([]byte{0x37}, 2401)
+			wire := make([]byte, packetHeader+len(payload))
+			n, err := encodePacket(wire, packet.LocalAddr().(*net.UDPAddr), payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire[0] = 2
+			binary.BigEndian.PutUint16(wire[20:22], 1200)
+			binary.BigEndian.PutUint16(wire[22:24], uint16(len(payload)))
+			if _, err := worker.Write(wire[:n]); err != nil {
+				t.Fatal(err)
+			}
+			packet.SetReadDeadline(time.Now().Add(time.Second))
+			var buffer [4096]byte
+			for offset := 0; offset < len(payload); offset += 1200 {
+				n, _, err := packet.ReadFrom(buffer[:])
+				if err != nil || !bytes.Equal(buffer[:n], payload[offset:min(offset+1200, len(payload))]) {
+					t.Fatalf("segmented reply at %d: %d, %v", offset, n, err)
+				}
+			}
+		})
+	}
+}

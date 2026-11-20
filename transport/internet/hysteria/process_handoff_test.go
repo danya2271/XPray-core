@@ -177,7 +177,7 @@ func testManagedHysteria(t *testing.T, binary string, nativeA, nativeB, masked, 
 			t.Fatal(err)
 		}
 		control := filepath.Join(dir, "ctl.sock")
-		manifest, err := json.Marshal(handoff.Manifest{Control: control, UDP: []handoff.UDPBinding{{Tag: "hy", Address: local.IP.String(), Port: local.Port, FD: 3, Key: key, Slot: slot}}})
+		manifest, err := json.Marshal(handoff.Manifest{Control: control, UDP: []handoff.UDPBinding{{Tag: "hy", Address: local.IP.String(), Port: local.Port, FD: 3, Key: key, Slot: slot, PacketBatch: true}}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -351,7 +351,7 @@ func testManagedHysteria(t *testing.T, binary string, nativeA, nativeB, masked, 
 	}
 	for _, socket := range []handoff.ControlSocket{a, b} {
 		reply, err := socket.Command(ctx, "quic-status")
-		if info := reply.UDP[fmt.Sprintf("hy:%d", local.Port)]; err != nil || !info.Known || info.Count != 2 {
+		if info := reply.UDP[fmt.Sprintf("hy:%d", local.Port)]; err != nil || !info.Known || info.Count != 2 || !info.WorkKnown || info.TransportWork < 2 {
 			t.Fatalf("UDP accounting %s: %+v (%v)", socket, reply, err)
 		}
 	}

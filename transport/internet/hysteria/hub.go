@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -158,6 +159,7 @@ type Listener struct {
 	tracked  bool
 	live     atomic.Uint64
 	closed   atomic.Bool
+	work     *generationWork
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
@@ -202,6 +204,27 @@ func (l *Listener) keepAccepting() {
 
 func (l *Listener) GenerationConnections() (uint64, bool) {
 	return l.live.Load(), l.tracked && !l.closed.Load()
+}
+
+// ConnContext is called before the handshake is accepted and its context is
+// cancelled on handshake failure or connection close. Track this separately
+// from accepted HTTP/3 handlers, which may still be winding down afterwards.
+type generationWork struct{ count atomic.Uint64 }
+
+func (w *generationWork) track(ctx context.Context, _ *quic.ClientInfo) (context.Context, error) {
+	w.count.Add(1)
+	context.AfterFunc(ctx, func() { w.count.Add(^uint64(0)) })
+	return ctx, nil
+}
+
+func (l *Listener) GenerationStatus() handoff.UDPConnectionStatus {
+	count, known := l.GenerationConnections()
+	status := handoff.UDPConnectionStatus{Count: count, Known: known}
+	if l.work != nil && known {
+		status.TransportWork = l.work.count.Load()
+		status.WorkKnown = !l.closed.Load()
+	}
+	return status
 }
 
 func (l *Listener) Addr() net.Addr {
@@ -281,6 +304,16 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	var pktConn net.PacketConn
 	ingress := generationFromContext(ctx)
 	if ingress != nil {
+		if export, ok := ingress.packet.(interface{ TransmitFile() (*os.File, error) }); ok {
+			file, err := export.TransmitFile()
+			if err != nil {
+				return nil, err
+			}
+			if file != nil {
+				file.Close()
+				return nil, errors.New("direct managed UDP transmit is supported by native Hysteria only")
+			}
+		}
 		pktConn = ingress.packet
 	} else if streamSettings.FinalMask != nil {
 		pktConn, err = streamSettings.FinalMask.ListenPacket(context.Background(), &net.UDPAddr{IP: address.IP(), Port: int(port)})
@@ -298,7 +331,10 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	}
 
 	tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO, StatelessResetKey: k}
+	var work *generationWork
 	if ingress != nil {
+		work = new(generationWork)
+		tr.ConnContext = work.track
 		tr.ConnectionIDGenerator = generationCIDGenerator{codec: handoff.NewQUICCIDCodec(ingress.key), slot: ingress.slot}
 	}
 
@@ -320,6 +356,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		tr:       tr,
 		listener: listener,
 		tracked:  ingress != nil,
+		work:     work,
 	}
 
 	go l.keepAccepting()

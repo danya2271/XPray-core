@@ -16,6 +16,8 @@ mod congestion;
 pub mod engine;
 #[cfg(all(feature = "engine", unix))]
 mod generation_cid;
+#[cfg(all(feature = "engine", target_os = "linux"))]
+mod ingress;
 #[cfg(feature = "engine")]
 mod h3_transport;
 #[cfg(feature = "engine")]

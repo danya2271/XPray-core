@@ -29,6 +29,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet/finalmask/mkcp/header"
 	"github.com/xtls/xray-core/transport/internet/finalmask/salamander"
 	"github.com/xtls/xray-core/transport/internet/finalmask/udphop"
+	"github.com/xtls/xray-core/transport/internet/handoff"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	native "github.com/xtls/xray-core/transport/internet/xhysteria"
@@ -542,6 +543,14 @@ func (l *nativeListener) GenerationConnections() (uint64, bool) {
 	return l.engine.GenerationConnections()
 }
 
+func (l *nativeListener) GenerationStatus() handoff.UDPConnectionStatus {
+	count, known := l.engine.GenerationConnections()
+	work, workKnown := l.engine.GenerationWork()
+	return handoff.UDPConnectionStatus{
+		Count: count, Known: known, TransportWork: work, WorkKnown: workKnown,
+	}
+}
+
 type nativeInbound struct {
 	*native.Conn
 	user *protocol.MemoryUser
@@ -554,6 +563,7 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	if err != nil {
 		return nil, err
 	}
+	directMasks := !config.PacketBridge
 	if config.PortHopping != nil {
 		return nil, fmt.Errorf("native UDP hopping is client-only")
 	}
@@ -619,8 +629,6 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 	if ingress := generationFromContext(ctx); ingress != nil {
 		config.QUICGeneration = &native.QUICGenerationConfig{Key: ingress.key, Slot: ingress.slot}
 		config.PacketBridge = true
-		config.Salamander = ""
-		config.UDPMasks = nil
 		raw = ingress.packet
 	} else if config.PacketBridge && settings.FinalMask != nil {
 		masks := settings.FinalMask.WithPacketConnSetup(func(packet stdnet.PacketConn) { native.TunePacketSocket(packet, true, config.Diagnostic) })
@@ -642,8 +650,24 @@ func nativeListen(ctx context.Context, address net.Address, port net.Port, setti
 					return nil, err
 				}
 				defer file.Close()
+				var transmit *os.File
+				if exporter, ok := raw.(interface{ TransmitFile() (*os.File, error) }); ok {
+					transmit, err = exporter.TransmitFile()
+					if err != nil {
+						return nil, err
+					}
+				}
+				if transmit == nil {
+					config.Salamander, config.UDPMasks = "", nil
+				} else {
+					defer transmit.Close()
+					if !directMasks {
+						return nil, fmt.Errorf("managed direct transmit cannot apply the configured masks natively")
+					}
+					config.PacketTransmitFD = int(transmit.Fd())
+				}
 				config.PacketLocal = local.String()
-				config.PacketBatch = false
+				config.PacketBatch = ingressBatch(ctx)
 				config.DisablePMTUD = true
 				engine, err := native.Start(ctx, config, file, local, nil, func(conn *native.Conn) { handler(&nativeInbound{Conn: conn, user: conn.User}) })
 				if err != nil {

@@ -31,12 +31,14 @@ type UnixBinding struct {
 }
 
 type UDPBinding struct {
-	Tag     string   `json:"tag"`
-	Address string   `json:"address"`
-	Port    int      `json:"port"`
-	FD      int      `json:"fd"`
-	Key     [16]byte `json:"key"`
-	Slot    byte     `json:"slot"`
+	Tag         string   `json:"tag"`
+	Address     string   `json:"address"`
+	Port        int      `json:"port"`
+	FD          int      `json:"fd"`
+	Key         [16]byte `json:"key"`
+	Slot        byte     `json:"slot"`
+	PacketBatch bool     `json:"packet_batch,omitempty"`
+	TransmitFD  int      `json:"transmit_fd,omitempty"`
 }
 
 type Manifest struct {
@@ -61,7 +63,7 @@ type binding struct {
 type udpBinding struct {
 	spec   UDPBinding
 	packet net.PacketConn
-	count  func() (uint64, bool)
+	status func() UDPConnectionStatus
 }
 
 // XHTTP participates in the admission transaction in addition to having
@@ -175,29 +177,42 @@ func ImportGeneration(manifest Manifest) (*Generation, error) {
 			g.Close()
 			return nil, fmt.Errorf("importing handoff datagram socket for %q: %w", spec.Tag, err)
 		}
+		if spec.TransmitFD != 0 {
+			if spec.TransmitFD < 3 || seen[spec.TransmitFD] {
+				packet.Close()
+				g.Close()
+				return nil, errors.New("invalid inherited UDP transmit descriptor")
+			}
+			seen[spec.TransmitFD] = true
+			if err := attachUDPTransmit(packet, spec.TransmitFD); err != nil {
+				packet.Close()
+				g.Close()
+				return nil, err
+			}
+		}
 		g.udp[key] = &udpBinding{spec: spec, packet: packet}
 	}
 	return g, nil
 }
 
 func (g *Generation) AttachUDP(tag string, port int, address net.IP,
-	start func(net.PacketConn, [16]byte, byte) (func() (uint64, bool), error),
+	start func(net.PacketConn, [16]byte, byte, bool) (func() UDPConnectionStatus, error),
 ) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	b := g.udp[bindingKey{tag, port}]
-	if b == nil || b.count != nil || g.state != "starting" {
+	if b == nil || b.status != nil || g.state != "starting" {
 		return fmt.Errorf("no unclaimed UDP handoff binding for %q port %d", tag, port)
 	}
 	actual := b.packet.LocalAddr().(*net.UDPAddr).IP
 	if !actual.Equal(address) && !(address.IsUnspecified() && (actual.To4() != nil) == (address.To4() != nil)) {
 		return fmt.Errorf("handoff UDP address %s does not match inbound %s", actual, address)
 	}
-	count, err := start(b.packet, b.spec.Key, b.spec.Slot)
+	status, err := start(b.packet, b.spec.Key, b.spec.Slot, b.spec.PacketBatch)
 	if err != nil {
 		return err
 	}
-	b.count = count
+	b.status = status
 	return nil
 }
 
@@ -207,8 +222,8 @@ func (g *Generation) UDPStatus() (string, map[string]UDPConnectionStatus) {
 	result := make(map[string]UDPConnectionStatus, len(g.udp))
 	for key, b := range g.udp {
 		status := UDPConnectionStatus{}
-		if b.count != nil {
-			status.Count, status.Known = b.count()
+		if b.status != nil {
+			status = b.status()
 		}
 		result[fmt.Sprintf("%s:%d", key.tag, key.port)] = status
 	}
@@ -308,10 +323,10 @@ func (g *Generation) Ready() error {
 		}
 	}
 	for key, b := range g.udp {
-		if b.count == nil {
+		if b.status == nil {
 			return fmt.Errorf("handoff UDP binding for %q port %d was not started", key.tag, key.port)
 		}
-		if _, known := b.count(); !known {
+		if !b.status().Known {
 			return fmt.Errorf("handoff UDP transport for %q port %d is not ready", key.tag, key.port)
 		}
 	}

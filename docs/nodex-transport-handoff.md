@@ -60,7 +60,18 @@ multihomed nodes is not wired yet). The relay adds one Unix datagram hop per
 direction. `BenchmarkManagedUDPIngressRoundTrip` measures that overhead on an
 unmasked loopback path, not throughput or latency on a VPS. Retain the old process: `drain` refuses to
 declare completion when UDP bindings are present. `quic-status` counts accepted
-QUIC connections, not application streams, and is not a handshake/queue fence.
+QUIC connections, not application streams. `work_known` / `transport_work`
+also expose a diagnostic snapshot of Go connection contexts before acceptance,
+or Rust endpoint connections plus application permits. Rust may count a
+connection twice and its snapshot omits Initials queued in Quinn before accept.
+Neither value proves that the worker or engine packet queues are empty.
+
+`UDPIngress.FenceInitials` waits for the inactive slot's client-chosen
+Initial/0-RTT pins to expire and synchronizes with the ingress receive loop.
+A concurrent admission change invalidates the result. Established CID routing
+stays available; no synchronization was added to its fast path. This is one
+prerequisite, **not** permission to stop a generation: server-issued CIDs, the
+worker queue, and the engine's own pending handshakes still need coordination.
 
 Test with real processes from the checkout:
 

@@ -143,10 +143,10 @@ func (w *tcpWorker) Start() error {
 			if w.address.Family().IsDomain() || w.recvOrigDest {
 				return errors.New("managed Hysteria inbound needs a numeric IP and no original destination socket option")
 			}
-			return generation.AttachUDP(w.tag, int(w.port), w.address.IP(), func(packet net.PacketConn, key [16]byte, slot byte) (func() (uint64, bool), error) {
-				hub, err := hysteria.ListenGeneration(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
+			return generation.AttachUDP(w.tag, int(w.port), w.address.IP(), func(packet net.PacketConn, key [16]byte, slot byte, batch bool) (func() handoff.UDPConnectionStatus, error) {
+				hub, err := hysteria.ListenGenerationWithBatch(ctx, w.address, w.port, w.stream, func(conn stat.Connection) {
 					go w.callback(conn)
-				}, packet, key, slot)
+				}, packet, key, slot, batch)
 				if err != nil {
 					return nil, err
 				}
@@ -156,7 +156,7 @@ func (w *tcpWorker) Start() error {
 					return nil, errors.New("managed Hysteria listener does not report generation connections")
 				}
 				w.hub = listener
-				return listener.GenerationConnections, nil
+				return listener.GenerationStatus, nil
 			})
 		} else if w.stream.ProtocolName == "grpc" || w.stream.ProtocolName == "splithttp" {
 			if (w.stream.FinalMask != nil && w.stream.FinalMask.HasTCPMasks()) || w.recvOrigDest ||
