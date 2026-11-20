@@ -63,6 +63,19 @@ void *xhys_ingress_start(const uint8_t *config_json, uintptr_t length, int32_t u
 bool xhys_ingress_add(void *ingress, uint8_t slot, int32_t worker_fd);
 bool xhys_ingress_activate(void *ingress, uint8_t slot);
 uint64_t xhys_ingress_dropped(const void *ingress);
+/* Approximate diagnostics, never use as proof that a generation is drained. */
+typedef struct {
+    uint64_t received;
+    uint64_t forwarded;
+    uint64_t backpressure;
+    uint64_t queue_drops;
+    uint64_t send_drops;
+    uint64_t egress_drops;
+    uint64_t queued_bytes;
+    uint64_t peak_queued_bytes;
+    uint64_t running;
+} XhysIngressStats;
+bool xhys_ingress_stats(const void *ingress, XhysIngressStats *stats);
 void xhys_ingress_join(void *ingress);
 void xhys_shared_release(void *owner);
 

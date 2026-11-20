@@ -27,12 +27,19 @@ The worktree adds explicit, opt-in experiments, not production activation:
   the ingress; an unsupported backend or mask configuration is rejected. The
   default remains relay egress, and ordinary native startup remains unchanged.
 
-The native relay keeps bounded kernel queues and drops unsent datagrams instead
-of blocking the other generation. At saturation this still causes significant
-loss and QUIC retransmissions. It is an unresolved performance defect, not a
-successful zero-overhead implementation. This ingress has no recovery protocol
-or QUIC retirement certificate and is not connected to the node supervisor or
-TUI activation path.
+The native relay now retries transient Unix socket backpressure with a separate
+bounded queue per generation (512 KiB and 256 frames). The healthy fast path
+still borrows receive buffers without allocation; only queued frames are copied.
+Each generation gets an independent readiness turn, so a stalled worker does
+not block admission changes or another worker. Queue overflow remains packet
+loss rather than unbounded memory or blocking the public receive owner.
+Directional counters separate queue overflow, send errors and egress failures.
+They are approximate telemetry, **not** a drain certificate.
+
+At saturation this still causes loss and QUIC retransmissions. It is an
+unresolved performance defect, not a successful zero-overhead implementation.
+This ingress has no recovery protocol or QUIC retirement certificate and is
+not connected to the node supervisor or TUI activation path.
 
 ## Exploratory results, November 20, 2026
 
@@ -97,3 +104,28 @@ generations still reported live QUIC connections. Background duplex TCP was
 98.91 MiB/s, UDP p99 1.631 ms and maximum 23.810 ms. Those latency numbers
 describe received replies only, not a loss-free result. This failure is retained
 as evidence that the experimental path cannot be enabled as a seamless updater.
+
+## Bounded backpressure retry, November 20, 2026
+
+Three new load-switch tests with retry all passed: 2000/2000 paced UDP replies
+each, zero relay drops, old/new generations both live, and 127.25–127.52 MiB/s
+background duplex TCP. Received UDP p99 was 1.405–1.469 ms. Peak queued data
+was 126080–130439 bytes, not the 512 KiB limit. Tests additionally fill one
+generation's socket and queue, verify another generation can still activate,
+check retry order and segment boundaries, and check bounded overflow.
+
+An interleaved three-round matrix then ran direct, previous native relay, and
+retry relay sequentially without builds running. Medians of each metric:
+
+| Variant | MB/s | TCP p99, ms | Relay drops | Total server CPU, µs/exchange |
+| --- | ---: | ---: | ---: | ---: |
+| Direct native | 624.98 | 20.201 | 0 | 661.04 |
+| Previous native relay + direct TX | 494.59 | 53.239 | 105384 | 830.43 |
+| Native relay + retry + direct TX | 510.47 | 31.547 | 12546 | 800.80 |
+
+The same 32-flow/64 KiB/8192-exchange, server CPUs 0–3 and client CPUs 8–15
+setup was used. Total server CPU is the per-run sum of Xray and supervisor/echo
+CPU, then its median. Retry improves tail latency and reduces drops, but the
+full-load queue reaches its bound. All remaining counted drops in that matrix
+are queue overflow, not Unix send errors. Do not enlarge queues and call this
+fixed; managed throughput still trails direct by about 18%.

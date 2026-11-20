@@ -42,6 +42,7 @@ type handoffLoadSnapshot struct {
 	ServerRSS     int64
 	Drops         uint64
 	Counts        []uint64
+	Ingress       native.NativeIngressStats
 }
 
 type handoffLoadInfo struct {
@@ -272,6 +273,9 @@ func TestHandoffLoadServerProcess(t *testing.T) {
 		}
 		if ingress != nil {
 			snapshot.Drops = ingress.Dropped()
+			if value, ok := ingress.(*native.NativeIngress); ok {
+				snapshot.Ingress = value.Stats()
+			}
 		}
 		if err := encoder.Encode(snapshot); err != nil {
 			t.Fatal(err)
@@ -472,6 +476,10 @@ func benchmarkHandoffLoad(b *testing.B, size int) {
 	b.ReportMetric(float64(after.ServerRSS)/1024, "server-peak-rss-MiB")
 	b.ReportMetric(float64(after.SupervisorRSS)/1024, "supervisor-echo-peak-rss-MiB")
 	b.ReportMetric(float64(after.Drops-before.Drops), "ingress-drops")
+	b.ReportMetric(float64(after.Ingress.Backpressure-before.Ingress.Backpressure), "ingress-queued")
+	b.ReportMetric(float64(after.Ingress.QueueDrops-before.Ingress.QueueDrops), "ingress-queue-drops")
+	b.ReportMetric(float64(after.Ingress.SendDrops-before.Ingress.SendDrops), "ingress-send-drops")
+	b.ReportMetric(float64(after.Ingress.PeakQueuedBytes)/1024, "ingress-peak-queue-KiB")
 	slices.Sort(samples)
 	for _, percentile := range []int{50, 95, 99} {
 		b.ReportMetric(float64(samples[min(len(samples)-1, len(samples)*percentile/100)])/1000, fmt.Sprintf("p%d-us", percentile))
@@ -617,6 +625,7 @@ func TestHandoffUnderLoad(t *testing.T) {
 	}
 	t.Logf("received=%d/%d background_mibps=%.2f udp_p50_us=%.1f udp_p99_us=%.1f udp_max_us=%.1f ingress_drops=%d generations=%v server_cpu_seconds=%.3f supervisor_echo_cpu_seconds=%.3f server_peak_rss_mib=%.2f supervisor_echo_peak_rss_mib=%.2f", len(samples), packets, background, float64(samples[len(samples)/2])/1000, float64(samples[(len(samples)-1)*99/100])/1000, float64(samples[len(samples)-1])/1000, after.Drops-before.Drops, after.Counts, float64(after.ServerCPU-before.ServerCPU)/1e9, float64(after.SupervisorCPU-before.SupervisorCPU)/1e9, float64(after.ServerRSS)/1024, float64(after.SupervisorRSS)/1024)
 	t.Logf("missing_before_sequence_600=%d missing_after_sequence_600=%d missing_first_32=%v", missingBefore, missingAfter, missing)
+	t.Logf("native_ingress=%+v", after.Ingress)
 	if len(samples) != packets || after.Drops != before.Drops {
 		t.Error("UDP loss under load")
 	}
