@@ -306,6 +306,10 @@ fn group_ring_packets<'a>(
     grouped: &mut [(SocketAddr, &'a [u8]); BATCH],
 ) -> [u8; BATCH] {
     debug_assert!(packets.len() <= BATCH);
+    if packets.len() > 1 && packets.iter().all(|packet| packet.0 == packets[0].0) {
+        grouped[..packets.len()].copy_from_slice(packets);
+        return std::array::from_fn(|index| index as u8);
+    }
     let mut consumed = 0u32;
     let mut written = 0;
     let mut order = [0u8; BATCH];
@@ -439,14 +443,20 @@ impl Peer {
             return 0;
         }
         assert!(packets.len() <= BATCH);
+        if self.ring.is_none() {
+            let accepted = self.forward_ordered(packets, health, destination);
+            return if accepted == BATCH {
+                u32::MAX
+            } else {
+                (1u32 << accepted) - 1
+            };
+        }
+        if packets.len() == 1 {
+            return self.forward_ordered(packets, health, destination) as u32;
+        }
         let mut grouped = [(packets[0].0, &[][..]); BATCH];
-        let mut order = std::array::from_fn(|index| index as u8);
-        let packets = if self.ring.is_some() {
-            order = group_ring_packets(packets, &mut grouped);
-            &grouped[..packets.len()]
-        } else {
-            packets
-        };
+        let order = group_ring_packets(packets, &mut grouped);
+        let packets = &grouped[..packets.len()];
         let accepted = self.forward_ordered(packets, health, destination);
         order[..accepted]
             .iter()
@@ -474,12 +484,15 @@ impl Peer {
         health.forwarded.fetch_add(sent as u64, Ordering::Relaxed);
         let pending = &packets[sent..];
         let mut index = 0;
+        let mut queued_bytes = 0;
+        let mut rejected = 0;
         while index < pending.len() {
             let Ok((count, header)) =
                 frame_shape(&pending[index..], if self.ring.is_some() { 32 } else { 8 })
             else {
-                health.drop_send(pending.len() - index);
-                return packets.len();
+                rejected = pending.len() - index;
+                health.drop_send(rejected);
+                break;
             };
             let length = HEADER
                 + pending[index..index + count]
@@ -502,16 +515,21 @@ impl Peer {
                     destination,
                 });
                 self.bytes += length;
-                let total = health
-                    .queued_bytes
-                    .fetch_add(length as u64, Ordering::Relaxed)
-                    + length as u64;
-                health.peak_queued_bytes.fetch_max(total, Ordering::Relaxed);
-                health.backpressure.fetch_add(count as u64, Ordering::Relaxed);
+                queued_bytes += length;
             }
             index += count;
         }
-        sent + index
+        if queued_bytes != 0 {
+            let total = health
+                .queued_bytes
+                .fetch_add(queued_bytes as u64, Ordering::Relaxed)
+                + queued_bytes as u64;
+            health.peak_queued_bytes.fetch_max(total, Ordering::Relaxed);
+            health
+                .backpressure
+                .fetch_add(index as u64, Ordering::Relaxed);
+        }
+        sent + index + rejected
     }
 
     fn flush(&mut self, health: &Health) -> io::Result<()> {
@@ -639,6 +657,7 @@ struct ReceivedBatch {
     index: usize,
     offset: usize,
     admission: u8,
+    held_mask: u32,
     held: [Option<HeldPacket>; BATCH],
 }
 
@@ -649,12 +668,13 @@ impl ReceivedBatch {
             index: 0,
             offset: 0,
             admission: 0,
+            held_mask: 0,
             held: [None; BATCH],
         }
     }
 
     fn pending(&self) -> bool {
-        self.index < self.count || self.held.iter().any(Option::is_some)
+        self.index < self.count || self.held_mask != 0
     }
 
     fn received(&mut self, count: usize, admission: u8) {
@@ -674,7 +694,7 @@ impl ReceivedBatch {
         local: SocketAddr,
         health: &Health,
     ) {
-        if self.held.iter().any(Option::is_some) {
+        if self.held_mask != 0 {
             return;
         }
         let mut written = 0;
@@ -700,7 +720,10 @@ impl ReceivedBatch {
             let address = if local.is_ipv4() {
                 match meta.addr {
                     SocketAddr::V6(address) if address.ip().to_ipv4_mapped().is_some() => {
-                        SocketAddr::new(address.ip().to_ipv4_mapped().unwrap().into(), address.port())
+                        SocketAddr::new(
+                            address.ip().to_ipv4_mapped().unwrap().into(),
+                            address.port(),
+                        )
                     }
                     other => other,
                 }
@@ -715,6 +738,7 @@ impl ReceivedBatch {
                 address,
                 destination,
             });
+            self.held_mask |= 1 << written;
             written += 1;
         }
     }
@@ -729,9 +753,10 @@ impl ReceivedBatch {
         let mut grouped = 0u32;
         let mut progressed = false;
         for index in 0..BATCH {
-            let Some(first) = self.held[index] else {
+            if self.held_mask & (1 << index) == 0 {
                 continue;
-            };
+            }
+            let first = self.held[index].unwrap();
             if grouped & (1 << index) != 0 {
                 continue;
             }
@@ -758,6 +783,7 @@ impl ReceivedBatch {
                 health.drop_send(count);
                 for &position in &positions[..count] {
                     self.held[position] = None;
+                    self.held_mask &= !(1 << position);
                 }
                 progressed = true;
                 continue;
@@ -767,6 +793,7 @@ impl ReceivedBatch {
             for (packet, &position) in positions[..count].iter().enumerate() {
                 if accepted & (1 << packet) != 0 {
                     self.held[position] = None;
+                    self.held_mask &= !(1 << position);
                     progressed = true;
                 }
             }
@@ -1094,10 +1121,9 @@ async fn run(
                 }
             }) => {
                 if let Some(count) = received? {
-                    for meta in &metadata[..count] {
-                        if meta.stride == 0 { continue; }
-                        health.received.fetch_add(meta.len.div_ceil(meta.stride) as u64, Ordering::Relaxed);
-                    }
+                    let packets = metadata[..count].iter().filter(|meta| meta.stride != 0)
+                        .map(|meta| meta.len.div_ceil(meta.stride) as u64).sum();
+                    health.received.fetch_add(packets, Ordering::Relaxed);
                     received_batch.received(count, routes.current);
                 }
             }
@@ -1517,8 +1543,32 @@ mod tests {
             assert_eq!(payload[0] as usize, expected);
         }
         assert_eq!(frame_shape(&grouped, BATCH).unwrap().0, BATCH / 2);
-        assert_eq!(frame_shape(&grouped[BATCH / 2..], BATCH).unwrap().0, BATCH / 2);
+        assert_eq!(
+            frame_shape(&grouped[BATCH / 2..], BATCH).unwrap().0,
+            BATCH / 2
+        );
         group_ring_packets(&[], &mut grouped);
+    }
+
+    #[test]
+    fn ring_grouping_same_peer_preserves_order_and_short_final_segment() {
+        let address = "127.0.0.1:123".parse().unwrap();
+        for count in [1, 2, BATCH] {
+            let payloads: Vec<_> = (0..count)
+                .map(|index| vec![index as u8; if index + 1 == count { 77 } else { 1200 }])
+                .collect();
+            let packets: Vec<_> = payloads
+                .iter()
+                .map(|payload| (address, payload.as_slice()))
+                .collect();
+            let mut grouped = [(address, &[][..]); BATCH];
+            let order = group_ring_packets(&packets, &mut grouped);
+            assert_eq!(&grouped[..count], packets.as_slice());
+            for (index, &position) in order[..count].iter().enumerate() {
+                assert_eq!(position as usize, index);
+            }
+            assert_eq!(frame_shape(&grouped[..count], BATCH).unwrap().0, count);
+        }
     }
 
     #[tokio::test]
@@ -1566,7 +1616,11 @@ mod tests {
                 .chunks(1200)
                 .enumerate()
             {
-                assert!(segment.iter().all(|&byte| byte as usize == sequence * 2 + index));
+                assert!(
+                    segment
+                        .iter()
+                        .all(|&byte| byte as usize == sequence * 2 + index)
+                );
             }
         }
     }
@@ -1721,9 +1775,11 @@ mod tests {
         };
         let mut live = [true; 256];
         for nonce in 0..PIN_LIMIT {
-            let mut cid = [0;20];
+            let mut cid = [0; 20];
             cid[..8].copy_from_slice(&(nonce as u64).to_be_bytes());
-            routes.pins.insert((1,8,cid),(1,now+Duration::from_secs(30)));
+            routes
+                .pins
+                .insert((1, 8, cid), (1, now + Duration::from_secs(30)));
         }
         let snapshot = |cid: &[u8]| {
             serde_json::to_vec(&serde_json::json!({
@@ -1733,10 +1789,19 @@ mod tests {
             .unwrap()
         };
         let original = routes.pins.clone();
-        assert!(adopt_receive(&mut routes,&live,[1;16],"127.0.0.1:443".parse().unwrap(),&snapshot(b"new-work")).is_err());
-        assert_eq!(routes.pins,original);
-        assert_eq!(routes.leases[1],0);
-        let key = (1,8,[0;20]);
+        assert!(
+            adopt_receive(
+                &mut routes,
+                &live,
+                [1; 16],
+                "127.0.0.1:443".parse().unwrap(),
+                &snapshot(b"new-work")
+            )
+            .is_err()
+        );
+        assert_eq!(routes.pins, original);
+        assert_eq!(routes.leases[1], 0);
+        let key = (1, 8, [0; 20]);
         routes.pins.get_mut(&key).unwrap().0 = 0;
         let original = routes.pins.clone();
         assert!(
@@ -1875,6 +1940,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_masks_and_counter_totals_survive_partial_queue_acceptance() {
+        let address: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let payload = [0x71u8; 1200];
+        let packets: Vec<_> = (1..=QUEUE_FRAMES + BATCH)
+            .map(|port| (SocketAddr::new(address.ip(), port as u16), &payload[..]))
+            .collect();
+        for use_ring in [false, true] {
+            let (mut peer, _receiver) = peer();
+            if use_ring {
+                let mut ring = packet_ring::Sender::new().unwrap();
+                let header = packet_socket::encode_header(address, payload.len()).unwrap();
+                let mut batch = ring.batch();
+                for _ in 0..BATCH {
+                    batch.push(&header, &[(address, &payload)]).unwrap();
+                }
+                drop(batch);
+                peer.ring = Some(ring);
+            } else {
+                saturate(&peer).await;
+            }
+            let health = Health::default();
+            for batch in packets[..QUEUE_FRAMES - 3].chunks(BATCH) {
+                let expected = u32::MAX >> (BATCH - batch.len());
+                assert_eq!(peer.forward(batch, &health), expected);
+            }
+            assert_eq!(
+                peer.forward(
+                    &packets[QUEUE_FRAMES - 3..QUEUE_FRAMES - 3 + BATCH],
+                    &health
+                ),
+                0b111
+            );
+            assert_eq!(peer.forward(&packets[..1], &health), 0);
+            let bytes = (QUEUE_FRAMES * (HEADER + payload.len())) as u64;
+            assert_eq!(peer.queue.len(), QUEUE_FRAMES);
+            assert_eq!(peer.bytes as u64, bytes);
+            assert_eq!(health.queued_bytes.load(Ordering::Relaxed), bytes);
+            assert_eq!(health.peak_queued_bytes.load(Ordering::Relaxed), bytes);
+            assert_eq!(
+                health.backpressure.load(Ordering::Relaxed),
+                QUEUE_FRAMES as u64
+            );
+            assert_eq!(health.forwarded.load(Ordering::Relaxed), 0);
+            assert_eq!(health.drops.load(Ordering::Relaxed), 0);
+            assert_eq!(health.queue_drops.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_counter_totals_survive_an_invalid_batch_tail() {
+        let (mut peer, _receiver) = peer();
+        saturate(&peer).await;
+        let health = Health::default();
+        let address = "127.0.0.1:12345".parse().unwrap();
+        let other = "127.0.0.1:12346".parse().unwrap();
+        let payload = [0x71u8; 1200];
+        let oversized = vec![0; 65536];
+        assert_eq!(peer.forward(&[(address, &payload)], &health), 1);
+        assert_eq!(
+            peer.forward(&[(address, &payload), (other, &oversized)], &health),
+            0b11
+        );
+        assert_eq!(peer.queue.len(), 2);
+        assert_eq!(peer.bytes, 2 * (HEADER + payload.len()));
+        assert_eq!(
+            health.queued_bytes.load(Ordering::Relaxed),
+            peer.bytes as u64
+        );
+        assert_eq!(
+            health.peak_queued_bytes.load(Ordering::Relaxed),
+            peer.bytes as u64
+        );
+        assert_eq!(health.backpressure.load(Ordering::Relaxed), 2);
+        assert_eq!(health.forwarded.load(Ordering::Relaxed), 0);
+        assert_eq!(health.send_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(health.drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn backpressure_retries_in_order_and_preserves_segment_boundaries() {
         let (mut peer, receiver) = peer();
         let saturated = saturate(&peer).await;
@@ -1954,10 +2098,7 @@ mod tests {
         }
         assert!(blocked.bytes <= QUEUE_BYTES);
         assert_eq!(blocked.queue.len(), QUEUE_FRAMES);
-        assert_eq!(
-            health.queue_drops.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(health.queue_drops.load(Ordering::Relaxed), 0);
         healthy.forward(&[(address, &payload)], &health);
         let mut peers = std::array::from_fn(|_| None);
         peers[0] = Some(blocked);
@@ -2003,6 +2144,7 @@ mod tests {
             address,
             destination: None,
         });
+        batch.held_mask |= 1;
         batch.held[1] = Some(HeldPacket {
             buffer: 0,
             start: 1200,
@@ -2011,10 +2153,12 @@ mod tests {
             address,
             destination: None,
         });
+        batch.held_mask |= 1 << 1;
         poll_fn(|cx| batch.poll_forward(&buffers, &mut peers, &health, cx)).await;
         assert!(batch.pending());
         assert!(batch.held[0].is_some());
         assert!(batch.held[1].is_none());
+        assert_eq!(batch.held_mask, 1);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !peers[1].as_ref().unwrap().queue.is_empty() {
                 poll_fn(|cx| poll_pending(&mut peers, &[0, 1], &health, cx)).await;
@@ -2060,6 +2204,7 @@ mod tests {
             (QUEUE_FRAMES + 2) as u64
         );
         assert_eq!(health.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(batch.held_mask, 0);
     }
 
     #[test]
@@ -2100,6 +2245,7 @@ mod tests {
             &Health::default(),
         );
         assert_eq!(batch.held[0].unwrap().slot, 0);
+        assert_eq!(batch.held_mask, 1);
         assert!(batch.pending());
     }
 
@@ -2145,8 +2291,9 @@ mod tests {
             for (before, after) in retained.iter().zip(&batch.held) {
                 assert_eq!(before.map(|p| p.start), after.map(|p| p.start));
             }
-            for packet in batch.held.iter_mut() {
-                if let Some(packet) = packet.take() {
+            for index in 0..BATCH {
+                if let Some(packet) = batch.held[index].take() {
+                    batch.held_mask &= !(1 << index);
                     assert_eq!(packet.slot, 0);
                     let payload = &buffers[packet.buffer][packet.start..packet.end];
                     seen.push(u64::from_be_bytes(payload[6..14].try_into().unwrap()));
@@ -2155,6 +2302,7 @@ mod tests {
             }
         }
         assert_eq!(seen, (0..40).collect::<Vec<u64>>());
+        assert_eq!(batch.held_mask, 0);
         assert_eq!(health.drops.load(Ordering::Relaxed), 0);
     }
 }

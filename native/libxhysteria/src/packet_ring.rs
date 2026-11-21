@@ -169,6 +169,7 @@ pub struct Sender {
 
 pub struct Batch<'a> {
     sender: &'a mut Sender,
+    head: u32,
     tail: u32,
     initial: u32,
 }
@@ -232,7 +233,13 @@ impl Batch<'_> {
                 "packet ring closed",
             ));
         }
-        let used = self.tail.wrapping_sub(h.head.value.load(Ordering::Acquire));
+        let mut used = self.tail.wrapping_sub(self.head);
+        if used >= CAPACITY {
+            // The cached consumer position is conservative within this batch.
+            // Refresh only when it would otherwise report a full ring.
+            self.head = h.head.value.load(Ordering::Acquire);
+            used = self.tail.wrapping_sub(self.head);
+        }
         if used > CAPACITY {
             return Err(io::ErrorKind::InvalidData.into());
         }
@@ -392,9 +399,12 @@ impl Sender {
     }
 
     pub fn batch(&mut self) -> Batch<'_> {
-        let tail = self.mapping.header().tail.value.load(Ordering::Relaxed);
+        let header = self.mapping.header();
+        let head = header.head.value.load(Ordering::Acquire);
+        let tail = header.tail.value.load(Ordering::Relaxed);
         Batch {
             sender: self,
+            head,
             tail,
             initial: tail,
         }
@@ -425,7 +435,9 @@ impl Sender {
 
 impl Drop for Sender {
     fn drop(&mut self) {
-        if self.preserve_on_drop { return; }
+        if self.preserve_on_drop {
+            return;
+        }
         self.mapping.header().closed.store(1, Ordering::Release);
         notify(self.wake.as_raw_fd());
     }
@@ -504,6 +516,10 @@ impl Receiver {
         if pending > CAPACITY {
             return Err(io::ErrorKind::InvalidData.into());
         }
+        if pending == 0 {
+            return Ok(0);
+        }
+        let initial = head;
         let mut count = 0;
         for _ in 0..pending.min(buffers.len().min(metadata.len()) as u32) {
             let slot = self.mapping.slot(head);
@@ -553,10 +569,11 @@ impl Receiver {
             }
             head = head.wrapping_add(1);
         }
-        let advanced = head != h.head.value.load(Ordering::Relaxed);
-        h.head.value.store(head, Ordering::SeqCst);
-        if advanced && h.write_waiting.swap(0, Ordering::SeqCst) != 0 {
-            notify(self.space.as_raw_fd());
+        if head != initial {
+            h.head.value.store(head, Ordering::SeqCst);
+            if h.write_waiting.swap(0, Ordering::SeqCst) != 0 {
+                notify(self.space.as_raw_fd());
+            }
         }
         Ok(count)
     }
@@ -686,6 +703,71 @@ mod tests {
             descriptors[2].as_raw_fd(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch_refreshes_cached_head_after_receiver_progress() {
+        let mut sender = Sender::new().unwrap();
+        let mut receiver = import(&sender);
+        let local = "127.0.0.1:443".parse().unwrap();
+        let payload = [0x71; 1200];
+        let header = packet_socket::encode_header(local, payload.len()).unwrap();
+        for _ in 0..CAPACITY {
+            sender.push(&header, &[(local, &payload)]).unwrap();
+        }
+        let mut batch = sender.batch();
+        assert_eq!(
+            batch
+                .push(&header, &[(local, &payload)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut buffer = [0u8; 1200];
+        let mut buffers = [IoSliceMut::new(&mut buffer)];
+        let mut metadata = [udp::RecvMeta::default()];
+        receiver
+            .receive(
+                &mut buffers,
+                &mut metadata,
+                local,
+                &std::sync::Mutex::new(None),
+            )
+            .unwrap();
+        batch.push(&header, &[(local, &payload)]).unwrap();
+        assert_eq!(
+            batch
+                .push(&header, &[(local, &payload)])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(batch);
+        for _ in 0..CAPACITY {
+            assert_eq!(
+                receiver
+                    .receive(
+                        &mut buffers,
+                        &mut metadata,
+                        local,
+                        &std::sync::Mutex::new(None)
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(&buffers[0][..1200], &payload);
+        }
+        assert_eq!(
+            receiver
+                .receive(
+                    &mut buffers,
+                    &mut metadata,
+                    local,
+                    &std::sync::Mutex::new(None)
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
