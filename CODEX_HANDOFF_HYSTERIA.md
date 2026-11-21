@@ -1,6 +1,6 @@
 # Codex Handoff: Native Hysteria Memory and Capacity
 
-Date: 2026-11-18
+Date: 2026-11-21
 Workspace: `/home/danya2271/ProxVless/XPray-core`
 
 ## Request and Scope
@@ -842,3 +842,66 @@ assembler.rs, not cargo fmt (which changes unrelated upstream vendored files).
 No push, restart or neighboring-repo edits. Follow up on remaining receive
 workspace (~3MiB/Quinn endpoint), latency and application UDP losses; do not
 disable GRO blindly or truncate advertised receive segment capacity.
+
+## Latest: Managed Ingress Batching and Counter Work (2026-11-21)
+
+Current baseline is `af2494ea`, after the lossless backpressure/flow-credit
+fixes and broker-control recovery. Historical loss/recovery limitations above
+must be read with `docs/nodex-managed-hysteria-performance.md` and
+`docs/nodex-managed-lifecycle.md`; they are not the current acceptance status.
+
+Only production files changed in this follow-up are
+`native/libxhysteria/src/ingress.rs` and `packet_ring.rs`: producer-batch
+cached head with Acquire refresh when full, no redundant empty receive head
+store, aggregated receive/queue counters, same-peer/Unix/single-packet grouping
+fast paths and a held-packet bitmap. Queue capacities, ring/wire ABI, receive
+ownership, worker counts and credit backpressure are unchanged. **Keep the
+SeqCst head/tail publication plus waiting-flag wakeup handshake.** The weaker
+ordering experiment was rolled back and is not the final candidate.
+
+New controlled baseline/final server-only matrix: same final native
+client/echo harness, three fresh alternating-order samples per version,
+server/supervisor CPUs0 or0-3, client CPUs8-15, mixed A+B 16+16 TCP flows.
+Fixed32768 duplex64KiB or200000 64B exchanges; strict drop gate. Logical-CPU
+affinity on one local host, not two physical servers or a1GiB cgroup.
+Median one-CPU throughput228.26->229.78MB/s (+0.67%), total generation plus
+supervisor/echo CPU525.48->522.63us/exchange (-0.54%). Four-CPU throughput
+700.80->700.32 (-0.07%), CPU645.26->646.97 (+0.26%). Small64B CPU decreases
+1.08%/0.83%, p99 2616->2577us /2180->2132us. Three-sample tails are noisy.
+Four-CPU generation peakRSS rises109.10->111.90MiB bulk and93.90->96.31MiB
+small, about2.6%; no total-memory saving or substantial speedup established.
+
+24/24 baseline/final benchmark samples have zero ingress/queue/send/public
+UDP drops. Final-candidate application UDP: six6000/6000 distinct1200B runs
+(three per core count),36000/36000 aggregate under32 unpaced64KiB TCP flows,
+zero relay/public drops. One/four-CPU loaded drain passes with47154/123716
+exchanges. These remain local acceptance, not zero-loss WAN guarantees.
+After adding tests, the exact-source Linux rebuild also passes6000/6000 UDP
+on each core count plus loaded drain with35853/105317 exchanges, zero relay/
+public drops. Raw follow-up logs are `validated-cpu*.log`; these are additional
+acceptance checks, not samples in the baseline matrix.
+
+126release engine tests and fresh-linked Go race xhysteria/handoff/supervisor
+packages pass. Production-library Clippy passes-Dwarnings. All-target strict
+Clippy fails on pre-existing receive_owner.rs:327 type_complexity; all-target
+passes when only that lint is allowed. Preserve failed test/compiler/lint logs
+from fixture development rather than presenting every invocation as passing.
+External-generation supervisor lifecycle cases skip without their binary env.
+
+Full methodology/results are in the new first section of
+`docs/nodex-managed-hysteria-performance.md`. Ignored artifacts/logs/scripts:
+`build_assets/ingress-opt-20261121/`, especially `compare-baseline-final.sh`,
+`baseline-cpu*-r*-{before,final}-{transfer,latency}.log`, `results.json`,
+`rust-tests-resume3.log`, `clippy-lib-resume.log`, `go-race-resume.log`,
+`build-validated.log`. Intermediate V2/final and atomic experiments are not
+the baseline comparison. Linux is rebuilt as `xray-validated`; Androidarm64/
+API26 build passes as `xray-android-arm64`, without device validation.
+
+The user now explicitly authorizes committing and pushing all task changes
+to every branch of this repository. Scope is the four `origin` branches:
+android, node-main, nodex-seamless-update, nodex-supervisor-pilot. Preserve
+branch-specific history, use focused commits/cherry-picks and normal pushes,
+not force or upstream pushes. Do not touch existing auxiliary worktrees or
+neighboring repositories; no remote deployment/restart is authorized.
+Remaining performance targets are native live allocations/retained RSS,
+ordinary idle latency and receive workspaces; no universal2.5x/OOM claim.

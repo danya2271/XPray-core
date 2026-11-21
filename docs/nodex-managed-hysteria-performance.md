@@ -1,5 +1,124 @@
 # Managed Hysteria performance investigation
 
+## Native ingress batching and counter follow-up, November 21, 2026
+
+Baseline is `af2494ea`. This follow-up keeps the packet-ring ABI, queue and
+socket capacities, flow-credit policy, receive ownership and worker counts
+unchanged. In particular, ring head/tail publication and waiting-flag rechecks
+retain the **SeqCst wakeup handshake**; the experimental weaker ordering is not
+part of this patch.
+
+The production changes are limited to existing-batch work:
+
+* Cache the consumer head within a producer batch, refreshing it with Acquire
+  when the conservative cached position would report a full ring. Publish the
+  completed batch with the existing SeqCst tail/waiting-flag handshake.
+* Empty receives do not rewrite the head. A receive that consumes frames,
+  including invalid frames, still publishes progress and wakes an armed writer.
+* Aggregate receive and queued-byte/backpressure counters once per batch.
+  Invalid tails still count as send failures, while already queued frames
+  contribute their bytes and packet counts.
+* Skip peer permutation for Unix forwarding and one-packet ring forwarding;
+  same-peer ring batches copy in their existing order. Partial acceptance
+  still returns a mask in the original packet positions.
+* Track retained RX packets with a bitmap rather than rescanning all 32 slots
+  for every pending/fill decision. Accepted and failed packets clear both
+  their held entry and bitmap bit; unaccepted packets remain in the RX buffers.
+
+### Controlled baseline versus final server matrix
+
+Three fresh-process samples per version, core count and workload, alternating
+order before/final, final/before, before/final. Both versions use the **same**
+`interop-final.test` client/echo fixture; only the server executable changes.
+The server/supervisor/echo are pinned to logical CPUs `0` or `0-3`, with
+one/four server workers, and the client to `8-15`, with eight Go workers and
+four native workers/pool sessions. These are local CPU-affinity limits, not
+separate weak/four-core physical servers or a memory-limited VPS.
+
+Managed native shared RX/direct TX starts with direct receive, then measures
+mixed overlap: sixteen TCP flows on A and sixteen on B. Masks are Salamander
+plus WireGuard header, with the existing public-socket policy. Each transfer
+sample completes 32768 duplex 64 KiB exchanges; each small-message sample
+completes 200000 64-byte exchanges. The strict relay/public UDP drop gate is
+enabled. CPU below is generation CPU plus supervisor/echo CPU, normalized per
+completed exchange; RSS is the generation process's peak, not whole-node RAM.
+
+| Workload / logical server CPUs | Metric | Baseline | Final |
+| --- | --- | ---: | ---: |
+| 64 KiB duplex / 1 | MB/s | 228.26 | 229.78 |
+| | Total server CPU, µs/exchange | 525.48 | 522.63 |
+| | TCP p99, ms | 35.908 | 35.642 |
+| | Generation peak RSS, MiB | 103.10 | 102.80 |
+| 64 B / 1 | Total server CPU, µs/exchange | 42.30 | 41.85 |
+| | TCP p99, ms | 2.616 | 2.577 |
+| | Generation peak RSS, MiB | 91.46 | 91.68 |
+| 64 KiB duplex / 4 | MB/s | 700.80 | 700.32 |
+| | Total server CPU, µs/exchange | 645.26 | 646.97 |
+| | TCP p99, ms | 12.531 | 12.403 |
+| | Generation peak RSS, MiB | 109.10 | 111.90 |
+| 64 B / 4 | Total server CPU, µs/exchange | 77.90 | 77.25 |
+| | TCP p99, ms | 2.180 | 2.132 |
+| | Generation peak RSS, MiB | 93.90 | 96.31 |
+
+All values are medians of three runs. Single-CPU bulk CPU decreases 0.54%
+and throughput increases 0.67%; four-CPU bulk throughput changes -0.07% and
+CPU +0.26%. Small-message CPU decreases 1.08%/0.83%. These are small changes,
+not a substantial speedup or a universal improvement. Four-CPU peak RSS is
+about 2.6% higher in both workloads; no memory reduction is established.
+
+For context, four-CPU throughput ranges overlap: 699.83–706.03 before versus
+696.74–704.71 MB/s after. Four-CPU bulk p99 ranges are 12.019–12.904 before
+and 12.165–13.198 ms after; a lower median is not a bound on latency or proof
+of a stable tail-latency gain. The earlier V2/final comparison also moved
+four-CPU bulk performance in the opposite direction. It is retained as an
+intermediate experiment, not substituted for this baseline comparison.
+
+All **24/24** matrix samples pass and report zero ingress, queue, send and
+public UDP drops. Separate final-candidate application acceptance repeats
+deliver **36000/36000** distinct 1200-byte UDP replies: three 6000-reply runs
+per core count under 32 unpaced duplex TCP background flows, without application
+retransmission. Achieved background rates are 194.40–196.75 MiB/s on one CPU
+and 506.75–517.83 MiB/s on four. Both continuous-load drain checks also pass,
+with 47154/123716 exchanges and zero relay/public-socket drops. These local
+results do not establish zero WAN loss or an OOM fix.
+
+### Reproduction and validation record
+
+Raw data, baseline identity, comparison scripts and build/test logs are in
+ignored `build_assets/ingress-opt-20261121/`. The controlled matrix uses
+`compare-baseline-final.sh`, `compare-baseline-final.log` and
+`baseline-cpu*-r*-{before,final}-{transfer,latency}.log`; `results.json`
+records individual observations and medians. Earlier `compare`, `compare-fast`
+and `compare-final` files describe intermediate comparisons. The experimental
+`atomic.patch`/`xray-atomic` are not the shipped ordering.
+
+126 release Rust engine unit tests pass, including new cached-head refresh,
+same-peer/short-final-segment grouping, partial queue acceptance masks on
+Unix/ring paths, invalid-tail counter accounting and held-bitmap assertions.
+The existing concurrent 10000-frame ring wakeup/closure test remains enabled.
+Production-library Clippy passes with warnings denied. Strict all-target
+Clippy fails on the pre-existing `type_complexity` lint at
+`receive_owner.rs:327`; the complete target check passes with only that lint
+allowed. The unrelated fixture is not changed or silently counted as passing
+the strict check.
+
+Fresh-linked Go `-race` tests pass for `transport/internet/xhysteria`,
+`transport/internet/handoff` and `cmd/nodex-xray-supervisor`. External-generation
+cases require their explicit binary environment and are not covered by an
+unconfigured package run. The Linux release executable is rebuilt from the
+final source as `xray-validated`; fresh saturated UDP/drain runs against it
+are recorded separately in `validated-cpu*.log`: both deliver 6000/6000 UDP
+replies and complete drain with zero relay/public UDP drops, with
+35853/105317 loaded exchanges. Their achieved TCP background rates are
+194.64/449.30 MiB/s, respectively. They are additional final-build acceptance
+checks, not extra samples in the baseline performance matrix. Source changes
+since the measured candidate are tests, assertions and a comment only.
+
+Android arm64/API 26 also builds as `xray-android-arm64`, using NDK
+30.0.14904198. This validates compilation/linking, not device operation.
+Artifact hashes are recorded in `artifact-hashes-resume.txt`. No deployment
+or process restart on a remote VPS is performed.
+
 ## Lossless backpressure fixes and qualification, November 20, 2026
 
 Two independently reproduced loss mechanisms are fixed:
