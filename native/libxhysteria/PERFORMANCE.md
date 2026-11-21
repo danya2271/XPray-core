@@ -2905,3 +2905,99 @@ compilation/linking validation only. Logs are `read-go-race.log`,
 `read-go-linux.log`, `read-interop.log` and `read-android.log`; final executable
 hashes are in `read-binaries.sha256`. No rejected allocator code or dependency
 remains in the source diff.
+
+## Releasing Drained QUIC Receive Metadata (2026-11-21)
+
+An open Quinn receive stream could retain the backing allocation of its
+chunk heap indefinitely after the application had read all buffered data.
+`clear` and `reinit` already bounded the metadata cache. Normal reads now
+also release that storage when the last chunk is removed and capacity exceeds
+the existing 128-entry limit. The same check runs when skipping a duplicate
+tail. Small heaps keep their allocation for reuse. The change releases heap
+storage while preserving receive offsets, unordered duplicate tracking, and
+the payload ownership of returned chunks.
+
+Four regressions cover partial reads through a large ordered queue, small
+cache reuse, a duplicate tail, and unordered reads followed by more data.
+The three oversized-cache regressions fail against baseline `94165775`.
+The ignored `benchmark_drained_metadata_retention` fixture fills each of 500
+assemblers through `insert` with 1024 contiguous 64-byte static chunks, reads
+them through `read`, and keeps all 500 assemblers alive. It sums the backing
+heap capacities multiplied by the size of one metadata entry (56 bytes on
+this x86-64 host) and samples Linux `VmRSS` after draining. The fixture isolates
+metadata retention with static payloads and no live connections.
+
+Three alternating-order fresh processes per version produced these medians.
+
+| Post-drain metric | Baseline | After |
+| --- | ---: | ---: |
+| Retained chunk heap per assembler | 56 KiB | 0 |
+| Retained chunk heaps for 500 assemblers | 27.34 MiB | 0 |
+| Fixture process RSS | 31.74 MiB | 4.47 MiB |
+| Drain time per assembler | 72.11 µs | 69.60 µs |
+
+The measured memory difference applies to streams that previously accumulated
+large receive heaps. The fixture measures its own process RSS and chunk heap
+capacity. Typical stream occupancy and production Xray RSS were not measured.
+
+Run the fixture from `native/libxhysteria`.
+
+```sh
+cargo test --locked --release --no-default-features --features rustls-ring \
+  --lib --manifest-path vendor/quinn-proto/Cargo.toml \
+  --target-dir target/proto-tests benchmark_drained_metadata_retention \
+  -- --ignored --nocapture
+```
+
+Quinn-proto passed 317 release and 318 debug tests with two ignored fixtures
+in each configuration. Its selected-feature Clippy run passed with warnings
+denied. Native Hysteria passed 126 release engine tests. Fresh-linked Go race
+tests passed for the native adapter, handoff and supervisor packages. The
+updated interop binary passed packet masks, short-flow stream-credit recovery,
+UDP idle expiry and the 100 ms RTT bulk check. Linux and Android arm64/API 26
+executables build successfully. Android validation covers compilation and linking.
+
+Managed native saturation accepted 6000/6000 UDP replies on both one and four
+logical server CPUs with 32 unpaced TCP background flows and zero relay or
+public UDP drops. Under-load drain returned the surviving generation to direct
+receive after 45731 and 120082 successful exchanges, respectively, with zero
+relay or public UDP drops. Server affinity was `20` or `20-23` and client
+affinity was `24-31` for these functional checks.
+
+### Server transport comparison
+
+Three fresh-process samples per version and workload compare the server at
+`94165775` with the patched server using the same baseline client and echo
+fixture. Managed mixed overlap keeps 16 TCP flows in each of two live
+generations. Server, supervisor and echo affinity is `0` or `0-3`, with the
+client on `8-15`. Samples alternate baseline and patched execution order.
+Each bulk run completes 32768 duplex 64 KiB exchanges. Each small-message
+run completes 200000 64-byte exchanges. Total CPU includes the generation,
+supervisor and echo processes. The table reports medians.
+
+| Logical server CPUs | Exchange | Metric | Baseline | After |
+| ---: | --- | --- | ---: | ---: |
+| 1 | 64 KiB | MB/s | 229.07 | 230.51 |
+| 1 | 64 KiB | Total CPU, µs/exchange | 523.73 | 521.01 |
+| 1 | 64 KiB | p99, ms | 35.238 | 35.611 |
+| 1 | 64 B | Total CPU, µs/exchange | 41.85 | 41.76 |
+| 1 | 64 B | p99, ms | 2.588 | 2.600 |
+| 4 | 64 KiB | MB/s | 704.48 | 707.36 |
+| 4 | 64 KiB | Total CPU, µs/exchange | 643.45 | 639.37 |
+| 4 | 64 KiB | p99, ms | 12.610 | 12.531 |
+| 4 | 64 B | Total CPU, µs/exchange | 76.92 | 77.28 |
+| 4 | 64 B | p99, ms | 2.160 | 2.200 |
+
+All 24 samples had zero relay and public UDP drops. Median differences in the
+table are under 2%. The four-CPU bulk peak RSS was 111.00 → 111.70 MiB, and the
+four-CPU small-message peak was 96.44 → 94.17 MiB. The ordinary transport
+fixture does not establish a general peak RSS reduction.
+
+The first comparison shared SMT cores with other local validation runs. The
+table uses the repeated `isolated-cpu*.log` matrix, run after that validation
+finished. `results.json` records both matrices and all memory samples.
+
+Artifacts and raw logs are in ignored `build_assets/assembler-drain-20261121/`.
+`reproducer-before.log` contains the expected failing regressions. The fixture
+samples use `memory-*-r*-final.log`, and the transport checks use
+`acceptance-cpu*.log` and `interop-functional.log`.

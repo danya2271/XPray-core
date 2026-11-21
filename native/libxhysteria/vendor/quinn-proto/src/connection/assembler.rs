@@ -72,6 +72,7 @@ impl Assembler {
                     self.buffered -= chunk.bytes.len();
                     self.allocated -= chunk.allocation_size;
                     PeekMut::pop(chunk);
+                    self.release_empty_metadata();
                     continue;
                 }
 
@@ -95,8 +96,17 @@ impl Assembler {
                 self.buffered -= chunk.bytes.len();
                 self.allocated -= chunk.allocation_size;
                 let chunk = PeekMut::pop(chunk);
+                self.release_empty_metadata();
                 Chunk::new(chunk.offset, chunk.bytes)
             });
+        }
+    }
+
+    fn release_empty_metadata(&mut self) {
+        if self.data.is_empty() && self.data.capacity() > MAX_CACHED_CHUNKS {
+            // An open receive half may become idle without clear/reinit.
+            // Keep the small cache, but return oversized drained storage.
+            self.data = BinaryHeap::new();
         }
     }
 
@@ -525,6 +535,141 @@ mod test {
         assert_eq!((assembler.buffered, assembler.allocated), (0, 0));
         assert!(assembler.data.is_empty());
         assert_eq!(assembler.data.capacity(), 0);
+    }
+
+    #[test]
+    fn draining_large_metadata_cache_preserves_offsets_and_partial_chunks() {
+        let mut assembler = Assembler::new();
+        for index in 0..1024u64 {
+            assembler
+                .insert(index * 64, Bytes::from_static(&[0x71; 64]), 64)
+                .unwrap();
+        }
+        let capacity = assembler.data.capacity();
+        assert!(capacity > MAX_CACHED_CHUNKS);
+        for offset in 0..65536u64 {
+            let chunk = assembler.read(1, true).unwrap();
+            assert_eq!((chunk.offset, chunk.bytes.as_ref()), (offset, &[0x71][..]));
+            if offset != 65535 {
+                assert_eq!(assembler.data.capacity(), capacity);
+            }
+        }
+        // The receive half is still open and can accept data at the next offset.
+        assert_eq!(assembler.data.capacity(), 0);
+        assert_eq!((assembler.buffered, assembler.allocated), (0, 0));
+        assert_eq!((assembler.bytes_read, assembler.end), (65536, 65536));
+        assert!(assembler.state.is_ordered());
+        assembler
+            .insert(65536, Bytes::from_static(b"next"), 4)
+            .unwrap();
+        assert_eq!(
+            assembler.read(4, true).unwrap(),
+            Chunk::new(65536, Bytes::from_static(b"next"))
+        );
+    }
+
+    #[test]
+    fn draining_small_metadata_cache_keeps_its_backing_storage() {
+        for capacity in [8, MAX_CACHED_CHUNKS] {
+            let mut assembler = Assembler::new();
+            assembler.data.reserve_exact(capacity);
+            assembler.insert(0, Bytes::from_static(b"read"), 4).unwrap();
+            let pointer = assembler.data.as_slice().as_ptr();
+            assert_eq!(assembler.read(4, true).unwrap().bytes, b"read".as_slice());
+            assert_eq!(assembler.data.capacity(), capacity);
+            assert_eq!(assembler.data.as_slice().as_ptr(), pointer);
+            assert!(assembler.read(4, true).is_none());
+        }
+    }
+
+    #[test]
+    fn draining_duplicate_tail_releases_large_metadata_cache() {
+        let mut assembler = Assembler::new();
+        assembler.data.reserve_exact(1024);
+        assembler
+            .insert(0, Bytes::from_static(b"duplicate"), 9)
+            .unwrap();
+        assembler
+            .insert(0, Bytes::from_static(b"duplicate"), 9)
+            .unwrap();
+        assert_eq!(
+            assembler.read(9, true).unwrap().bytes,
+            b"duplicate".as_slice()
+        );
+        assert!(!assembler.data.is_empty());
+        assert!(assembler.read(9, true).is_none());
+        assert_eq!(assembler.data.capacity(), 0);
+        assert_eq!((assembler.buffered, assembler.allocated), (0, 0));
+        assert_eq!((assembler.bytes_read, assembler.end), (9, 9));
+    }
+
+    #[test]
+    fn draining_unordered_metadata_keeps_duplicate_history() {
+        let mut assembler = Assembler::new();
+        assembler.ensure_ordering(false).unwrap();
+        assembler.data.reserve_exact(1024);
+        assembler
+            .insert(64, Bytes::from_static(b"later"), 5)
+            .unwrap();
+        assert_eq!(
+            assembler.read(5, false).unwrap(),
+            Chunk::new(64, Bytes::from_static(b"later"))
+        );
+        assert_eq!(assembler.data.capacity(), 0);
+        assert_eq!((assembler.bytes_read, assembler.end), (5, 69));
+        assert_eq!((assembler.buffered, assembler.allocated), (0, 0));
+        assembler
+            .insert(64, Bytes::from_static(b"later"), 5)
+            .unwrap();
+        assert!(assembler.read(5, false).is_none());
+        assembler
+            .insert(0, Bytes::from_static(b"first"), 5)
+            .unwrap();
+        assert_eq!(
+            assembler.read(5, false).unwrap(),
+            Chunk::new(0, Bytes::from_static(b"first"))
+        );
+        assert!(assembler.ensure_ordering(true).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_drained_metadata_retention() {
+        const STREAMS: usize = 500;
+        let mut assemblers = Vec::with_capacity(STREAMS);
+        let mut drained = std::time::Duration::ZERO;
+        for _ in 0..STREAMS {
+            let mut assembler = Assembler::new();
+            for index in 0..1024u64 {
+                assembler
+                    .insert(index * 64, Bytes::from_static(&[0x71; 64]), 64)
+                    .unwrap();
+            }
+            let started = std::time::Instant::now();
+            for index in 0..1024u64 {
+                let chunk = assembler.read(64, true).unwrap();
+                assert_eq!(chunk.offset, index * 64);
+                assert_eq!(chunk.bytes.as_ref(), &[0x71; 64][..]);
+            }
+            drained += started.elapsed();
+            assert_eq!((assembler.buffered, assembler.allocated), (0, 0));
+            assemblers.push(assembler);
+        }
+        let retained = assemblers
+            .iter()
+            .map(|assembler| assembler.data.capacity() * mem::size_of::<Buffer>())
+            .sum::<usize>();
+        println!(
+            "streams={STREAMS} retained_metadata_bytes={retained} drain_ns_per_stream={} node_bytes={}",
+            drained.as_nanos() / STREAMS as u128,
+            mem::size_of::<Buffer>()
+        );
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines().filter(|line| line.starts_with("VmRSS:")) {
+                println!("{line}");
+            }
+        }
+        std::hint::black_box(assemblers);
     }
 
     #[test]
