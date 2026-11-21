@@ -905,3 +905,35 @@ not force or upstream pushes. Do not touch existing auxiliary worktrees or
 neighboring repositories; no remote deployment/restart is authorized.
 Remaining performance targets are native live allocations/retained RSS,
 ordinary idle latency and receive workspaces; no universal2.5x/OOM claim.
+
+## Latest: Reclaim Drained QUIC Receive Metadata (2026-11-21)
+
+Baseline `94165775`. An open receive half could keep a large, empty chunk heap
+after reading all the data. Quinn-proto `connection/assembler.rs` now releases
+storage after removing the last chunk if capacity exceeds the existing cache
+limit of 128 entries. Duplicate-tail removal uses the same check. Small caches
+remain reusable. Tests preserve partially read chunks, receive offsets and
+unordered duplicate tracking across drain and subsequent reads.
+
+Three regressions reproduce the oversized-cache retention on baseline. Three
+paired fixture runs keep 500 assemblers alive after draining 1024 static
+64-byte chunks each. Retained backing heaps are 27.34 MiB before and zero
+after. Median fixture RSS is 31.74 → 4.47 MiB. This measures the isolated
+post-burst retention case. Production Xray RSS was not sampled.
+
+317 release and 318 debug Quinn-proto tests, 126 release engine tests,
+Quinn-proto Clippy, fresh-linked Go race checks for xhysteria/handoff/supervisor,
+packet masks, short-flow stream credits, UDP expiry and 100 ms RTT bulk pass.
+Linux and Android arm64/API 26 binaries are built. Saturated managed UDP
+delivers 6000/6000 on each core count, plus drain with 45731/120082 exchanges.
+Both core counts report zero relay or public UDP drops. Methodology is in
+`native/libxhysteria/PERFORMANCE.md`, raw logs and binaries in ignored
+`build_assets/assembler-drain-20261121/`.
+
+The repeated baseline/after server matrix uses the same client, 16+16 mixed
+generation flows and three fresh samples per workload and version. All 24
+samples report zero relay and public UDP drops. Bulk throughput is
+229.07 → 230.51 MB/s on one CPU and 704.48 → 707.36 MB/s on four CPUs.
+Throughput, CPU and p99 medians shift by less than 2%. The first matrix shared
+SMT cores with local validation. Use `isolated-cpu*.log` for the performance
+table and `results.json` for individual observations.
