@@ -937,3 +937,63 @@ samples report zero relay and public UDP drops. Bulk throughput is
 Throughput, CPU and p99 medians shift by less than 2%. The first matrix shared
 SMT cores with local validation. Use `isolated-cpu*.log` for the performance
 table and `results.json` for individual observations.
+
+## Third-Party Client Stream Exhaustion Follow-Up (2026-11-22)
+
+The user reports `outbound/hysteria2: too many open streams` after about
+15 minutes on clients not using this Xray. Baseline `a5dd2330` advertises eight
+incoming bidirectional QUIC streams, increasing to 64 after the second TCP
+request. Third-party clients commonly use one QUIC session and nonblocking
+OpenStream; our pooled native clients and blocking opens concealed this limit.
+The same quic-go error is reproduced at approximately the 65th concurrently
+live TCP stream without any reconnect or pool.
+
+A second issue survives simply increasing the wire limit: the TCP relay can
+wait indefinitely for Go commands when the peer sends STOP_SENDING while
+there is no more outbound data. FIN+STOP_SENDING closes from a third-party
+client can accumulate active native flows. The new helper races the entire
+TCP relay against the send half's stopped future. Peer STOP cancels the relay
+and permits Bus::done to release the flow; acknowledged local FIN preserves
+the other direction. Client and server raw TCP relays use this behavior.
+
+An initial always-1024 QUIC window fixes the live-stream test but increases
+1000-session peak RSS from 214.8 to 299.9 MiB. That candidate is rejected.
+The corrected policy starts at 64 handles and expands once to 1024 at
+16 simultaneously active TCP flows. An RAII counter decrements on all task
+exit paths. Sessions serving only short serial flows remain small. The
+listener-wide flow cap and buffer budgets are unchanged. Task-admission
+guards use configured max_flows plus bounded control/diagnostic/UDP room,
+rather than silently stopping at the old prototype's 128 tasks.
+
+The new single-session quic-go fixtures authenticate through HTTP/3, use
+nonblocking OpenStream, hold 192 TCP streams live, then independently recycle
+1200 FIN+STOP/reset streams with one permanent echo stream. Three plain
+repetitions pass; shared/socket × plain/Salamander cases pass. Idle untransmitted
+stream handles remain finite (63 after auth at the 64-handle startup window).
+128 Rust engine tests pass. Go race xhysteria/hysteria/handoff/supervisor,
+flow-cap rejection/recovery, mask compatibility and 100ms RTT transfer pass.
+Linux and Android arm64/API26 builds succeed.
+
+Three fresh non-cgroup1000-session samples per baseline/adaptive variant:
+median peak213.2→221.0MiB, idle127.9→138.3MiB, throughput155.62→154.19MiB/s,
+heartbeatp99=2553.9→2638.3µs. Rejected always1024 single peak=299.9MiB.
+All capacity samples pass512MiB guard; this is a compatibility memory cost,
+not a claim of improved throughput/memory.
+Exact-client/vendor/version and deployed-server configuration are still
+unknown, so these reproduced mechanisms do not establish sole causality for
+every production report. No production update or remote restart is authorized.
+Ignored reproduction, failed prototypes and validation are retained in
+`build_assets/stream-interop-20261122/`. The first soak fails at60s because the
+fixture echo had a60s deadline; corrected tests use20min. The later always1024
+soak was deliberately terminated when its memory regression was measured.
+Only completed corrected-adaptive soaks may be cited as fifteen-minute passes.
+The detailed report is `docs/hysteria-third-party-stream-limit.md`; repeated
+server-only A/B raw files use `isolated-cpu*.log`. All24 samples pass strict
+relay/public drop gates. Median bulk rates229.68→228.15 and713.86→706.61MB/s
+(one/four server CPUs); small CPU+1.88%/+2.20%, p99 mixed. No speedup claim.
+Next, the user asks to optimize after finishing this compatibility fix.
+Keep optimization changes/measurements separate from this patch and do not
+remove STOP_SENDING cleanup, half-close correctness or stream-limit checks.
+Both fifteen-minute corrected-adaptive soaks now pass: plain/shared17591
+recycles, Salamander/socket17580, one permanent echo stream and no reconnect.
+Logs: `soak-adaptive-15m.log` and `soak-adaptive-masked-socket-15m.log`.
