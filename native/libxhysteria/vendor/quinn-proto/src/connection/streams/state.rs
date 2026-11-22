@@ -20,6 +20,10 @@ use crate::{
     transport_parameters::TransportParameters,
 };
 
+// Retain a small hot cache without tying receive allocations to every stream
+// ID the peer is allowed to open after a high-concurrency burst.
+const MAX_CACHED_RECEIVERS: usize = 32;
+
 /// Wrapper around `Recv` that facilitates reusing `Recv` instances
 #[derive(Debug)]
 pub(super) enum StreamRecv {
@@ -267,11 +271,10 @@ impl StreamsState {
             debug!("received illegal STREAM frame");
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            &mut self.free_recv,
+        )) {
             Some(rs) => rs,
             None => {
                 trace!("dropping frame for closed stream");
@@ -320,11 +323,10 @@ impl StreamsState {
             debug!("received illegal RESET_STREAM frame");
         })?;
 
-        let rs = match self
-            .recv
-            .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
-        {
+        let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
+            self.stream_receive_window,
+            &mut self.free_recv,
+        )) {
             Some(stream) => stream,
             None => {
                 trace!("received RESET_STREAM on closed stream");
@@ -960,8 +962,9 @@ impl StreamsState {
         }
         // bidirectional OR (unidirectional AND remote)
         if bi || remote {
-            let recv = self.free_recv.pop();
-            assert!(self.recv.insert(id, recv).is_none());
+            // Permission to open a stream does not require a receive object.
+            // Take a cached object only when the stream is actually accessed.
+            assert!(self.recv.insert(id, None).is_none());
         }
     }
 
@@ -1014,7 +1017,9 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        self.free_recv.push(recv.free(self.stream_receive_window));
+        if self.free_recv.len() < MAX_CACHED_RECEIVERS {
+            self.free_recv.push(recv.free(self.stream_receive_window));
+        }
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1040,15 +1045,21 @@ pub(super) fn get_or_insert_send(
 #[inline]
 pub(super) fn get_or_insert_recv(
     initial_max_data: u64,
-) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
-    move |opt| {
-        *opt = opt.take().map(|s| match s {
-            StreamRecv::Free(recv) => StreamRecv::Open(recv),
-            s => s,
-        });
-        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
-            .as_open_recv_mut()
-            .unwrap()
+    free_recv: &mut Vec<StreamRecv>,
+) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv + '_ {
+    move |opt| match opt {
+        // Most accesses are to live streams. Do not take and reconstruct
+        // their entry merely to consult the idle-object cache.
+        Some(StreamRecv::Open(recv)) => recv,
+        opt => {
+            let recv = match opt.take().or_else(|| free_recv.pop()) {
+                Some(StreamRecv::Free(recv)) => recv,
+                Some(StreamRecv::Open(_)) => unreachable!("live streams use the fast path"),
+                None => Recv::new(initial_max_data),
+            };
+            *opt = Some(StreamRecv::Open(recv));
+            opt.as_mut().unwrap().as_open_recv_mut().unwrap()
+        }
     }
 }
 
@@ -1070,6 +1081,255 @@ mod tests {
             (1024 * 1024u32).into(),
             (1024 * 1024u32).into(),
         )
+    }
+
+    fn receive_cache_fixture(streams: u32) -> StreamsState {
+        let mut state = StreamsState::new(
+            Side::Server,
+            streams.into(),
+            0u32.into(),
+            1024 * 1024,
+            (1024 * 1024u32).into(),
+            (1024 * 1024u32).into(),
+        );
+        for index in 0..streams {
+            let id = StreamId::new(Side::Client, Dir::Uni, u64::from(index));
+            for segment in 0..16 {
+                let _ = state
+                    .received(
+                        frame::Stream {
+                            id,
+                            offset: segment * 128,
+                            fin: false,
+                            data: Bytes::from_static(&[0x71; 64]),
+                        },
+                        64,
+                    )
+                    .unwrap();
+            }
+        }
+        let mut pending = Retransmits::default();
+        for index in 0..streams {
+            let id = StreamId::new(Side::Client, Dir::Uni, u64::from(index));
+            RecvStream {
+                id,
+                state: &mut state,
+                pending: &mut pending,
+            }
+            .stop(0u32.into())
+            .unwrap();
+            let _ = state
+                .received_reset(frame::ResetStream {
+                    id,
+                    error_code: 0u32.into(),
+                    final_offset: 1984u32.into(),
+                })
+                .unwrap();
+        }
+        state
+    }
+
+    fn retained_receive_storage(state: &StreamsState) -> (usize, usize) {
+        state
+            .free_recv
+            .iter()
+            .chain(state.recv.values().flatten())
+            .filter_map(|entry| match entry {
+                StreamRecv::Free(recv) => {
+                    Some(std::mem::size_of::<Recv>() + recv.assembler.metadata_bytes())
+                }
+                StreamRecv::Open(_) => None,
+            })
+            .fold((0, 0), |(count, bytes), size| (count + 1, bytes + size))
+    }
+
+    #[test]
+    fn closed_receive_cache_is_bounded_without_changing_stream_credit() {
+        let state = receive_cache_fixture(256);
+        assert_eq!(state.recv.len(), 256);
+        assert_eq!(state.allocated_remote_count[Dir::Uni as usize], 256);
+        assert_eq!(state.max_remote[Dir::Uni as usize], 512);
+        assert!(state.recv.values().all(Option::is_none));
+        assert_eq!(retained_receive_storage(&state).0, 32);
+        assert_eq!(state.free_recv.len(), 32);
+        assert!(state.free_recv.capacity() <= 32);
+    }
+
+    #[test]
+    fn recycled_receive_state_is_used_only_when_stream_is_accessed() {
+        let mut state = receive_cache_fixture(1);
+        let id = StreamId::new(Side::Client, Dir::Uni, 1);
+        assert!(state.recv[&id].is_none());
+        let pointer = match state.free_recv.last().unwrap() {
+            StreamRecv::Free(recv) => &**recv as *const Recv,
+            StreamRecv::Open(_) => unreachable!(),
+        };
+        let _ = state
+            .received(
+                frame::Stream {
+                    id,
+                    offset: 0,
+                    fin: true,
+                    data: Bytes::from_static(b"reused"),
+                },
+                6,
+            )
+            .unwrap();
+        assert!(state.free_recv.is_empty());
+        let recv = state.recv[&id].as_ref().unwrap().as_open_recv().unwrap();
+        assert_eq!(recv as *const Recv, pointer);
+        assert_eq!(recv.assembler.bytes_read(), 0);
+        let mut pending = Retransmits::default();
+        let mut stream = RecvStream {
+            id,
+            state: &mut state,
+            pending: &mut pending,
+        };
+        let mut chunks = stream.read(true).unwrap();
+        assert_eq!(chunks.next(64).unwrap().unwrap().bytes.as_ref(), b"reused");
+        assert!(chunks.next(64).unwrap().is_none());
+        let _ = chunks.finalize();
+        assert_eq!(state.max_remote[Dir::Uni as usize], 3);
+        assert_eq!(retained_receive_storage(&state).0, 1);
+    }
+
+    #[test]
+    fn cached_receiver_is_reused_for_read_stop_and_reset_without_data() {
+        for operation in ["read", "stop", "reset"] {
+            let mut state = receive_cache_fixture(1);
+            let id = StreamId::new(Side::Client, Dir::Uni, 1);
+            let pointer = match state.free_recv.last().unwrap() {
+                StreamRecv::Free(recv) => &**recv as *const Recv,
+                StreamRecv::Open(_) => unreachable!(),
+            };
+            let mut pending = Retransmits::default();
+            match operation {
+                "read" => {
+                    let mut stream = RecvStream {
+                        id,
+                        state: &mut state,
+                        pending: &mut pending,
+                    };
+                    let mut chunks = stream.read(true).unwrap();
+                    assert!(matches!(
+                        chunks.next(64),
+                        Err(super::super::ReadError::Blocked)
+                    ));
+                    let _ = chunks.finalize();
+                }
+                "stop" => {
+                    RecvStream {
+                        id,
+                        state: &mut state,
+                        pending: &mut pending,
+                    }
+                    .stop(0u32.into())
+                    .unwrap();
+                }
+                "reset" => {
+                    let _ = state
+                        .received_reset(frame::ResetStream {
+                            id,
+                            error_code: 7u32.into(),
+                            final_offset: 0u32.into(),
+                        })
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(state.free_recv.is_empty());
+            let recv = state.recv[&id].as_ref().unwrap().as_open_recv().unwrap();
+            assert_eq!(recv as *const Recv, pointer, "{operation}");
+            assert_eq!(recv.assembler.bytes_read(), 0);
+            assert_eq!(recv.end, 0);
+            assert_eq!(recv.stopped, operation == "stop");
+            assert_eq!(
+                recv.reset_code(),
+                (operation == "reset").then_some(7u32.into())
+            );
+            assert_eq!(state.max_remote[Dir::Uni as usize], 2);
+        }
+    }
+
+    #[test]
+    fn cache_does_not_retain_unread_payload_or_limit_the_next_burst() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Owner(Arc<AtomicUsize>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                b"leased"
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let mut state = receive_cache_fixture(256);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut pending = Retransmits::default();
+        for index in 256..512 {
+            let id = StreamId::new(Side::Client, Dir::Uni, index);
+            let _ = state
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: true,
+                        data: Bytes::from_owner(Owner(dropped.clone())),
+                    },
+                    6,
+                )
+                .unwrap();
+        }
+        assert_eq!(state.recv.values().flatten().count(), 256);
+        assert!(state.free_recv.is_empty());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        for index in 256..512 {
+            let id = StreamId::new(Side::Client, Dir::Uni, index);
+            RecvStream {
+                id,
+                state: &mut state,
+                pending: &mut pending,
+            }
+            .stop(0u32.into())
+            .unwrap();
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 256);
+        assert_eq!(state.free_recv.len(), MAX_CACHED_RECEIVERS);
+        assert!(state.recv.values().all(Option::is_none));
+        assert_eq!(state.max_remote[Dir::Uni as usize], 768);
+        assert_eq!(state.allocated_remote_count[Dir::Uni as usize], 256);
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_idle_receive_cache() {
+        let mut states = Vec::with_capacity(128);
+        let start = std::time::Instant::now();
+        for _ in 0..128 {
+            states.push(receive_cache_fixture(256));
+        }
+        let elapsed = start.elapsed();
+        let (receivers, bytes) = states
+            .iter()
+            .map(retained_receive_storage)
+            .fold((0, 0), |(count, bytes), (next_count, next_bytes)| {
+                (count + next_count, bytes + next_bytes)
+            });
+        println!(
+            "sessions=128 peak_streams_per_session=256 retained_receivers={receivers} retained_receive_bytes={bytes} lifecycle_ns_per_session={}",
+            elapsed.as_nanos() / 128
+        );
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines().filter(|line| line.starts_with("VmRSS:")) {
+                println!("{line}");
+            }
+        }
+        std::hint::black_box(states);
     }
 
     #[test]
