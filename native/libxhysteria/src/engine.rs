@@ -64,6 +64,12 @@ const MAX_FLOWS: usize = 128;
 const SERVER_CHUNK: usize = 16384;
 const SERVER_RECEIVE_WINDOW: u32 = 64 * 1024;
 const SERVER_BULK_WINDOW: u32 = 8 * 1024 * 1024;
+// Third-party clients use one QUIC session and nonblocking OpenStream.
+// Keep low-concurrency sessions small, with ample headroom before expanding
+// to the Go server's wire limit. Bus::register still caps application flows.
+const SERVER_BIDI_STREAMS: u32 = 64;
+const SERVER_BUSY_BIDI_STREAMS: u32 = 1024;
+const SERVER_STREAM_EXPAND_AT: usize = 16;
 
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -509,11 +515,30 @@ struct ReceiveWindow {
     process_budget: Arc<Semaphore>,
     received: AtomicU64,
     expanded: AtomicBool,
-    streams: AtomicU32,
+    active_streams: AtomicUsize,
+    streams_expanded: AtomicBool,
     reservation: std::sync::Mutex<Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>>,
 }
 
+struct ActiveServerStream(Arc<ReceiveWindow>);
+
+impl Drop for ActiveServerStream {
+    fn drop(&mut self) {
+        self.0.active_streams.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl ReceiveWindow {
+    fn open_stream(self: &Arc<Self>) -> ActiveServerStream {
+        let active = self.active_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        if active >= SERVER_STREAM_EXPAND_AT
+            && !self.streams_expanded.swap(true, Ordering::Relaxed)
+        {
+            self.connection.set_max_concurrent_bi_streams(SERVER_BUSY_BIDI_STREAMS.into());
+        }
+        ActiveServerStream(self.clone())
+    }
+
     fn observe(&self, bytes: usize) {
         if self.expanded.load(Ordering::Relaxed) {
             return;
@@ -912,14 +937,21 @@ fn transport(config: &Config) -> Result<quinn::TransportConfig> {
     } else {
         8u32 * 1024 * 1024
     };
-    t.max_concurrent_bidi_streams((if config.server { 8u32 } else { 0 }).into())
-        .max_concurrent_uni_streams(8u32.into())
-        // Match Xray's Go Hysteria windows on WAN paths, while bounding memory
-        // across streams instead of retaining Quinn's effectively unlimited cap.
-        .stream_receive_window((8u32 * 1024 * 1024).into())
-        .receive_window(receive_window.into())
-        .max_idle_timeout(Some(idle.try_into()?))
-        .keep_alive_interval(Some(alive));
+    t.max_concurrent_bidi_streams(
+        (if config.server {
+            SERVER_BIDI_STREAMS
+        } else {
+            0
+        })
+        .into(),
+    )
+    .max_concurrent_uni_streams(8u32.into())
+    // Match Xray's Go Hysteria windows on WAN paths, while bounding memory
+    // across streams instead of retaining Quinn's effectively unlimited cap.
+    .stream_receive_window((8u32 * 1024 * 1024).into())
+    .receive_window(receive_window.into())
+    .max_idle_timeout(Some(idle.try_into()?))
+    .keep_alive_interval(Some(alive));
     let datagram_buffer = if config.server { 32 * 1024 } else { 256 * 1024 };
     t.datagram_receive_buffer_size(Some(datagram_buffer));
     t.datagram_send_buffer_size(datagram_buffer);
@@ -1429,6 +1461,24 @@ async fn relay_tcp_upload(
     }
 }
 
+async fn relay_tcp_until_stopped(
+    work: impl std::future::Future<Output = Result<()>>,
+    stopped: impl std::future::Future<
+        Output = std::result::Result<Option<quinn::VarInt>, quinn::StoppedError>,
+    >,
+) -> Result<()> {
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        result = &mut work => result,
+        result = stopped => match result? {
+            Some(_) => Err("peer stopped TCP receive".into()),
+            // Local FIN only closes the send half; preserve the receive half.
+            None => work.await,
+        },
+    }
+}
+
 async fn relay_client_tcp(
     connection: quinn::Connection,
     frame: Frame,
@@ -1469,6 +1519,7 @@ async fn relay_client_tcp(
         }
     }
     drop(response);
+    let stopped = tx.stopped();
     let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
     let down = async {
         let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
@@ -1488,8 +1539,10 @@ async fn relay_client_tcp(
         bus.send(Frame::new(FIN, id, Bytes::new())).await?;
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     };
-    tokio::try_join!(up, down)?;
-    Ok(())
+    relay_tcp_until_stopped(
+        async { tokio::try_join!(up, down)?; Ok(()) },
+        stopped,
+    ).await
 }
 
 async fn relay_server_tcp(
@@ -1529,12 +1582,7 @@ async fn relay_server_tcp(
             return Err(error);
         }
     };
-    let streams = receive_window.streams.fetch_add(1, Ordering::Relaxed);
-    if streams == 1 {
-        receive_window
-            .connection
-            .set_max_concurrent_bi_streams(64u32.into());
-    }
+    let _active_stream = receive_window.open_stream();
     let result: Result<()> = async {
         let mut metadata = user.to_be_bytes().to_vec();
         metadata.extend_from_slice(&owner.to_be_bytes());
@@ -1550,6 +1598,7 @@ async fn relay_server_tcp(
         }
         drop(header);
         let (mut tx, mut rx) = stream.split()?;
+        let stopped = tx.stopped();
         let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
         let down = async {
             let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
@@ -1571,8 +1620,10 @@ async fn relay_server_tcp(
             bus.send(Frame::new(FIN, id, Bytes::new())).await?;
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         };
-        tokio::try_join!(up, down)?;
-        Ok(())
+        relay_tcp_until_stopped(
+            async { tokio::try_join!(up, down)?; Ok(()) },
+            stopped,
+        ).await
     }
     .await;
     bus.done(id, result).await;
@@ -1939,10 +1990,14 @@ async fn serve(
             .clone(),
         received: AtomicU64::new(0),
         expanded: AtomicBool::new(false),
-        streams: AtomicU32::new(0),
+        active_streams: AtomicUsize::new(0),
+        streams_expanded: AtomicBool::new(false),
         reservation: std::sync::Mutex::new(None),
     });
     let mut tasks = JoinSet::<Result<()>>::new();
+    // Reserve room for auth, diagnostics and UDP without imposing the old
+    // prototype's 128-flow cap on a listener configured for more TCP flows.
+    let task_limit = bus.max_flows.saturating_add(3);
     if config.diagnostic {
         tasks.spawn(connection_diagnostics(connection.clone(), "server"));
     }
@@ -1981,13 +2036,13 @@ async fn serve(
                     data,
                 ));
             }
-            accepted = h3_transport::accept(&mut incoming), if classifiers.len() < 32 && tasks.len() < MAX_FLOWS + 1 => {
+            accepted = h3_transport::accept(&mut incoming), if classifiers.len() < 32 && tasks.len() < task_limit => {
                 match accepted {
                     Ok(stream) => { classifiers.spawn(async { tokio::time::timeout(Duration::from_secs(10), h3_transport::classify(stream)).await? }); }
                     Err(_) => break,
                 }
             }
-            accepted = poll_fn(|cx| h3.poll_accept_request_stream(cx)), if tasks.len() < MAX_FLOWS + 1 => {
+            accepted = poll_fn(|cx| h3.poll_accept_request_stream(cx)), if tasks.len() < task_limit => {
                 match accepted {
                     Ok(Some(stream)) => {
                         let stopped = config.external_masquerade.then(|| stream.stopped());
@@ -3519,6 +3574,55 @@ mod tests {
         };
         assert_eq!(config.connection_limit(), 32);
         assert_eq!(config.flow_limit(), 64);
+    }
+
+    #[tokio::test]
+    async fn peer_stop_cancels_an_idle_tcp_relay() {
+        struct OnDrop(Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = dropped.clone();
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            relay_tcp_until_stopped(
+                async move {
+                    let _guard = OnDrop(observed);
+                    std::future::pending::<Result<()>>().await
+                },
+                async { Ok(stopped.await.unwrap()) },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        stop.send(Some(0u32.into())).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await.unwrap().unwrap().is_err()
+        );
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_local_fin_keeps_the_other_tcp_half_alive() {
+        let (complete, remaining) = oneshot::channel();
+        let mut task = tokio::spawn(async {
+            relay_tcp_until_stopped(
+                async { remaining.await.unwrap(); Ok(()) },
+                async { Ok(None) },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut task)
+                .await.is_err()
+        );
+        complete.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await.unwrap().unwrap().unwrap();
     }
 
     #[test]
