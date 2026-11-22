@@ -47,32 +47,42 @@ impl SendBuffer {
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
+        // Most ACKs advance an uninterrupted prefix. With no queued ranges,
+        // consume it directly instead of allocating then removing a tree node.
+        // Reordered ACKs retain the original range-set path below.
+        if range.start == base_offset && self.acks.is_empty() {
+            self.discard_prefix((range.end - range.start) as usize);
+            return;
+        }
         self.acks.insert(range);
 
         while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
             let prefix = self.acks.pop_min().unwrap();
-            let mut to_advance = (prefix.end - prefix.start) as usize;
+            self.discard_prefix((prefix.end - prefix.start) as usize);
+        }
+    }
 
-            self.unacked_len -= to_advance;
-            while to_advance > 0 {
-                let front = self
-                    .unacked_segments
-                    .front_mut()
-                    .expect("Expected buffered data");
+    #[inline]
+    fn discard_prefix(&mut self, mut to_advance: usize) {
+        self.unacked_len -= to_advance;
+        while to_advance > 0 {
+            let front = self
+                .unacked_segments
+                .front_mut()
+                .expect("Expected buffered data");
 
-                if front.len() <= to_advance {
-                    to_advance -= front.len();
-                    self.unacked_segments.pop_front();
-                    self.front_trimmed = 0;
+            if front.len() <= to_advance {
+                to_advance -= front.len();
+                self.unacked_segments.pop_front();
+                self.front_trimmed = 0;
 
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
-                        self.unacked_segments.shrink_to_fit();
-                    }
-                } else {
-                    front.advance(to_advance);
-                    self.front_trimmed += to_advance;
-                    to_advance = 0;
+                if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                    self.unacked_segments.shrink_to_fit();
                 }
+            } else {
+                front.advance(to_advance);
+                self.front_trimmed += to_advance;
+                to_advance = 0;
             }
         }
     }
@@ -395,6 +405,214 @@ mod tests {
         buf.ack(0..16);
         assert_eq!(aggregate_unacked(&buf), &MSG[23..]);
         assert!(buf.acks.is_empty());
+    }
+
+    #[test]
+    fn batched_ack_preserves_wrapped_segments_and_partial_tail() {
+        let mut buf = SendBuffer::new();
+        for index in 0..1024u64 {
+            buf.write(Bytes::from(index.to_be_bytes().to_vec()));
+        }
+        buf.poll_transmit(8192 + 16);
+        buf.ack(0..6144);
+        for index in 1024..1536u64 {
+            buf.write(Bytes::from(index.to_be_bytes().to_vec()));
+        }
+        buf.poll_transmit(4096 + 16);
+        // The new writes use the previously drained front of the deque.
+        assert!(!buf.unacked_segments.as_slices().1.is_empty());
+        buf.ack(8192..12288);
+        assert_eq!(buf.unacked_len, 6144);
+        buf.ack(6144..8191);
+        assert_eq!(buf.unacked_len, 4097);
+        assert_eq!(buf.front_trimmed, 7);
+        assert_eq!(buf.get(8191..8192), &[0xff]);
+        buf.ack(8191..8192);
+        assert_eq!(buf.unacked_len, 0);
+        assert_eq!(buf.front_trimmed, 0);
+        assert!(buf.unacked_segments.is_empty());
+        assert_eq!(buf.unacked_segments.capacity(), 0);
+        assert!(buf.acks.is_empty());
+        assert_eq!(buf.offset(), 12288);
+        buf.write(Bytes::from_static(b"next"));
+        assert_eq!(buf.get(12288..12292), b"next");
+    }
+
+    #[test]
+    fn batched_ack_releases_payload_owners_only_after_the_final_byte() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Owner {
+            bytes: [u8; 8],
+            dropped: Arc<AtomicUsize>,
+        }
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut buf = SendBuffer::new();
+        for _ in 0..1024 {
+            buf.write(Bytes::from_owner(Owner {
+                bytes: [0x71; 8],
+                dropped: dropped.clone(),
+            }));
+        }
+        buf.poll_transmit(8192 + 16);
+        buf.ack(8..8192);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        buf.ack(0..7);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(buf.buffered(), 8192);
+        buf.ack(7..8);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1024);
+        assert_eq!(buf.buffered(), 0);
+        assert_eq!(buf.unacked_segments.capacity(), 0);
+    }
+
+    fn reference_ack(buf: &mut SendBuffer, mut range: Range<u64>) {
+        let base = buf.offset - buf.unacked_len as u64;
+        range.start = base.max(range.start);
+        range.end = base.max(range.end);
+        buf.acks.insert(range);
+        while buf.acks.min() == Some(buf.offset - buf.unacked_len as u64) {
+            let prefix = buf.acks.pop_min().unwrap();
+            let mut remaining = (prefix.end - prefix.start) as usize;
+            buf.unacked_len -= remaining;
+            while remaining > 0 {
+                let front = buf.unacked_segments.front_mut().unwrap();
+                if front.len() <= remaining {
+                    remaining -= front.len();
+                    buf.unacked_segments.pop_front();
+                    buf.front_trimmed = 0;
+                    if buf.unacked_segments.len() * 4 < buf.unacked_segments.capacity() {
+                        buf.unacked_segments.shrink_to_fit();
+                    }
+                } else {
+                    front.advance(remaining);
+                    buf.front_trimmed += remaining;
+                    remaining = 0;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_ack_matches_reference_with_duplicates_gaps_and_new_writes() {
+        for scenario in 0..64u64 {
+            let mut actual = SendBuffer::new();
+            let mut reference = SendBuffer::new();
+            let mut random = scenario + 1;
+            for cycle in 0..4 {
+                for index in 0..256 {
+                    random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let length = 1 + ((random >> 32) % 64) as usize;
+                    let data = Bytes::from(vec![(index + cycle) as u8; length]);
+                    actual.write(data.clone());
+                    reference.write(data);
+                }
+                for _ in 0..128 {
+                    random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let start = (random >> 32) % (actual.offset + 1);
+                    let length = 1 + (random & 1023);
+                    let end = actual.offset.min(start + length);
+                    actual.ack(start..end);
+                    reference_ack(&mut reference, start..end);
+                    assert_eq!(actual.unacked_len, reference.unacked_len);
+                    assert_eq!(actual.front_trimmed, reference.front_trimmed);
+                    assert_eq!(actual.buffered(), reference.buffered());
+                    assert_eq!(actual.offset, reference.offset);
+                    assert_eq!(aggregate_unacked(&actual), aggregate_unacked(&reference));
+                    assert_eq!(
+                        format!("{:?}", actual.acks),
+                        format!("{:?}", reference.acks)
+                    );
+                    assert_eq!(
+                        actual.unacked_segments.capacity(),
+                        reference.unacked_segments.capacity()
+                    );
+                }
+                assert_eq!(
+                    actual.poll_transmit(actual.unacked_len + 32),
+                    reference.poll_transmit(reference.unacked_len + 32)
+                );
+                let base = actual.offset - actual.unacked_len as u64;
+                if base < actual.unsent {
+                    let range = base..actual.unsent.min(base + 32);
+                    actual.retransmit(range.clone());
+                    reference.retransmit(range);
+                    let (range, encoded) = actual.poll_transmit(48);
+                    assert_eq!((range.clone(), encoded), reference.poll_transmit(48));
+                    assert_eq!(actual.get(range.clone()), reference.get(range));
+                }
+                // An ACK gap stays buffered into the next batch of writes.
+                let end = actual.offset.saturating_sub(32);
+                actual.ack(0..end);
+                reference_ack(&mut reference, 0..end);
+                assert_eq!(aggregate_unacked(&actual), aggregate_unacked(&reference));
+            }
+            actual.ack(0..actual.offset);
+            let offset = reference.offset;
+            reference_ack(&mut reference, 0..offset);
+            assert_eq!(actual.unacked_segments.capacity(), 0);
+            assert_eq!(reference.unacked_segments.capacity(), 0);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn benchmark_batched_ack_metadata() {
+        const RUNS: usize = 1024;
+        let reference = std::env::var_os("XHYS_ACK_BENCH_REFERENCE").is_some();
+        let ack: fn(&mut SendBuffer, Range<u64>) = if reference {
+            reference_ack
+        } else {
+            SendBuffer::ack
+        };
+        println!("reference={reference}");
+        for chunks in [1, 8, 128, 1024, 8192] {
+            for mode in ["full", "partial", "reordered"] {
+                let mut elapsed = std::time::Duration::ZERO;
+                for _ in 0..RUNS {
+                    let mut buf = SendBuffer::new();
+                    for _ in 0..chunks {
+                        buf.write(Bytes::from_static(&[0x71; 64]));
+                    }
+                    let size = (chunks * 64) as u64;
+                    let started = std::time::Instant::now();
+                    match mode {
+                        "full" => ack(&mut buf, 0..size),
+                        "partial" => ack(&mut buf, 0..size * 7 / 8),
+                        "reordered" => {
+                            ack(&mut buf, size / 2..size);
+                            ack(&mut buf, 0..size / 2);
+                        }
+                        _ => unreachable!(),
+                    }
+                    elapsed += started.elapsed();
+                    if mode == "partial" {
+                        assert_eq!(buf.unacked_len, (size / 8) as usize);
+                        assert_eq!(buf.get(size * 7 / 8..size)[0], 0x71);
+                    } else {
+                        assert_eq!(buf.unacked_len, 0);
+                        assert_eq!(buf.unacked_segments.capacity(), 0);
+                    }
+                    std::hint::black_box(&buf);
+                }
+                println!(
+                    "chunks={chunks} mode={mode} ack_ns_per_run={}",
+                    elapsed.as_nanos() / RUNS as u128
+                );
+            }
+        }
     }
 
     fn aggregate_unacked(buf: &SendBuffer) -> Vec<u8> {

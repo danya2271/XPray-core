@@ -1,6 +1,6 @@
 # Codex Handoff: Native Hysteria Memory and Capacity
 
-Date: 2026-11-21
+Date: 2026-11-23
 Workspace: `/home/danya2271/ProxVless/XPray-core`
 
 ## Request and Scope
@@ -997,3 +997,50 @@ remove STOP_SENDING cleanup, half-close correctness or stream-limit checks.
 Both fifteen-minute corrected-adaptive soaks now pass: plain/shared17591
 recycles, Salamander/socket17580, one permanent echo stream and no reconnect.
 Logs: `soak-adaptive-15m.log` and `soak-adaptive-masked-socket-15m.log`.
+
+## ACK Prefix Fast Path and General Performance Round (2026-11-23)
+
+The user explicitly accepts meaningful microbenchmark wins, while retaining
+the overall goal of maximum throughput/minimum latency/low RSS. Baseline
+`5a0afcdc`. Accepted production change is only Quinn-proto SendBuffer::ack:
+when the ACK starts at the unacknowledged base and no ranges are queued,
+discard that prefix without a temporary range-tree insertion/removal.
+All other ACKs retain the old range-set algorithm. Shared prefix-consumption
+helper preserves payload owners, offsets, retransmits and the exact original
+deque shrink/capacity policy. Shared bridge production behavior is unchanged;
+the full-queue/close regression from its rejected experiment is retained.
+
+Seven alternating-order samples compare old/new algorithms in one test binary:
+one-chunk full ACK67→35ns, partial56→25ns; eight-chunk full146→118ns,
+partial123→95ns. One-chunk reordered129→147ns: document the micro regression
+instead of claiming every ACK is faster. Isolated test-only allocator counts
+one-chunk sequential ACK1allocation/192bytes→0/0. Production allocator unchanged.
+64scenario differential testing compares data, byte counters, stream offsets,
+retransmissions and exact metadata capacity to the old reference.
+
+Five matched both-native end-to-end samples per variant/workload: upload
+369.85→377.06MB/s, download330.83→330.80; bulkCPU421.08→439.31µs upload
+and493.18→501.30 download. CPU is not universally lower. Upload peakRSS
+87.40→80.67MiB, download56.12→56.25. Idle TCPp99=194.1→189.4µs,
+UDP181.0→170.7, paced567.1→485.6 at unequal achieved background60.96→63.16MiB/s.
+These local samples do not prove general speed/latency/RSS factors; accepted
+claim is the sequential-ACK allocation/work reduction.
+
+Three alternating1000-session capacity samples per variant pass512MiB guard:
+median idleRSS138.3→135.7MiB, peak223.5→221.8, duplex151.65→153.98MiB/s,
+heartbeatp99=2670.3→2554.7µs. No1GiB cgroup; retain original memory caveats.
+320release/321debug Quinn-proto +3ignored,129engine, production/library Clippy,
+fresh-linked Go race xhysteria/hysteria/handoff/supervisor/proxy pass.
+Single-session192live/1200churn, flow rejection/recovery, masks, short flows,
+100ms RTT bulk pass. Strict direct/cascade256/4096 UDP:8000/8000,
+zero sampled kernel drops/duplicates. No new fifteen-minute ACK variant soak.
+
+Full report: `docs/hysteria-ack-prefix-performance.md`. Raw accepted results
+and test-only allocation instrumentation:ignored `build_assets/ack-prefix-20261123/`.
+Earlier ACK/shrink/merged-range/shared-waiter candidates were reverted; preserve
+their `ack-batching`, `ack-fastpath`, `ack-combined`, `shared-fastpath` logs,
+including invalid identical-binary cache comparison and missing-time setup.
+The native/Go overall latency/RSS gap remains. Do not report an end-to-end
+speedup percentage equal to the47.8–55.4% single-chunk micro improvement.
+Commit/push all task changes to four origin branches normally; no upstream,
+force push, remote deployment or neighboring-worktree changes.
