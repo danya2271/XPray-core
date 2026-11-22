@@ -724,6 +724,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn full_publication_waits_for_progress_and_close_interrupts_it() {
+        for close in [false, true] {
+            let bridge = Bridge::new().unwrap();
+            for id in 0..CAPACITY {
+                assert!(bridge.push(false, 3, u64::from(id), b"queued").unwrap());
+            }
+            let sender = bridge.clone();
+            let mut task = tokio::spawn(async move {
+                sender.send_vectored(3, 99, &[b"after", b"-full"]).await
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut task)
+                    .await.is_err()
+            );
+            assert_eq!(bridge.header().event_waiting.load(Ordering::SeqCst), 1);
+            if close {
+                bridge.close();
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                        .await.unwrap().unwrap().is_err()
+                );
+            } else {
+                assert_eq!(bridge.pop(false).unwrap().unwrap().1, 0);
+                bridge.changed.notify_waiters();
+                tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await.unwrap().unwrap().unwrap();
+                for expected in 1..CAPACITY {
+                    assert_eq!(bridge.pop(false).unwrap().unwrap().1, u64::from(expected));
+                }
+                let (_, id, data) = bridge.pop(false).unwrap().unwrap();
+                assert_eq!((id, data.as_ref()), (99, b"after-full".as_slice()));
+                assert!(bridge.pop(false).unwrap().is_none());
+            }
+        }
+    }
+
     #[test]
     fn layout_wraparound_and_full_rings() {
         assert_eq!(std::mem::size_of::<Header>(), HEADER);
