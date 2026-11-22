@@ -250,6 +250,11 @@ impl Assembler {
         self.bytes_read
     }
 
+    #[cfg(test)]
+    pub(super) fn metadata_bytes(&self) -> usize {
+        self.data.capacity() * mem::size_of::<Buffer>()
+    }
+
     /// Discard all buffered data
     pub(super) fn clear(&mut self) {
         if self.data.capacity() > MAX_CACHED_CHUNKS {

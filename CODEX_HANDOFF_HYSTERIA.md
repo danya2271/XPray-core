@@ -1044,3 +1044,46 @@ The native/Go overall latency/RSS gap remains. Do not report an end-to-end
 speedup percentage equal to the47.8–55.4% single-chunk micro improvement.
 Commit/push all task changes to four origin branches normally; no upstream,
 force push, remote deployment or neighboring-worktree changes.
+
+## Bounded Lazy Receive-Object Cache (2026-11-23)
+
+Baseline829b79d1. Quinn formerly attached recycled Recv objects to every new
+permitted stream ID, keeping post-burst receive metadata even for unused IDs.
+Cache at most32 closed receive objects per connection, and take them only on
+actual DATA/RESET/read/STOP access. Already-open lookup directly returns Recv,
+without taking/reconstructing the entry. Eviction applies only to closed
+objects. Stream limits/MAX_STREAMS, flow windows, process budgets, ACK prefix
+optimization and third-party STOP_SENDING/half-close fixes are unchanged.
+
+Five alternating protocol-fixture samples:128sessions ×256gapped RX streams
+then STOP/reset; retained objects32768→4096, object/assembler metadata
+32.25→4.03MiB (-87.5%), fixtureRSS50.99→22.48MiB, lifecycle421.15→318.98µs
+per state. This is isolated post-burst retention, not a whole-Xray RSS factor.
+The first helper prototype reconstructed live entries and its download
+regressed about8%; retain its recv-cache-20261123 logs, not final claims.
+
+Final five-run both-native loopback medians:upload364.42→363.03MB/s,
+download326.92→317.70 (-2.82%). BulkCPU438.59→457.57µs upload and
+502.04→522.54 download. BulkpeakRSS83.77→78.19MiB /62.25→55.42.
+IdleTCPp99=205.9→202.6µs, UDP201.8→191.9; paced588.2→608.1 at
+background60.31→60.26MiB/s. Accept as memory-retention optimization with
+documented throughput/CPU tradeoff, not a universal speedup.
+
+Three1000-session capacity samples per variant:idleRSS137.6→135.4MiB,
+peak221.4→219.6, duplex143.86→140.72MiB/s, heartbeatp99=2724.5→2770µs.
+All6pass512MiB guard; no1GiB cgroup. The isolated post-burst saving is not
+expected in this low-per-session-concurrency capacity fixture.
+
+324release/325debug Quinn-proto +4ignored,129engine and applicable Clippy pass.
+Fresh-linked Go race xhysteria/hysteria/handoff/supervisor/proxy pass.
+New tests cover cache bound, DATA/read/STOP/reset reuse, cleared state,
+last-payload release and second256stream burst. Shared/socket Salamander
+192live/1200churn, cap recovery, masks/shortflows/100msRTT pass.
+StrictUDPdirect/cascade256/4096 gets8000/8000; kernel drops/duplicates0.
+Linuxamd64/Androidarm64API26 build pass; no device or fresh15min cache soak.
+
+Report:docs/hysteria-receive-cache-performance.md. Final data/artifacts:
+ignored build_assets/recv-cache-fast-20261123/. Initial prototype and expected
+failing baseline:recv-cache-20261123/. Preserve failed fixture Clippy logs.
+Commit/push all task paths to four origin branches, no force/upstream push.
+No production restart/deployment or neighboring-worktree edits.
