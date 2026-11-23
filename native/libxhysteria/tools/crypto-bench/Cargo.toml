@@ -1,0 +1,12 @@
+[package]
+name = "xhys-crypto-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring", "aws_lc_rs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

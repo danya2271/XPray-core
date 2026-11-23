@@ -1,0 +1,9 @@
+diff --git a/native/libxhysteria/src/engine.rs b/native/libxhysteria/src/engine.rs
+--- a/native/libxhysteria/src/engine.rs
++++ b/native/libxhysteria/src/engine.rs
+@@ -198 +198 @@
+-        .global_queue_interval(7)
++        .global_queue_interval(31)
+@@ -223 +223 @@
+-                    .global_queue_interval(7)
++                    .global_queue_interval(31)
