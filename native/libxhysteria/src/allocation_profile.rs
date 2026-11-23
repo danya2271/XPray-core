@@ -8,6 +8,14 @@ struct Allocator;
 static COUNTS: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
 static BYTES: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
 
+#[cfg(test)]
+pub(crate) fn live_objects() -> usize {
+    COUNTS
+        .iter()
+        .map(|count| count.load(Ordering::Relaxed))
+        .sum()
+}
+
 fn class(size: usize) -> usize {
     (usize::BITS - size.saturating_sub(1).leading_zeros()).min(31) as usize
 }

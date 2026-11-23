@@ -9,6 +9,7 @@ use crate::{
 };
 use bytes::Bytes;
 use std::{
+    fmt,
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr::NonNull,
@@ -18,6 +19,46 @@ use std::{
     },
 };
 use tokio::{io::unix::AsyncFd, sync::Notify};
+
+/// A leased payload need not allocate a Bytes owner until its final consumer
+/// attaches the send-budget permits. Moving this value keeps the slot pinned.
+#[derive(Debug)]
+pub(crate) enum FrameData {
+    Bytes(Bytes),
+    Payload(Payload),
+}
+
+impl FrameData {
+    pub(crate) fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Payload(payload) => Bytes::from_owner(payload),
+        }
+    }
+}
+
+impl From<Bytes> for FrameData {
+    fn from(bytes: Bytes) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+impl AsRef<[u8]> for FrameData {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes.as_ref(),
+            Self::Payload(payload) => payload.as_ref(),
+        }
+    }
+}
+
+impl std::ops::Deref for FrameData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
 
 pub const MAGIC: u64 = 0x5848595353484d32;
 pub const VERSION: u32 = 6;
@@ -329,7 +370,17 @@ impl Bridge {
         None
     }
 
+    #[cfg(test)]
     pub fn pop(self: &Arc<Self>, commands: bool) -> Result<Option<(u8, u64, Bytes)>> {
+        Ok(self
+            .pop_deferred(commands)?
+            .map(|(kind, id, data)| (kind, id, data.into_bytes())))
+    }
+
+    pub(crate) fn pop_deferred(
+        self: &Arc<Self>,
+        commands: bool,
+    ) -> Result<Option<(u8, u64, FrameData)>> {
         let header = self.header();
         let (head, tail) = if commands {
             (&header.command_head.value, &header.command_tail.value)
@@ -362,15 +413,15 @@ impl Bridge {
             return Err("invalid shared frame descriptor".into());
         }
         let data = if leased {
-            Bytes::from_owner(Payload {
+            FrameData::Payload(Payload {
                 bridge: self.clone(),
                 commands,
-                slot: payload_slot,
+                slot: payload_slot as u8,
                 len,
             })
         } else {
             let payload = unsafe { std::slice::from_raw_parts(slot.add(16), len) };
-            match payload {
+            FrameData::Bytes(match payload {
                 [credit]
                     if kind == u32::from(CREDIT) && usize::from(*credit) < CREDIT_COUNTS.len() =>
                 {
@@ -378,7 +429,7 @@ impl Bridge {
                     Bytes::from_static(&CREDIT_COUNTS[index..index + 1])
                 }
                 _ => Bytes::copy_from_slice(payload),
-            }
+            })
         };
         tail.store(index.wrapping_add(1), Ordering::SeqCst);
         Ok(Some((kind as u8, id, data)))
@@ -449,18 +500,32 @@ impl Bridge {
     }
 }
 
-struct Payload {
+pub(crate) struct Payload {
     bridge: Arc<Bridge>,
     commands: bool,
-    slot: usize,
+    // Validated against the 16-slot arena before constructing this lease.
+    // Keeping the index narrow lets FrameData reuse Bytes' existing niche.
+    slot: u8,
     len: usize,
+}
+
+impl fmt::Debug for Payload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Payload")
+            .field("commands", &self.commands)
+            .field("slot", &self.slot)
+            .field("len", &self.len)
+            .finish()
+    }
 }
 
 impl AsRef<[u8]> for Payload {
     fn as_ref(&self) -> &[u8] {
         unsafe {
             std::slice::from_raw_parts(
-                self.bridge.payload_pointer(self.commands, self.slot),
+                self.bridge
+                    .payload_pointer(self.commands, usize::from(self.slot)),
                 self.len,
             )
         }
@@ -589,7 +654,7 @@ mod tests {
                 })
             })
             .collect();
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Bytes)>(PAYLOAD_SLOTS);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, FrameData)>(PAYLOAD_SLOTS);
         let consumer = std::thread::spawn(move || {
             for (id, payload) in receiver {
                 assert_eq!(payload.as_ref(), id.to_le_bytes());
@@ -597,7 +662,7 @@ mod tests {
         });
         for _ in 0..4096 {
             loop {
-                if let Some((kind, id, payload)) = bridge.pop(false).unwrap() {
+                if let Some((kind, id, payload)) = bridge.pop_deferred(false).unwrap() {
                     assert_eq!(kind, 3);
                     sender.send((id, payload)).unwrap();
                     break;

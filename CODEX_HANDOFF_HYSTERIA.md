@@ -1400,3 +1400,89 @@ Prepared ignored `build_assets/crypto-scheduling-20261124/crypto-bench-android-a
 SHA25685a454b5d3128528dcf3c2bdc7ff5fe5a707e7b7dda3165f2174403a480de00e.
 No device execution or ARM performance claim. README includes cross-build/run
 recipe;measure on actual target before changing provider there.
+
+## Completed: Compact shared-payload/send-budget ownership (2026-11-24)
+
+User moved away from crypto and requests optimization of complex transport
+paths. Baseline d1856927; standing commit/push authorization to all four
+origin branches persists. No deployment/restart or neighboring worktree edits.
+
+Accepted source changes: src/shared.rs,src/engine.rs,src/allocation_profile.rs.
+FrameData holds ordinary Bytes or a moveable arena Payload lease. Shared
+command pop defers Bytes::from_owner until send-budget permits are attached,
+so one owner replaces nested payload+budget owners. Consumers without a
+budget can materialize ordinary Bytes. Lease Drop still returns the same slot;
+last Quinn slice keeps the arena and both permits alive.
+
+Initial uncompact variant grew Frame48→56B and budget owner64→72B, saving
+2–6% in micros but producing mixed multicore/server results. Not accepted.
+Its complete80lowcore+48controls+24managed observations,42micros and6allocator
+checks are preserved in docs/hysteria-shared-owner-20261124/uncompacted-rejected.json.
+Ignored artifacts/source snapshots:build_assets/shared-owner-20261124/.
+
+FINAL candidate narrows validated slot0..15 from usize to u8. FrameData reuses
+Bytes' niche: Frame48B,budget owner64B unchanged on amd64. 133release engine
+tests pass,2ignored. New regressions verify last-slice arena/budget lifetime,
+cancellation at local/process budget, and failed try_acquire preserving the
+lease/address for retry. Concurrent shared release/publication test uses raw
+FrameData. Diagnostic allocator confirms2→1live owner allocations per frame
+and complete cleanup. Normal-allocator seven paired same-binary CPU4 micros:
+64B225.919→214.940ns;4096B273.789→251.760;16384B627.468→600.553.
+Reference shares compact parser/layout and uses separate old-sized budget
+wrapper;it isolates ownership,not entire old transport.
+
+Completed sequentially:133release/133debug engine tests,seven paired micros,
+allocator checks,native/harness/Xraybuilds;5paired1/2core A/B(80samples),
+3paired4/8controls(48),3pairedmanaged1/2(24),release engineClippy-Dwarnings,
+fresh5packageGorace;1/2mask/concurrency/credit/capacity/100msRTT andHTTP
+file/proxy/trailers/cancel/early-response checks;masked thirdpartyshared/socket
+192concurrent/1200churn/finite-window checks;strictUDP8000/8000perbudget,
+saturatedUDP6000/6000perbudget,retained/saturated-drain tests;3paired1000session
+capacity;Androidarm64NDK30/API26build. All pass. No task builds/tests overlap
+timed matrices. Original v1 acceptance was explicitly deferred to this variant.
+
+Compact artifacts:build_assets/shared-owner-compact-20261124/.
+Progress logs:ab-progress.log,control-progress.log,managed-progress.log,
+validation-progress.log,progress.log. Source snapshots and SHA manifest there.
+Native compact archive SHA
+9e66f59f147bd87b1ca807bd1a394f8c184ff6af446c2a5c33ee65da07c6b998.
+Android native archive SHA
+fbefa3bb9e4ba0ce518ab83a6f14c9717f400e90a6b7831217edaa3706a5bb93.
+Android Xray SHA466ae45f89cd8153ddea783959c220c828fba86b13b48f4336afffca89eb8446.
+
+Initial8corecontrols showed worse duplex/pacedp99. Four additional paired
+repeats of those exact workloads,binaries/settings completed after acceptance
+builds/tests. Retain initial3 and added4 separately. All7pair medians:
+duplex665.16→676.79MB/s,CPU1157.700→1138.740µs,p9927044→25920µs;
+pacedp993224→3229µs,CPU1062.021→1032.785µs,background63.99→64.00MiB/s.
+Large p99 regression from initial3 did not persist;not a universal speed factor.
+
+Accepted for deterministic ownership metadata reduction with unchanged frame/
+queue bounds and passed lifetime/transport acceptance. Five-pair combined
+one-core up178.42→182.45MB/s,down186.15→190.53;two-core292.03→293.73 /
+328.65→337.27. Pacedp994695→4603µs /2207→1845. All40candidate lowcore
+samples zero kernel drops;baseline two nonzero download samples at2cores.
+Controls have8coreupload drops in all3samples per revision;do not qualify
+them as loss-free. Managed24samples zero ingress/publicUDPdrops.
+
+Explicit tradeoffs:one-core combined bulk-duplexp9959.319→65.428ms;
+managed one-core252.86→248.78MB/s,totalCPU477.039→485.453µs.
+Managed2corebulk451.25→451.54MB/s essentially unchanged. Two-core paced CPU
+perprobe increases while p99 improves.1000session peak-before-closeRSS
+222.4→222.7MiB;no intrinsic process RSS reduction claim. No all-metrics win.
+No device/WAN/new15minute-soak/full-repository-green/deployment claim.
+
+Final report docs/hysteria-shared-owner-performance.md.
+Final168transport/6capacity/42micro/6allocator observations and validation in
+docs/hysteria-shared-owner-20261124/results.json. Earlier152sample variant
+and exact historical source patch are uncompacted-rejected.json/.patch.
+finish-evidence.py generated final report/data and verifies source hashes,
+library hashes and passing logs. Do not rerun it after editing/reverting source
+without accounting for source/binary consistency;it rewrites result tables.
+
+Standing publication authorization:focused ordinary commit,cherry-pick-x on
+fresh disposable worktrees,atomicpushall4origin,verifyremoteheads. No force,
+upstream push,remote VPS or existing auxiliary/neighbor worktree changes.
+Future optimization starts from this accepted compact version;keep the mixed
+transport/latency/RSS limits explicit instead of claiming the micro factor
+for the entire transport.
