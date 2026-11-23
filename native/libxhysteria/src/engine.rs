@@ -891,6 +891,52 @@ impl Bus {
         }
     }
 
+    // Only already-published data/credit frames enter this bounded group.
+    // No sender clone survives the table lock, so removing a flow still closes
+    // its command receiver and credit semaphore immediately.
+    fn route_batch(&self, frames: &mut [Option<Frame>]) {
+        if frames.len() == 1 {
+            self.route(frames[0].take().unwrap());
+            return;
+        }
+        let mut flows = self.flows.lock().unwrap();
+        let mut index = 0;
+        while index < frames.len() {
+            let id = frames[index].as_ref().unwrap().id;
+            let end = index
+                + frames[index..]
+                    .iter()
+                    .take_while(|frame| frame.as_ref().unwrap().id == id)
+                    .count();
+            if let Entry::Occupied(entry) = flows.entry(id) {
+                let flow = entry.get();
+                let mut remove = false;
+                while index < end {
+                    let frame = frames[index].take().unwrap();
+                    index += 1;
+                    if frame.kind == CREDIT {
+                        let count = frame.data.first().copied().unwrap_or(1) as usize;
+                        let available = flow.receive_credit.available_permits();
+                        if count != 0 && count <= self.flow_window && available < self.flow_window {
+                            flow.receive_credit
+                                .add_permits(count.min(self.flow_window - available));
+                        }
+                    } else if frame.kind == CLOSE || flow.sender.try_send(frame).is_err() {
+                        remove = true;
+                        break;
+                    }
+                }
+                if remove {
+                    entry.remove();
+                }
+            }
+            for frame in &mut frames[index..end] {
+                *frame = None;
+            }
+            index = end;
+        }
+    }
+
     fn try_command(&self, incoming: &mpsc::Sender<Frame>, frame: Frame) -> Result<Option<Frame>> {
         match frame.kind {
             OPEN_TCP | OPEN_UDP | CLOSE | AUTH_RESPONSE | UPDATE_TLS => {
@@ -2207,12 +2253,36 @@ fn bridge_tasks(
                     let mut drained = 0;
                     let mut bytes = 0;
                     while drained < 32 && bytes < 256 * 1024 {
-                        let Some((kind, id, data)) = bridge.pop_deferred(true)? else {
-                            break;
+                        // Gather no more than the ring's capacity without
+                        // waiting; stop before a control frame to preserve
+                        // its exact position relative to DATA, CREDIT and FIN.
+                        let mut routed = std::array::from_fn::<_, 8, _>(|_| None);
+                        let mut count = 0;
+                        let mut control = None;
+                        while count < routed.len() && drained < 32 && bytes < 256 * 1024 {
+                            let Some((kind, id, data)) = bridge.pop_deferred(true)? else {
+                                break;
+                            };
+                            drained += 1;
+                            bytes += data.len();
+                            let frame = Frame { kind, id, data };
+                            if matches!(kind, OPEN_TCP | OPEN_UDP | CLOSE | AUTH_RESPONSE | UPDATE_TLS) {
+                                control = Some(frame);
+                                break;
+                            }
+                            routed[count] = Some(frame);
+                            count += 1;
+                        }
+                        if count != 0 {
+                            bus.route_batch(&mut routed[..count]);
+                        }
+                        let Some(control) = control else {
+                            if count == 0 {
+                                break;
+                            }
+                            continue;
                         };
-                        drained += 1;
-                        bytes += data.len();
-                        let frame = match bus.try_command(&incoming, Frame { kind, id, data }) {
+                        let frame = match bus.try_command(&incoming, control) {
                             Ok(Some(frame)) => frame,
                             Ok(None) => continue,
                             Err(_) => return Ok(()),
@@ -3050,6 +3120,111 @@ mod tests {
         }
         assert!(commands.recv().await.is_none());
         assert!(bus.register(1, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn grouped_routes_match_individual_routes_with_credit_close_and_overflow() {
+        let actual = capacity_bus();
+        let reference = capacity_bus();
+        let (mut actual_rx, mut actual_credit) = actual.register(1, 0).await.unwrap();
+        let (mut reference_rx, mut reference_credit) = reference.register(1, 0).await.unwrap();
+        for round in 0..128 {
+            let mut frames = std::array::from_fn::<_, 8, _>(|index| {
+                let kind = match (round + index) % 7 {
+                    0 => CREDIT,
+                    1 => FIN,
+                    2 => CLOSE,
+                    _ => DATA,
+                };
+                Some(Frame::new(
+                    kind,
+                    if (round + index) % 11 == 0 { 99 } else { 1 },
+                    Bytes::from_static(&[1]),
+                ))
+            });
+            if let Ok(permit) = actual_credit.try_acquire() {
+                permit.forget();
+            }
+            if let Ok(permit) = reference_credit.try_acquire() {
+                permit.forget();
+            }
+            for frame in frames.iter().flatten() {
+                reference.route(Frame::new(
+                    frame.kind,
+                    frame.id,
+                    Bytes::copy_from_slice(&frame.data),
+                ));
+            }
+            actual.route_batch(&mut frames);
+            assert!(frames.iter().all(Option::is_none));
+            assert_eq!(actual_credit.is_closed(), reference_credit.is_closed());
+            assert_eq!(
+                actual_credit.available_permits(),
+                reference_credit.available_permits()
+            );
+            loop {
+                let a = actual_rx.try_recv();
+                let b = reference_rx.try_recv();
+                match (a, b) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(
+                            (a.kind, a.id, a.data.as_ref()),
+                            (b.kind, b.id, b.data.as_ref())
+                        );
+                    }
+                    (Err(a), Err(b)) => {
+                        assert_eq!(a, b);
+                        break;
+                    }
+                    _ => panic!("grouped delivery changed the command sequence"),
+                }
+            }
+            if actual_credit.is_closed() {
+                // A reused ID must receive a fresh sender; the old receiver
+                // must close even though a later batch can use the same ID.
+                assert!(actual_rx.recv().await.is_none());
+                assert!(reference_rx.recv().await.is_none());
+                let (rx, credit) = actual.register(1, 0).await.unwrap();
+                actual_rx = rx;
+                let (rx, other_credit) = reference.register(1, 0).await.unwrap();
+                reference_rx = rx;
+                assert!(!credit.is_closed() && !other_credit.is_closed());
+                actual_credit = credit;
+                reference_credit = other_credit;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "manual grouped command-routing CPU benchmark"]
+    async fn benchmark_grouped_command_routes() {
+        let reference = std::env::var_os("XHYS_ROUTE_REFERENCE").is_some();
+        for count in [1, 2, 4, 8] {
+            let mut bus = capacity_bus();
+            bus.flow_window = 16;
+            let (mut receiver, _credit) = bus.register(1, 0).await.unwrap();
+            let started = Instant::now();
+            for _ in 0..262144 {
+                let mut frames = std::array::from_fn::<_, 8, _>(|_| None);
+                for frame in &mut frames[..count] {
+                    *frame = Some(Frame::new(DATA, 1, Bytes::from_static(b"ready")));
+                }
+                if reference {
+                    for frame in &mut frames[..count] {
+                        bus.route(frame.take().unwrap());
+                    }
+                } else {
+                    bus.route_batch(&mut frames[..count]);
+                }
+                for _ in 0..count {
+                    std::hint::black_box(receiver.try_recv().unwrap());
+                }
+            }
+            println!(
+                "reference={reference} group={count} ns_per_frame={:.3}",
+                started.elapsed().as_nanos() as f64 / (262144 * count) as f64,
+            );
+        }
     }
 
     #[tokio::test]

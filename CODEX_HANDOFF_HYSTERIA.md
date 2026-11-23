@@ -1486,3 +1486,85 @@ upstream push,remote VPS or existing auxiliary/neighbor worktree changes.
 Future optimization starts from this accepted compact version;keep the mixed
 transport/latency/RSS limits explicit instead of claiming the micro factor
 for the entire transport.
+
+## Bridge queue, notification and flow lookup fast paths (2026-11-24)
+
+User explicitly requested audit items1/2/4. Baseline is accepted compact-owner
+HEADab53428e7628b61c1e89b493378c728bdf18adcc,not an earlier pre-fusion binary.
+Implementations in transport/internet/xhysteria/engine.go and native
+engine.rs: lazy queued-send timer,remove premature reservation notify,
+single-reader Go last-Conn cache with closed-channel validation,and Rust
+max8already-published noncontrol routes per table lock/per consecutive ID
+lookup. No batching delay;control ordering,32descriptor/256KiB turn limits,
+existing queue/window/budget sizes,worker defaults,Tokio7/7,crypto andSeqCst
+handshakes remain. User's unrequested audit item3,Conn.waitWrite,is unchanged.
+
+Go tests cover0allocation available queued sends with future deadline,
+expired/full/closed cleanup,notification only after publication,and cached
+route deletion/IDreuse/engine stop. Rust differential regression compares
+group routing with individual routing across DATA/CREDIT/FIN/CLOSE,overflow,
+missing IDs,closed receivers and registration reuse. No sender survives the
+table lock;removal still closes its receiver/credit state.
+
+All acceptance completed sequentially,with no task builds/tests overlapping
+timed matrices:134release/134debug Rust tests,release engine Clippy-Dwarnings,
+fresh five-package native Go race tests;1/2core masks/concurrency/HTTP file/
+proxy/lifecycle/short-flow credits/capacity recovery/100msRTT;masked third-party
+shared/socket192concurrent/1200churn/finite-window;strict direct/cascadeUDP
+256/4096B,8000/8000per budget,zero sampled drops/duplicates;saturated managed
+UDP6000/6000per budget,zero ingress/publicUDPdrops;retained/saturated-drain;
+3paired1000session capacity;Androidarm64API26NDK30.0.14904198build. No skips.
+
+Five-pair1/2core A/B80samples+three-pair4/8controls48+managed1/2core24;
+seven paired Rust micros56observations;Go current-candidate micros28.
+Go table/last-flow lookup16.770→9.033ns,zero allocations. Rust2/4/8ready-frame
+group reductions11.14/19.16/22.44%. Group1 calls original route;its9.45%
+difference is dispatch/codegen/timing,not lock-amortization proof. No old
+queued-send timer-policy micro timing was collected;allocation test proves
+the candidate's available-queue zero-allocation behavior.
+
+Initial1coreupload183.72→143.84MB/s and8coreduplex726.46→669.98 raised
+concerns. Five extra pairs each of1upload/4download/8duplex/8paced,40samples,
+retain all first measurements. Then6repeats of4variants(before,Go-only,
+Rust-only,full)×1upload/8duplex,48diagnostic samples,rotate/reverse order.
+Diagnostic builds complete first;both production source files restored
+byte-for-byte,source hashes and Linux archive match exact accepted candidate.
+No diagnostic env flag added to production.
+
+All240transport samples retained,including nonzero drops. All14same-binary
+8coreduplex pairs:728.62→727.75MB/s,CPU1042.887→1042.556µs/op,
+p9921290→19956µs. Initial large8core regression does not persist across all
+observations.8corepaced8pairs p992688.5→2721µs remains slightly worse.
+1core upload bimodality remains unresolved: all16same-binary pairs median
+183.03→163.99MB/s,mean165.34→163.57;below160MB/s7/16baseline vs8/16candidate.
+Extra5pairs medians183.17→183.80,diagnostic6pairs141.70→184.51;both isolated
+components reproduce both modes. No intrinsic21.7%slowdown established,and
+no general one-core upload improvement claimed. Do not discard original
+regressions or present later samples alone as proof of universal improvement.
+
+Combined1/2corepacedp994585→4441 /2286→2146µs. Managed1core250.12→250.84MB/s,
+bulk p9936787→38064µs worsens. Managed2core451.10→457.93MB/s,
+total serverCPU521.012→513.409µs/op,p9919457→18119µs.1000session peak-before-
+closeRSS222.2→221.9MiB,no material intrinsic memory reduction established.
+One candidate2coreupload,one baseline4coredownload recheck,and all3eightcore
+upload samples per revision have kernel drops;keep them in summaries and
+separate from strict UDP acceptance. No WAN/device/new15minute soak/full-
+repository-green/deployment claim.
+
+Accepted for requested operation/allocation reduction and measured micro
+CPU wins,with mixed transport/latency/RSS limits explicit.
+Report docs/hysteria-bridge-fastpaths-performance.md;all240transport/6capacity/
+56Rustmicro/28Gomicro records,validation,source/binary hashes and exact scripts:
+docs/hysteria-bridge-fastpaths-20261124/results.json.
+Ignored raw artifacts build_assets/bridge-fastpaths-20261124/;source snapshots,
+candidate.patch,run.sh,validate.sh,recheck.py,isolate.py,export.py and progress
+logs there. export.py accepted verifies exact sources,archive and all passing
+acceptance logs before exporting;do not rerun after unrelated runtime edits.
+
+Linux native archive SHA
+c56253fba054ce92917a28a6719b02746e16150a9dfb91ae8ecd14026740869a.
+Android native archive SHA
+563ada08090c4d2a9d56dd6db64b4dda7fcbd91affd83201ccab0903fba2aa63.
+Standing authorization:explicit-path ordinary commit,cherry-pick-x on fresh
+disposable worktrees,atomic push all4origin branches,verify remote heads.
+No force/upstream push,VPS action,existing auxiliary/neighbor worktree edits.
