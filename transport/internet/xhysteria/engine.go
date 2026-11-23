@@ -400,13 +400,30 @@ func (e *Engine) send(f frame, until time.Time) error {
 			e.queued.Add(-1)
 		}
 	}()
+	// A frame that fits in the writer queue does not need a deadline timer.
+	// Keep the deadline/close checks before attempting immediate publication.
+	if !until.IsZero() && !time.Now().Before(until) {
+		return os.ErrDeadlineExceeded
+	}
+	select {
+	case <-e.done:
+		return net.ErrClosed
+	default:
+	}
+	select {
+	case e.out <- f:
+		queued = false
+		return nil
+	default:
+	}
 	var timeout <-chan time.Time
 	var timer *time.Timer
 	if !until.IsZero() {
-		if !time.Now().Before(until) {
+		remaining := time.Until(until)
+		if remaining <= 0 {
 			return os.ErrDeadlineExceeded
 		}
-		timer = time.NewTimer(time.Until(until))
+		timer = time.NewTimer(remaining)
 		defer timer.Stop()
 		timeout = timer.C
 	}
@@ -458,12 +475,8 @@ func (e *Engine) prepareFrame(f *frame) (bool, error) {
 		}
 		f.borrowed = false
 	}
-	if bridge, ok := e.bridge.(*sharedBridge); ok {
-		if err := bridge.notifyRust(); err != nil {
-			e.queued.Add(-1)
-			return false, err
-		}
-	}
+	// The writer notifies after publication, or before waiting on a full ring.
+	// Reserving a Go queue entry has not made new work visible to Rust.
 	return false, nil
 }
 
@@ -687,9 +700,32 @@ func (e *Engine) writeLoop() {
 	}
 }
 
+// Owned by the single bridge reader. A closed Conn cannot remain a cache hit;
+// the table still handles misses and all control/lifecycle changes under mu.
+type flowReadCache struct {
+	last *Conn
+}
+
+func (cache *flowReadCache) lookup(e *Engine, id uint64) *Conn {
+	if c := cache.last; c != nil && c.id == id {
+		select {
+		case <-c.closed:
+			cache.last = nil
+		default:
+			return c
+		}
+	}
+	e.mu.Lock()
+	c := e.flows[id]
+	e.mu.Unlock()
+	cache.last = c
+	return c
+}
+
 func (e *Engine) readLoop() {
 	defer e.wg.Done()
 	defer e.stop()
+	var routes flowReadCache
 	for {
 		f, err := e.bridge.read()
 		if err != nil {
@@ -737,76 +773,82 @@ func (e *Engine) readLoop() {
 			}
 			continue
 		}
-		e.mu.Lock()
-		if f.kind == authClosed {
-			delete(e.authUsers, f.id)
-			e.mu.Unlock()
-			f.release()
-			continue
-		}
-		if f.kind == controlResult {
-			waiter := e.controls[f.id]
-			if waiter != nil {
-				waiter <- f
-			} else {
-				f.release()
-			}
-			e.mu.Unlock()
-			continue
-		}
-		c := e.flows[f.id]
-		if f.kind == incomingTCP || f.kind == incomingUDP {
-			if e.accept == nil || c != nil || len(e.flows) >= e.maxFlows {
-				f.release()
+		var c *Conn
+		if f.kind != authClosed && f.kind != controlResult &&
+			f.kind != incomingTCP && f.kind != incomingUDP {
+			c = routes.lookup(e, f.id)
+		} else {
+			e.mu.Lock()
+			if f.kind == authClosed {
+				delete(e.authUsers, f.id)
 				e.mu.Unlock()
-				e.send(frame{kind: closeFrame, id: f.id}, time.Now().Add(time.Second))
+				f.release()
 				continue
 			}
-			if len(f.data) < 14 {
-				f.release()
+			if f.kind == controlResult {
+				waiter := e.controls[f.id]
+				if waiter != nil {
+					waiter <- f
+				} else {
+					f.release()
+				}
 				e.mu.Unlock()
-				return
+				continue
 			}
-			user := binary.BigEndian.Uint32(f.data)
-			owner := binary.BigEndian.Uint64(f.data[4:])
-			identity, known := e.authUsers[owner]
-			if e.authenticate != nil && !known {
-				f.release()
+			c = e.flows[f.id]
+			if f.kind == incomingTCP || f.kind == incomingUDP {
+				if e.accept == nil || c != nil || len(e.flows) >= e.maxFlows {
+					f.release()
+					e.mu.Unlock()
+					e.send(frame{kind: closeFrame, id: f.id}, time.Now().Add(time.Second))
+					continue
+				}
+				if len(f.data) < 14 {
+					f.release()
+					e.mu.Unlock()
+					return
+				}
+				user := binary.BigEndian.Uint32(f.data)
+				owner := binary.BigEndian.Uint64(f.data[4:])
+				identity, known := e.authUsers[owner]
+				if e.authenticate != nil && !known {
+					f.release()
+					e.mu.Unlock()
+					return
+				}
+				peer, target, err := decodeAddress(f.data[12:])
+				if err != nil {
+					f.release()
+					e.mu.Unlock()
+					return
+				}
+				network := "tcp:"
+				if f.kind == incomingUDP {
+					network = "udp:"
+				}
+				dest, err := xnet.ParseDestination(network + string(target))
+				if err != nil {
+					f.release()
+					e.mu.Unlock()
+					return
+				}
+				remote, err := net.ResolveUDPAddr("udp", string(peer))
+				if err != nil {
+					f.release()
+					e.mu.Unlock()
+					return
+				}
+				c = newConn(e, f.id, dest, remote)
+				c.UserIndex = user
+				c.User = identity.user
+				e.flows[f.id] = c
 				e.mu.Unlock()
-				return
-			}
-			peer, target, err := decodeAddress(f.data[12:])
-			if err != nil {
+				go e.accept(c)
 				f.release()
-				e.mu.Unlock()
-				return
+				continue
 			}
-			network := "tcp:"
-			if f.kind == incomingUDP {
-				network = "udp:"
-			}
-			dest, err := xnet.ParseDestination(network + string(target))
-			if err != nil {
-				f.release()
-				e.mu.Unlock()
-				return
-			}
-			remote, err := net.ResolveUDPAddr("udp", string(peer))
-			if err != nil {
-				f.release()
-				e.mu.Unlock()
-				return
-			}
-			c = newConn(e, f.id, dest, remote)
-			c.UserIndex = user
-			c.User = identity.user
-			e.flows[f.id] = c
 			e.mu.Unlock()
-			go e.accept(c)
-			f.release()
-			continue
 		}
-		e.mu.Unlock()
 		if c == nil {
 			f.release()
 			continue

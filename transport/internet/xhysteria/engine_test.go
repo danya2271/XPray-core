@@ -333,6 +333,114 @@ func TestAvailableWriteCreditDoesNotAllocateDeadlineTimer(t *testing.T) {
 	}
 }
 
+func TestQueuedEngineSendAllocatesTimerOnlyWhenBlocked(t *testing.T) {
+	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+	message := frame{kind: creditFrame, id: 1, data: creditCounts[1:2]}
+	until := time.Now().Add(time.Minute)
+	if n := testing.AllocsPerRun(100, func() {
+		if err := e.send(message, until); err != nil {
+			t.Fatal(err)
+		}
+		<-e.out
+		e.queued.Add(-1)
+	}); n != 0 {
+		t.Fatalf("available queue allocated %.1f times", n)
+	}
+	if err := e.send(message, time.Now().Add(-time.Second)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired send: %v", err)
+	}
+	if len(e.out) != 0 || e.queued.Load() != 0 {
+		t.Fatal("expired send changed queue reservations")
+	}
+	e.out <- message
+	if err := e.send(message, time.Now().Add(5*time.Millisecond)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("full queue deadline: %v", err)
+	}
+	if len(e.out) != 1 || e.queued.Load() != 0 {
+		t.Fatal("timed-out send leaked a reservation or changed the queued frame")
+	}
+	close(e.done)
+	if err := e.send(message, until); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed send: %v", err)
+	}
+}
+
+func TestFlowReadCacheDropsClosedConnectionBeforeIDReuse(t *testing.T) {
+	e := &Engine{done: make(chan struct{}), flows: make(map[uint64]*Conn)}
+	old := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	e.flows[7] = old
+	var cache flowReadCache
+	if cache.lookup(e, 7) != old || cache.lookup(e, 7) != old {
+		t.Fatal("live flow was not routed")
+	}
+	old.fail(net.ErrClosed)
+	delete(e.flows, 7)
+	if cache.lookup(e, 7) != nil {
+		t.Fatal("closed route survived deletion")
+	}
+	current := newConn(e, 7, old.target, nil)
+	e.flows[7] = current
+	if cache.lookup(e, 7) != current {
+		t.Fatal("reused ID routed to the previous connection")
+	}
+	e.stop()
+	if cache.lookup(e, 7) != nil {
+		t.Fatal("engine shutdown retained a live route")
+	}
+}
+
+func BenchmarkEngineQueuedSend(b *testing.B) {
+	for _, deadline := range []bool{false, true} {
+		name := "no_deadline"
+		until := time.Time{}
+		if deadline {
+			name = "future_deadline"
+			until = time.Now().Add(time.Hour)
+		}
+		b.Run(name, func(b *testing.B) {
+			e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+			message := frame{kind: creditFrame, id: 1, data: creditCounts[1:2]}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := e.send(message, until); err != nil {
+					b.Fatal(err)
+				}
+				<-e.out
+				e.queued.Add(-1)
+			}
+		})
+	}
+}
+
+func BenchmarkFlowReadLookup(b *testing.B) {
+	for _, cached := range []bool{false, true} {
+		name := "table"
+		if cached {
+			name = "last_flow"
+		}
+		b.Run(name, func(b *testing.B) {
+			e := &Engine{flows: make(map[uint64]*Conn)}
+			c := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)
+			e.flows[7] = c
+			var cache flowReadCache
+			b.ReportAllocs()
+			for b.Loop() {
+				var found *Conn
+				if cached {
+					found = cache.lookup(e, 7)
+				} else {
+					e.mu.Lock()
+					found = e.flows[7]
+					e.mu.Unlock()
+				}
+				if found != c {
+					b.Fatal("route changed")
+				}
+			}
+		})
+	}
+}
+
 func TestDirectSharedWriteDoesNotAllocateDeadlineTimer(t *testing.T) {
 	bridge := testSharedBridge(t)
 	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1), bridge: bridge}
