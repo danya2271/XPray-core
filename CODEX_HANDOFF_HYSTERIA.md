@@ -1087,3 +1087,62 @@ ignored build_assets/recv-cache-fast-20261123/. Initial prototype and expected
 failing baseline:recv-cache-20261123/. Preserve failed fixture Clippy logs.
 Commit/push all task paths to four origin branches, no force/upstream push.
 No production restart/deployment or neighboring-worktree edits.
+
+## CPU Optimization Round: Direct Salamander Hash (2026-11-23)
+
+Baseline9c39305b. Accepted change is only Salamander key hashing:
+PSK lengths4–120bytes keep a128byte input prefix and use existing SIMD
+one-shot unkeyed BLAKE2b-256(PSK||8byte salt), with shared immutable Params.
+Longer PSKs retain the old prehashed State algorithm behind a Box.
+Inline mask size224→136bytes on amd64; long PSKs additionally allocate224byte
+State. No allocation per packet. Salt/XOR/layer order/GSO/GRO/wire/ABI,
+budgets, flow control, stream compatibility and SeqCst wakes stay unchanged.
+
+Seven same-engine-binary hash+XOR samples: short-key savings about1–8%;
+long-key timings mixed near unchanged. Independent vectors/boundary tests
+cover120/121byte transition,128varying salts and cloned templates.
+Additional standalone exact-production-method fixture for actual25byte PSK,
+with both references blackboxed, saves9.2%/3.0%/5.5% at64/1200/1452bytes;
+source/logs:fixture-packet.* in the final artifact directory.
+
+First five-run end-to-end matrix has large bulk variability and mixed
+results; keep it intact, not as the sole speed claim. Additional five
+alternating512MiB controls after all task builds/functional tests finish:
+upload379.85→384.65MB/s, CPU429.710→425.457µs/64KiB,
+download343.24→349.76MB/s, CPU505.851→493.325µs/64KiB.
+Whole-process user instructions9.35438→9.29993billion upload and
+9.91626→9.85737billion download; hardware counters100% active.
+BulkpeakRSS90.20→88.29MiB /55.62→54.38; no universal RSS factor.
+
+Five one-server-CPU controls:243.90→244.16MB/s and
+497.842→497.337µs total CPU/duplex exchange, p9932.711→33.913ms.
+Four-server-CPU original three medians751.09→755.51MB/s,
+608.46→606.12µs and p9913.376→11.925ms. All34managed server samples pass
+strict relay/public drop gates. Ordinary32MiB/s paced latency is mixed:
+TCPidle p99174.4→172.5µs, UDP163.2→165.6, paced409.7→413.0 at
+31.70→31.49MiB/s attained background. No general minimum-latency claim.
+
+All6capacity1000-session samples pass512MiB guard: median idleRSS137.2→135.6,
+peak221.2→221.0MiB, duplex149.75→152.45MiB/s, heartbeatp992844.6→2759.7µs.
+130engine/20core,324release/325debug Quinn-proto tests and selected-library
+Clippy pass; ignored benchmark counts1/1/4/4. Fresh Go race native adapter,
+hysteria,handoff,supervisor,proxy pass. Both-bridge masked quic-go192live/
+1200recycles, finite window, cap recovery, masks, shortflows, concurrent
+transfers,100msRTT pass. Strict UDP8000/8000; kernel drops/duplicates0.
+Linuxamd64 and Androidarm64/API26 build; no new15minute soak/device runtime.
+Known unrelated repository-wide Go/all-target Clippy limitations persist.
+
+SendBuffer cursor is NOT adopted: micro wins27–97% sequential lookup, but
+repeat one-core managed bulk240.29→227.00MB/s. Its production source was
+restored exactly. Copy+XOR fusion and four-packet BLAKE2b batching also
+regress common QUIC packet sizes and were completely reverted.
+Preserve all source/logs in ignored send-lookup,send-cursor-final,
+mask-fused,salamander-batch directories dated20261123.
+
+Accepted final artifacts:build_assets/salamander-direct-20261123/.
+Candidate Xray0e567bcb6557ab9b2f314fec2343e0f8c263638242a7033c940a4a6b2e48fdeb,
+interop263af5d82a9f4b49477e6a36a3b2d917c2188b2ea3bc5250324125d715a37ae2.
+Reports:docs/hysteria-salamander-direct-performance.md and
+docs/hysteria-send-cursor-experiment.md. Commit/push all task paths normally
+to four origin branches; no force/upstream push, remote deployment/restart
+or neighboring-worktree edits.
