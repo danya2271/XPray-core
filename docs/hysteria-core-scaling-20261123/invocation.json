@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "native/libxhysteria/bench-scaling.py",
+    "--binary",
+    "build_assets/core-scaling-20261123/interop-drained.test",
+    "--output",
+    "build_assets/core-scaling-20261123/qualification-v4",
+    "--cores",
+    "1,2,4,6,8,10,12,14,16",
+    "--cpus",
+    "4,5,6,7,8,9,10,11,12,13,14,15,0,1,2,3",
+    "--search-repeats",
+    "2",
+    "--final-repeats",
+    "3",
+    "--finalists",
+    "build_assets/core-scaling-20261123/finalists-drained.json",
+    "--skip-screen"
+  ],
+  "skip_stream_screen": true,
+  "driver_sha256": "9279590c48983fbc6dd9d1e8ff1fb89c6dee399982fd112214fbd9d0bdaaa1f7"
+}

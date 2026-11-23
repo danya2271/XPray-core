@@ -1,0 +1,598 @@
+[
+  {
+    "cores": 1,
+    "kind": "compatibility",
+    "config": {
+      "cores": 1,
+      "client_workers": 1,
+      "server_workers": 1,
+      "pool": 2,
+      "affinity": [
+        4
+      ],
+      "upload_MBps": 174.47,
+      "download_MBps": 188.79,
+      "duplex_MBps": 179.27,
+      "upload_cpu_us": 355.88,
+      "download_cpu_us": 332.402,
+      "paced_p99_us": 4136.0,
+      "background_MiBps": 64.22,
+      "peak_RSS_MiB": 156.8203125,
+      "default_upload_MBps": 174.47,
+      "default_download_MBps": 188.79,
+      "default_paced_p99_us": 4136.0,
+      "default_failed_samples": 0,
+      "default_valid_samples": {
+        "duplex": 3,
+        "upload": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        1,
+        1,
+        1
+      ],
+      "fastest_measured_upload_MBps": 181.06,
+      "fastest_measured_download_MBps": 186.69,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores1-compatibility.log"
+  },
+  {
+    "cores": 1,
+    "kind": "strict-udp",
+    "config": {
+      "cores": 1,
+      "client_workers": 1,
+      "server_workers": 1,
+      "pool": 2,
+      "affinity": [
+        4
+      ],
+      "upload_MBps": 174.47,
+      "download_MBps": 188.79,
+      "duplex_MBps": 179.27,
+      "upload_cpu_us": 355.88,
+      "download_cpu_us": 332.402,
+      "paced_p99_us": 4136.0,
+      "background_MiBps": 64.22,
+      "peak_RSS_MiB": 156.8203125,
+      "default_upload_MBps": 174.47,
+      "default_download_MBps": 188.79,
+      "default_paced_p99_us": 4136.0,
+      "default_failed_samples": 0,
+      "default_valid_samples": {
+        "duplex": 3,
+        "upload": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        1,
+        1,
+        1
+      ],
+      "fastest_measured_upload_MBps": 181.06,
+      "fastest_measured_download_MBps": 186.69,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores1-strict-udp.log"
+  },
+  {
+    "cores": 1,
+    "kind": "third-party-shared",
+    "config": {
+      "cores": 1,
+      "client_workers": 1,
+      "server_workers": 1,
+      "pool": 2,
+      "affinity": [
+        4
+      ],
+      "upload_MBps": 174.47,
+      "download_MBps": 188.79,
+      "duplex_MBps": 179.27,
+      "upload_cpu_us": 355.88,
+      "download_cpu_us": 332.402,
+      "paced_p99_us": 4136.0,
+      "background_MiBps": 64.22,
+      "peak_RSS_MiB": 156.8203125,
+      "default_upload_MBps": 174.47,
+      "default_download_MBps": 188.79,
+      "default_paced_p99_us": 4136.0,
+      "default_failed_samples": 0,
+      "default_valid_samples": {
+        "duplex": 3,
+        "upload": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        1,
+        1,
+        1
+      ],
+      "fastest_measured_upload_MBps": 181.06,
+      "fastest_measured_download_MBps": 186.69,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores1-streams-shared.log"
+  },
+  {
+    "cores": 1,
+    "kind": "third-party-socket",
+    "config": {
+      "cores": 1,
+      "client_workers": 1,
+      "server_workers": 1,
+      "pool": 2,
+      "affinity": [
+        4
+      ],
+      "upload_MBps": 174.47,
+      "download_MBps": 188.79,
+      "duplex_MBps": 179.27,
+      "upload_cpu_us": 355.88,
+      "download_cpu_us": 332.402,
+      "paced_p99_us": 4136.0,
+      "background_MiBps": 64.22,
+      "peak_RSS_MiB": 156.8203125,
+      "default_upload_MBps": 174.47,
+      "default_download_MBps": 188.79,
+      "default_paced_p99_us": 4136.0,
+      "default_failed_samples": 0,
+      "default_valid_samples": {
+        "duplex": 3,
+        "upload": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        1,
+        1,
+        1
+      ],
+      "fastest_measured_upload_MBps": 181.06,
+      "fastest_measured_download_MBps": 186.69,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores1-streams-socket.log"
+  },
+  {
+    "cores": 4,
+    "kind": "compatibility",
+    "config": {
+      "cores": 4,
+      "client_workers": 2,
+      "server_workers": 2,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "upload_MBps": 439.67,
+      "download_MBps": 450.46,
+      "duplex_MBps": 464.39,
+      "upload_cpu_us": 445.0,
+      "download_cpu_us": 444.277,
+      "paced_p99_us": 1223.0,
+      "background_MiBps": 64.08,
+      "peak_RSS_MiB": 180.9765625,
+      "default_upload_MBps": 444.39,
+      "default_download_MBps": 482.76,
+      "default_paced_p99_us": 1072.0,
+      "default_failed_samples": 1,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3,
+        "upload": 2
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        4,
+        4,
+        2
+      ],
+      "fastest_measured_upload_MBps": 444.39,
+      "fastest_measured_download_MBps": 482.76,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": false,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores4-compatibility.log"
+  },
+  {
+    "cores": 4,
+    "kind": "strict-udp",
+    "config": {
+      "cores": 4,
+      "client_workers": 2,
+      "server_workers": 2,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "upload_MBps": 439.67,
+      "download_MBps": 450.46,
+      "duplex_MBps": 464.39,
+      "upload_cpu_us": 445.0,
+      "download_cpu_us": 444.277,
+      "paced_p99_us": 1223.0,
+      "background_MiBps": 64.08,
+      "peak_RSS_MiB": 180.9765625,
+      "default_upload_MBps": 444.39,
+      "default_download_MBps": 482.76,
+      "default_paced_p99_us": 1072.0,
+      "default_failed_samples": 1,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3,
+        "upload": 2
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        4,
+        4,
+        2
+      ],
+      "fastest_measured_upload_MBps": 444.39,
+      "fastest_measured_download_MBps": 482.76,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": false,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores4-strict-udp.log"
+  },
+  {
+    "cores": 4,
+    "kind": "third-party-shared",
+    "config": {
+      "cores": 4,
+      "client_workers": 2,
+      "server_workers": 2,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "upload_MBps": 439.67,
+      "download_MBps": 450.46,
+      "duplex_MBps": 464.39,
+      "upload_cpu_us": 445.0,
+      "download_cpu_us": 444.277,
+      "paced_p99_us": 1223.0,
+      "background_MiBps": 64.08,
+      "peak_RSS_MiB": 180.9765625,
+      "default_upload_MBps": 444.39,
+      "default_download_MBps": 482.76,
+      "default_paced_p99_us": 1072.0,
+      "default_failed_samples": 1,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3,
+        "upload": 2
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        4,
+        4,
+        2
+      ],
+      "fastest_measured_upload_MBps": 444.39,
+      "fastest_measured_download_MBps": 482.76,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": false,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores4-streams-shared.log"
+  },
+  {
+    "cores": 4,
+    "kind": "third-party-socket",
+    "config": {
+      "cores": 4,
+      "client_workers": 2,
+      "server_workers": 2,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "upload_MBps": 439.67,
+      "download_MBps": 450.46,
+      "duplex_MBps": 464.39,
+      "upload_cpu_us": 445.0,
+      "download_cpu_us": 444.277,
+      "paced_p99_us": 1223.0,
+      "background_MiBps": 64.08,
+      "peak_RSS_MiB": 180.9765625,
+      "default_upload_MBps": 444.39,
+      "default_download_MBps": 482.76,
+      "default_paced_p99_us": 1072.0,
+      "default_failed_samples": 1,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3,
+        "upload": 2
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        4,
+        4,
+        2
+      ],
+      "fastest_measured_upload_MBps": 444.39,
+      "fastest_measured_download_MBps": 482.76,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": false,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores4-streams-socket.log"
+  },
+  {
+    "cores": 16,
+    "kind": "compatibility",
+    "config": {
+      "cores": 16,
+      "client_workers": 2,
+      "server_workers": 4,
+      "pool": 4,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        0,
+        1,
+        2,
+        3
+      ],
+      "upload_MBps": 691.93,
+      "download_MBps": 825.09,
+      "duplex_MBps": 813.98,
+      "upload_cpu_us": 896.972,
+      "download_cpu_us": 505.528,
+      "paced_p99_us": 556.9,
+      "background_MiBps": 63.95,
+      "peak_RSS_MiB": 153.64453125,
+      "default_upload_MBps": 721.94,
+      "default_download_MBps": 810.01,
+      "default_paced_p99_us": 517.2,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 847.49,
+      "fastest_measured_download_MBps": 811.61,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores16-compatibility.log"
+  },
+  {
+    "cores": 16,
+    "kind": "strict-udp",
+    "config": {
+      "cores": 16,
+      "client_workers": 2,
+      "server_workers": 4,
+      "pool": 4,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        0,
+        1,
+        2,
+        3
+      ],
+      "upload_MBps": 691.93,
+      "download_MBps": 825.09,
+      "duplex_MBps": 813.98,
+      "upload_cpu_us": 896.972,
+      "download_cpu_us": 505.528,
+      "paced_p99_us": 556.9,
+      "background_MiBps": 63.95,
+      "peak_RSS_MiB": 153.64453125,
+      "default_upload_MBps": 721.94,
+      "default_download_MBps": 810.01,
+      "default_paced_p99_us": 517.2,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 847.49,
+      "fastest_measured_download_MBps": 811.61,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores16-strict-udp.log"
+  },
+  {
+    "cores": 16,
+    "kind": "third-party-shared",
+    "config": {
+      "cores": 16,
+      "client_workers": 2,
+      "server_workers": 4,
+      "pool": 4,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        0,
+        1,
+        2,
+        3
+      ],
+      "upload_MBps": 691.93,
+      "download_MBps": 825.09,
+      "duplex_MBps": 813.98,
+      "upload_cpu_us": 896.972,
+      "download_cpu_us": 505.528,
+      "paced_p99_us": 556.9,
+      "background_MiBps": 63.95,
+      "peak_RSS_MiB": 153.64453125,
+      "default_upload_MBps": 721.94,
+      "default_download_MBps": 810.01,
+      "default_paced_p99_us": 517.2,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 847.49,
+      "fastest_measured_download_MBps": 811.61,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores16-streams-shared.log"
+  },
+  {
+    "cores": 16,
+    "kind": "third-party-socket",
+    "config": {
+      "cores": 16,
+      "client_workers": 2,
+      "server_workers": 4,
+      "pool": 4,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        0,
+        1,
+        2,
+        3
+      ],
+      "upload_MBps": 691.93,
+      "download_MBps": 825.09,
+      "duplex_MBps": 813.98,
+      "upload_cpu_us": 896.972,
+      "download_cpu_us": 505.528,
+      "paced_p99_us": 556.9,
+      "background_MiBps": 63.95,
+      "peak_RSS_MiB": 153.64453125,
+      "default_upload_MBps": 721.94,
+      "default_download_MBps": 810.01,
+      "default_paced_p99_us": 517.2,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 847.49,
+      "fastest_measured_download_MBps": 811.61,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    },
+    "log": "acceptance-cores16-streams-socket.log"
+  }
+]

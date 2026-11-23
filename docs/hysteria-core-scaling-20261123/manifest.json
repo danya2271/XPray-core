@@ -1,0 +1,48 @@
+{
+  "binary": "/home/danya2271/ProxVless/XPray-core/build_assets/core-scaling-20261123/interop-drained.test",
+  "sha256": "83f181dd99fba83916b62552730576b7b0528d75626f604ffea2f4b09c9d58ea",
+  "physical_cpus": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    0,
+    1,
+    2,
+    3
+  ],
+  "methodology": "v4-drained-calibration-persistent-streams-driver-drop-gate",
+  "cores": [
+    1,
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    14,
+    16
+  ],
+  "flows": 32,
+  "model": "combined client/server/target CPU budget",
+  "search_iterations": 8192,
+  "final_iterations": {
+    "duplex": 8192,
+    "upload": 8192,
+    "download": 8192,
+    "small": 65536,
+    "paced": 10000
+  },
+  "search_repeats": 2,
+  "final_repeats": 3,
+  "finalist_source": "/home/danya2271/ProxVless/XPray-core/build_assets/core-scaling-20261123/finalists-drained.json",
+  "finalist_sha256": "28198a09163f75e972546f44f2257f72ed1da95ead16d743124c28be5557dcfb"
+}

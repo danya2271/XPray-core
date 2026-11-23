@@ -1206,3 +1206,53 @@ smokes. Built harness matches baseline263af5d8...; full-build smoke gives
 Task commits publish benchmark script and qualification docs to four origin
 branches. No force/upstream push, production deployment/restart or neighboring
 worktree edit. Keep all candidates, sample sizes and failed observations.
+
+## Completed: Physical CPU-Budget Scaling Matrix (2026-11-23)
+
+User requested profiles for1/2/4/6/8/10/12/14/16physical cores. Runtime is
+unchanged from4fd935d5; no production/default/UDPbuffer changes or deployment.
+HostXeonE5-2698v3,16physical/32SMT,single socket. Physical representatives
+4..15,0..3,one percore. CPU budgets cover COMBINED client/server/TCPtarget,
+not isolated server capacity.32TCPflows,shared bridge,Salamander+WireGuard.
+
+Final drained-calibration matrix:ignored build_assets/core-scaling-20261123/
+qualification-v4,interop-drained.test.516fresh samples,43configs*4workloads*
+3repeats,463zero-drop/53rejected. All metrics, failures and commands retained.
+Initial316duplex searches and intermediate series are DEVELOPMENT/candidate
+evidence; never mix their hashes/timings with final results. Exact-port
+diagnostics confirmed real receive drops, not solely stale counter scope.
+Final fixture waits for prior calibration engines to stop, captures socket
+baseline inside each benchmark invocation, retains counter descriptors and
+holds streaming TCPtargets through the final snapshot. Driver gates drops.
+
+Selected C/S/pool and median upload/downloadMBps:
+1:1/1/2,174.47/188.79;2:2/2/2,289.51/327.15(candidate ONLY,6drops in one
+sample; neither2core finalist fully clean);4:2/2/2,439.67/450.46;
+6:2/6/2,583.73/571.64;8:2/4/4,692.37/765.16;
+10:4/8/2,699.62/623.44;12:2/4/4,668.33/831.11;
+14:4/8/2,686.77/641.13;16:2/4/4,691.93/825.09.
+All selected4..16core streaming samples individually exceed400/370MBps.
+4/10core selected profiles miss relativepacedp99gate(default*1.10),explicit.
+All attained backgrounds pass57.6MiB/s gate. No universal optimum guarantee.
+
+Committed reportdata:docs/hysteria-core-scaling-20261123/ (516observations,
+failed sample metrics,manifest/finalists/invocation,results/CSV,9environment
+profiles,9CPUperfsummary,chart,acceptanceJSON).Report:
+docs/hysteria-core-scaling-performance.md. Raw logs/perf/binaries remain
+ignored. Perf covers whole process setup/TLS/calibration/cleanup,userCPUonly;
+its5-7%elliptic-curve symbol is not a steady-state bulkCPUclaim.
+bench-scaling.sh/.py reproduce search or --finalists --skip-screen qualification.
+Invocation hash/mode recorded; no stale qualified.env survives reclassification.
+
+Validation passed:130release engine tests(1ignored),5packageGo race
+(xhysteria,hysteria,handoff,nodex-supervisor,proxy/hysteria),4scaling128x race
+smokes,7Python parser/gate tests,ShellCheck/bashsyntax,reusewrapper fullsmoke.
+At1/4/16cores:mask compatibility/concurrent/credit/cap/100msRTT,thirdparty
+shared/socket streamlimit/recycle,strictUDP8000/8000 EACH with0kernel
+UDPdrops/duplicates. FunctionalUDPdiffersfrom32flowcontinuousstreaming;
+passing it does not erase failed streaming samples. No fresh15minsoak,
+Androiddevice/WAN/isolated-servercapacity or repository-widetest claim.
+
+Publish benchmark/report/profile changes with normal commits/cherry-pick-x
+and atomicpush to4origin branches. Do not force/upstream-push,deploystart,
+or alter existing auxiliary/neighbor worktrees. The active worktree isandroid.
