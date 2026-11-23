@@ -1,6 +1,6 @@
 # Codex Handoff: Native Hysteria Memory and Capacity
 
-Date: 2026-11-23
+Date: 2026-11-24
 Workspace: `/home/danya2271/ProxVless/XPray-core`
 
 ## Request and Scope
@@ -1256,3 +1256,79 @@ Androiddevice/WAN/isolated-servercapacity or repository-widetest claim.
 Publish benchmark/report/profile changes with normal commits/cherry-pick-x
 and atomicpush to4origin branches. Do not force/upstream-push,deploystart,
 or alter existing auxiliary/neighbor worktrees. The active worktree isandroid.
+
+## Completed: One/two-core experiment round (2026-11-24)
+
+Baseline `19052c8e`. No runtime candidate from this round was retained.
+Do not claim a new general Hysteria speedup. Added reproducible A/B tooling,
+focused tests and complete final experiment evidence. No VPS deployment,
+restart or neighboring/previous auxiliary worktree changes.
+
+Rejected and reverted: Go read batching (`batch/final/ready/server`),
+ready-queue-before-mutex (`lock`), last-range lookup (`range`), in-place
+ACK-range extension (`inplace`), and bounded empty send metadata (`cache`).
+Read batching improved one-core upload 137.13→181.09 MB/s but worsened paced
+p99 and RSS. Range insertion saved 37–54% in micros but had mixed transport.
+
+The final send cache retained <=4 empty Bytes descriptors, 128 B per drained
+open send stream on amd64, never payload owners. Seven same-binary alternating
+micros: 32.444→14.429 ns/write-transmit-ACK cycle, approximately 55.5% lower.
+This local win remains documented, not represented as whole-Hysteria gain.
+
+Final cache evidence: 48 combined one/two-core samples, 48 four/eight-core
+controls, 24 managed-server samples, 14 micro samples, six capacity runs.
+Three paired samples per transport configuration; all timing/drop observations
+retained. Complete client/server/target CPU budget is distinct from independent
+managed-server CPU accounting.
+
+Combined results:
+- One core: duplex 179.92→172.73 MB/s, upload 142.10→139.36,
+  download 182.56→182.85; paced p99 4689→4742 µs.
+- Two cores: upload 294.16→289.76, download 327.80→327.16;
+  paced p99 2226→2370 µs. Two candidate download samples had kernel drops;
+  baseline had none. Controls had three nonzero-drop samples per revision.
+- Managed server: throughput 230.05→231.11 / 412.00→415.68 MB/s,
+  total server-side CPU 525.193→522.211 / 573.429→567.445 µs.
+  All 24 managed samples had zero ingress/public UDP drops.
+- 1000 sessions: peak-before-close RSS 225.1→222.3 MiB, but server lifetime
+  CPU 4.185→4.251 seconds and heartbeat p99 2561.4→2693.2 µs.
+
+Cache candidate validation passed: 325 release / 326 debug Quinn-proto tests
+(five ignored); 130 release engine tests (one ignored); release library Clippy
+with -D warnings; fresh-linked race tests for five Go packages. One/two-core
+mask/concurrency/credit/capacity/100 ms RTT checks and masked shared/socket
+third-party 192 concurrent streams / 1200 close-reopen checks passed.
+Strict UDP: 8000/8000 per budget, direct/cascade 256/4096 bytes, sampled kernel
+drops and duplicates zero. All six capacity runs passed 512 MiB guard.
+Android arm64/API26 build passed using NDK30.0.14904198. No new 15-minute soak,
+WAN/device performance or full-repository green claim.
+
+Source and Linux/Android archives were then restored to baseline. Linux archive
+SHA256 `2a1cd8dcabb972412c9521ce3e8b11927b41859225d841351610d0a9dea697d6`;
+interop `83f181dd99fba83916b62552730576b7b0528d75626f604ffea2f4b09c9d58ea`;
+standalone Xray `0e567bcb6557ab9b2f314fec2343e0f8c263638242a7033c940a4a6b2e48fdeb`.
+Both Linux executables cmp-identical to baseline. Android baseline rebuilt;
+native archive SHA256
+`5c06dfe74c4bf05528c3e27de8040eef72183d6434a7655796e974e985b3d3a9`.
+
+`native/libxhysteria/bench-low-core.py` compares before/after harnesses,
+with manifests including binary/driver hashes and relevant environment.
+Records affinity, exact commands, loadavg, individual metrics and median/min/max
+with explicit drop-sample counts. Invalid/incomplete/failed logs stop resumption;
+timeouts TERM then KILL the entire process group. Seven focused plus seven
+existing scaling unit tests pass. Actual one-core pair ran all four workloads,
+eight fresh processes; same-manifest resumption reused all logs.
+
+Report: `docs/hysteria-low-core-performance.md`.
+Data: `docs/hysteria-low-core-20261123/send-cache-rejected.json`;
+historical patch `send-cache-rejected.patch` is evidence only, not runtime.
+Earlier range evidence: `range-rejected.json` (120 transport +42 micro samples).
+Raw logs, source snapshots, all intermediate binaries:
+ignored `build_assets/low-core-20261123/`. Preserve failed/aborted evidence.
+
+Standing authorization: publish accepted tooling/reports to all four origin
+branches via ordinary commits/cherry-pick-x and atomic push; never force or push
+upstream. Existing branch-specific differences and auxiliary worktrees remain.
+Future optimization should start from baseline, not reapply rejected candidates
+without new evidence. The 400/370 MB/s target is not newly qualified on 1/2 cores
+by this experiment.
