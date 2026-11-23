@@ -3053,3 +3053,35 @@ AVX2XOR359.97→350.21despite a6–8%packet-masking micro win.
 Task runtime source remains identical to4fd935d5. Raw data/source snapshots:
 ignored `build_assets/throughput-400-370-20261123/`.
 Full report:[target qualification](../../docs/hysteria-throughput-target-performance.md).
+
+## Physical CPU-budget scaling and tuning (2026-11-23)
+
+Measured 1/2/4/6/8/10/12/14/16 physical cores on the Xeon E5-2698 v3,
+pinning the combined client/server/TCP-target process to one SMT representative
+per physical core. This is not isolated server capacity. Runtime remains
+`4fd935d5`; no transport defaults or UDP buffer policy changed.
+
+The final matrix contains 516 fresh-process samples: 43 worker/pool profiles,
+four workloads, three repeats. Go calibration engines finish before each
+setup; per-invocation socket counters exclude earlier endpoints. All completed
+streaming receivers acknowledge delivery. Nonzero kernel UDP drops disqualify
+a profile, while retaining its timing/CPU/RSS as overload evidence.
+
+Selected medians at 4 cores: client2/server2/pool2, upload439.67/download450.46
+MB/s; 8 cores: client2/server4/pool4,692.37/765.16; 16 cores:
+client2/server4/pool4,691.93/825.09. Every selected 4–16-core profile exceeds
+400/370 MB/s in all three final streaming samples, not merely by median.
+At 2 cores no finalist is fully loss-free: only a marked candidate is emitted.
+At 4 and10 cores the selected clean profiles miss the relative paced-p99 gate.
+These limitations and all failed observations remain explicit.
+
+Nine separate user-CPU perf recordings, 130 release engine tests, five-package
+Go race tests, four scaling race smokes, seven Python gate tests and ShellCheck
+pass. Selected profiles at1/4/16cores pass compatibility, third-party
+shared/socket stream checks and strict UDP8000/8000 per budget with zero
+sampled kernel drops/duplicates. No WAN/Android/production claim follows.
+
+Reproduce via `bench-scaling.sh`. Complete per-core settings, final observations,
+CPU profiles, ranges, chart and methodology:
+[scaling report](../../docs/hysteria-core-scaling-performance.md).
+Ignored raw artifacts: `build_assets/core-scaling-20261123/`.
