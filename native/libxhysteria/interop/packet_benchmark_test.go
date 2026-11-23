@@ -23,8 +23,15 @@ func benchmarkPacketModes(b *testing.B, run func(*testing.B, *core.Instance, xne
 }
 
 func benchmarkPacketModesWithPool(b *testing.B, pool string, parallelism int, run func(*testing.B, *core.Instance, xnet.Destination)) {
+	benchmarkPacketModesWithSetup(b, pool, parallelism, nil, run)
+}
+
+func benchmarkPacketModesWithSetup(b *testing.B, pool string, parallelism int, beforeSetup func(*testing.B), run func(*testing.B, *core.Instance, xnet.Destination)) {
 	for _, mode := range []struct{ name, backend string }{{"go", "0"}, {"native", "1"}} {
 		b.Run(mode.name, func(b *testing.B) {
+			if beforeSetup != nil {
+				beforeSetup(b)
+			}
 			b.Setenv("XRAY_HYSTERIA_NATIVE", mode.backend)
 			b.Setenv("XRAY_HYSTERIA_POOL_SIZE", pool)
 			b.Setenv("XRAY_HYSTERIA_BRIDGE", "shared")
@@ -39,6 +46,9 @@ func benchmarkPacketModesWithPool(b *testing.B, pool string, parallelism int, ru
 				receiver.StreamSettings.Udpmasks = masks
 				config.Inbound[0].ReceiverSettings = serial.ToTypedMessage(receiver)
 			})
+			if os.Getenv("XHYS_SCALING_SOCKET_DIAG") == "1" {
+				b.Logf("scaling_iterations=%d scaling_server=%s", b.N, server)
+			}
 			ca, err := os.ReadFile(caPath)
 			if err != nil {
 				b.Fatal(err)
@@ -68,10 +78,11 @@ func benchmarkPacketModesWithPool(b *testing.B, pool string, parallelism int, ru
 			run(b, client, target)
 			if mode.backend == "1" {
 				engines := native.Stats().StartedEngines - before
-				if engines < 2 || (pool != "0" && engines != 2) {
+				expectedPool, err := strconv.Atoi(pool)
+				if err != nil || engines < 2 || (expectedPool != 0 && engines != int64(expectedPool+1)) {
 					b.Fatal("packet benchmark fell back to Go or opened extra engines")
 				}
-				if pool == "0" {
+				if pool != "1" {
 					b.ReportMetric(float64(engines-1), "native-client-engines")
 				}
 			}

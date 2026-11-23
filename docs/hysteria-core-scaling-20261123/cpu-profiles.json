@@ -1,0 +1,1786 @@
+[
+  {
+    "cores": 1,
+    "top": [
+      {
+        "percent": 6.73,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 4.29,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 3.83,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 3.71,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 3.02,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 2.2,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.97,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.97,
+        "symbol": "memeqbody"
+      },
+      {
+        "percent": 1.86,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.74,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 1.51,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 1.51,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 1.16,
+        "symbol": "<quinn_proto::connection::packet_builder::PacketBuilder>::new"
+      },
+      {
+        "percent": 1.16,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 1.04,
+        "symbol": "<quinn_proto::connection::Connection>::handle_decode"
+      },
+      {
+        "percent": 1.04,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 1.04,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 1.04,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 0.93,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "<xhysteria::udp::DatagramParts>::into_datagram"
+      },
+      {
+        "percent": 0.81,
+        "symbol": "0x00000000000b5a22"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "<quinn_proto::endpoint::Endpoint>::accept"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "<quinn_proto::token::IncomingToken>::from_header"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "ring::ec::suite_b::ops::p384::p384_elem_inv_squared"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_adx"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "0x00000000001b1b2e"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "0x00000000001b1b33"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "<quinn::recv_stream::RecvStream as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "<quinn_proto::cid_generator::RandomConnectionIdGenerator as quinn_proto::cid_generator::ConnectionIdGenerator>::generate_cid"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "<tokio::sync::batch_semaphore::Acquire as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "<xhysteria::engine::Bus>::register::{closure#0}"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "ring::ec::suite_b::ops::p384::p384_scalar_inv_to_mont"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "xhysteria::engine::server_udp::{closure#0}"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "0x00000000001b1b24"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "0x00000000001b1b29"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "0x0000000000e1a29c"
+      }
+    ],
+    "benchmark_log": "profile-cores1.log",
+    "config": {
+      "cores": 1,
+      "client_workers": 1,
+      "server_workers": 1,
+      "pool": 2,
+      "affinity": [
+        4
+      ],
+      "upload_MBps": 174.47,
+      "download_MBps": 188.79,
+      "duplex_MBps": 179.27,
+      "upload_cpu_us": 355.88,
+      "download_cpu_us": 332.402,
+      "paced_p99_us": 4136.0,
+      "background_MiBps": 64.22,
+      "peak_RSS_MiB": 156.8203125,
+      "default_upload_MBps": 174.47,
+      "default_download_MBps": 188.79,
+      "default_paced_p99_us": 4136.0,
+      "default_failed_samples": 0,
+      "default_valid_samples": {
+        "duplex": 3,
+        "upload": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        1,
+        1,
+        1
+      ],
+      "fastest_measured_upload_MBps": 181.06,
+      "fastest_measured_download_MBps": 186.69,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 2,
+    "top": [
+      {
+        "percent": 6.93,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 3.61,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 3.31,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 3.11,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 2.91,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 2.11,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 1.81,
+        "symbol": "memeqbody"
+      },
+      {
+        "percent": 1.81,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.71,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 1.51,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 1.51,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.51,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 1.31,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.2,
+        "symbol": "runtime.chansend"
+      },
+      {
+        "percent": 1.1,
+        "symbol": "<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>, alloc::collections::btree::node::marker::Leaf>, alloc::collections::btree::node::marker::KV>>::remove_leaf_kv::<<alloc::collections::btree::map::entry::OccupiedEntry<std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>>>::remove_kv::{closure#0}, alloc::alloc::Global>"
+      },
+      {
+        "percent": 1.1,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 1.1,
+        "symbol": "<quinn_proto::token::IncomingToken>::from_header"
+      },
+      {
+        "percent": 1.1,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.0,
+        "symbol": "<quinn_proto::connection::packet_builder::PacketBuilder>::new"
+      },
+      {
+        "percent": 1.0,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 1.0,
+        "symbol": "xhysteria::engine::server_udp::{closure#0}"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "<quinn_proto::connection::Connection>::handle_timeout"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "<quinn_proto::connection::streams::SendStream>::finish"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "<quinn_proto::connection::Connection>::handle_decode"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "<quinn_proto::connection::Connection>::set_loss_detection_timer"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "ring::ec::suite_b::ops::p384::p384_elem_inv_squared"
+      },
+      {
+        "percent": 0.6,
+        "symbol": "<tokio::runtime::park::Inner>::park_timeout"
+      },
+      {
+        "percent": 0.6,
+        "symbol": "<xhysteria::engine::Bus>::register::{closure#0}"
+      },
+      {
+        "percent": 0.6,
+        "symbol": "github.com/xtls/xray-core/transport/internet/xhysteria.(*sharedBridge).read"
+      },
+      {
+        "percent": 0.6,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 0.6,
+        "symbol": "tokio::runtime::scheduler::multi_thread::worker::run"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "<quinn::recv_stream::RecvStream as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "__ecp_nistz256_sqr_montx"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "github.com/xtls/xray-core/transport/internet/xhysteria.(*Engine).readLoop"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "runtime.casgstatus"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "0x00000000001b1b29"
+      }
+    ],
+    "benchmark_log": "profile-cores2.log",
+    "config": {
+      "cores": 2,
+      "client_workers": 2,
+      "server_workers": 2,
+      "pool": 2,
+      "affinity": [
+        4,
+        5
+      ],
+      "upload_MBps": 289.51,
+      "download_MBps": 327.15,
+      "duplex_MBps": 308.25,
+      "upload_cpu_us": 396.288,
+      "download_cpu_us": 364.569,
+      "paced_p99_us": 2176.0,
+      "background_MiBps": 64.13,
+      "peak_RSS_MiB": 168.3671875,
+      "default_upload_MBps": 289.51,
+      "default_download_MBps": 327.15,
+      "default_paced_p99_us": 2176.0,
+      "default_failed_samples": 1,
+      "default_valid_samples": {
+        "duplex": 3,
+        "upload": 3,
+        "paced": 3,
+        "download": 2
+      },
+      "loss_free_qualification_pass": false,
+      "selected_failed_samples": 1,
+      "fastest_measured_config": [
+        1,
+        1,
+        2
+      ],
+      "fastest_measured_upload_MBps": 302.07,
+      "fastest_measured_download_MBps": 318.25,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 4,
+    "top": [
+      {
+        "percent": 5.67,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 5.39,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 3.53,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 3.16,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 2.14,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.95,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.86,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 1.86,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 1.49,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 1.49,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 1.49,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.3,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 1.12,
+        "symbol": "runtime.findRunnable"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "memeqbody"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 0.93,
+        "symbol": "<quinn::recv_stream::RecvStream as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.93,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 0.84,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 0.84,
+        "symbol": "runtime.stealWork"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "<alloc::collections::btree::node::BalancingContext<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo>>::merge_tracking_child_edge::<alloc::alloc::Global>"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "<quinn_proto::connection::Connection>::handle_decode"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "<quinn_proto::connection::Connection>::set_loss_detection_timer"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "runtime.netpoll"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "0x00000000001b1b29"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "0x0000000000e1a29c"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "<quinn_proto::connection::Connection>::handle_timeout"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "<quinn_proto::connection::Connection>::on_ack_received"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "malloc"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "runtime.lock2"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "xhysteria::engine::server_udp::{closure#0}"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "0x00000000000b5a22"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "0x00000000001b1b2e"
+      },
+      {
+        "percent": 0.56,
+        "symbol": "0x00000000001b1b33"
+      }
+    ],
+    "benchmark_log": "profile-cores4.log",
+    "config": {
+      "cores": 4,
+      "client_workers": 2,
+      "server_workers": 2,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "upload_MBps": 439.67,
+      "download_MBps": 450.46,
+      "duplex_MBps": 464.39,
+      "upload_cpu_us": 445.0,
+      "download_cpu_us": 444.277,
+      "paced_p99_us": 1223.0,
+      "background_MiBps": 64.08,
+      "peak_RSS_MiB": 180.9765625,
+      "default_upload_MBps": 444.39,
+      "default_download_MBps": 482.76,
+      "default_paced_p99_us": 1072.0,
+      "default_failed_samples": 1,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3,
+        "upload": 2
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        4,
+        4,
+        2
+      ],
+      "fastest_measured_upload_MBps": 444.39,
+      "fastest_measured_download_MBps": 482.76,
+      "fastest_measured_failed_samples": 1,
+      "latency_gate_pass": false,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 6,
+    "top": [
+      {
+        "percent": 6.12,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 4.03,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 3.86,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 3.61,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 2.43,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 1.93,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.93,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 1.43,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.34,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 1.34,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.26,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 1.17,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 1.09,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 0.92,
+        "symbol": "<quinn_proto::connection::Connection>::handle_decode"
+      },
+      {
+        "percent": 0.92,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 0.84,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 0.84,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 0.84,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_adx"
+      },
+      {
+        "percent": 0.84,
+        "symbol": "runtime.stealWork"
+      },
+      {
+        "percent": 0.67,
+        "symbol": "<xhysteria::engine::Bus>::register::{closure#0}"
+      },
+      {
+        "percent": 0.67,
+        "symbol": "memeqbody"
+      },
+      {
+        "percent": 0.67,
+        "symbol": "0x00000000001b1b24"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>, alloc::collections::btree::node::marker::Leaf>, alloc::collections::btree::node::marker::KV>>::remove_leaf_kv::<<alloc::collections::btree::map::entry::OccupiedEntry<std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>>>::remove_kv::{closure#0}, alloc::alloc::Global>"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "<quinn_proto::connection::Connection>::detect_lost_packets"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "<quinn_proto::connection::packet_builder::PacketBuilder>::new"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "<quinn_proto::token::IncomingToken>::from_header"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "<std::sys::sync::mutex::futex::Mutex>::lock_contended"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "github.com/xtls/xray-core/transport/internet/xhysteria.(*sharedBridge).read"
+      },
+      {
+        "percent": 0.59,
+        "symbol": "runtime.findRunnable"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "<quinn_proto::connection::Connection>::handle_timeout"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "<tokio::task::local::Shared>::schedule"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "ring::ec::suite_b::ops::p384::p384_elem_inv_squared"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "runtime.lock2"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "type:.eq.IM36K4M12K4IM32"
+      },
+      {
+        "percent": 0.5,
+        "symbol": "0x0000000000e1a29c"
+      }
+    ],
+    "benchmark_log": "profile-cores6.log",
+    "config": {
+      "cores": 6,
+      "client_workers": 2,
+      "server_workers": 6,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "upload_MBps": 583.73,
+      "download_MBps": 571.64,
+      "duplex_MBps": 590.05,
+      "upload_cpu_us": 489.637,
+      "download_cpu_us": 473.857,
+      "paced_p99_us": 775.9,
+      "background_MiBps": 63.94,
+      "peak_RSS_MiB": 191.59765625,
+      "default_upload_MBps": 591.99,
+      "default_download_MBps": 528.9,
+      "default_paced_p99_us": 843.0,
+      "default_failed_samples": 0,
+      "default_valid_samples": {
+        "duplex": 3,
+        "upload": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        2,
+        6,
+        2
+      ],
+      "fastest_measured_upload_MBps": 583.73,
+      "fastest_measured_download_MBps": 571.64,
+      "fastest_measured_failed_samples": 0,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 8,
+    "top": [
+      {
+        "percent": 5.19,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 5.04,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 3.54,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 3.15,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 2.28,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 2.12,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 1.73,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.49,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.49,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 1.42,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 1.26,
+        "symbol": "runtime.findRunnable"
+      },
+      {
+        "percent": 1.18,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.1,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "runtime.stealWork"
+      },
+      {
+        "percent": 0.94,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 0.94,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 0.87,
+        "symbol": "<quinn::recv_stream::RecvStream as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.87,
+        "symbol": "internal/runtime/syscall/linux.Syscall6"
+      },
+      {
+        "percent": 0.87,
+        "symbol": "xhysteria::engine::server_udp::{closure#0}"
+      },
+      {
+        "percent": 0.79,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 0.79,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 0.71,
+        "symbol": "runtime.lock2"
+      },
+      {
+        "percent": 0.71,
+        "symbol": "0x00000000001b1b29"
+      },
+      {
+        "percent": 0.63,
+        "symbol": "<quinn_proto::connection::Connection>::handle_decode"
+      },
+      {
+        "percent": 0.63,
+        "symbol": "<quinn_proto::connection::streams::SendStream>::finish"
+      },
+      {
+        "percent": 0.63,
+        "symbol": "github.com/xtls/xray-core/transport/internet/xhysteria.(*sharedBridge).tryWriteBatch"
+      },
+      {
+        "percent": 0.63,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 0.63,
+        "symbol": "0x00000000001b1af1"
+      },
+      {
+        "percent": 0.63,
+        "symbol": "0x00000000001b1b2e"
+      },
+      {
+        "percent": 0.63,
+        "symbol": "0x00000000001b1b33"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "<quinn_proto::connection::Connection>::set_loss_detection_timer"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "<quinn_proto::connection::packet_builder::PacketBuilder>::new"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "<quinn_proto::endpoint::Endpoint>::accept"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "<quinn_proto::token::IncomingToken>::from_header"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "<xhysteria::engine::Bus>::register::{closure#0}"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "github.com/xtls/xray-core/transport/internet/xhysteria.(*Engine).readLoop"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "memeqbody"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "0x00000000001b1b24"
+      }
+    ],
+    "benchmark_log": "profile-cores8.log",
+    "config": {
+      "cores": 8,
+      "client_workers": 2,
+      "server_workers": 4,
+      "pool": 4,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "upload_MBps": 692.37,
+      "download_MBps": 765.16,
+      "duplex_MBps": 772.51,
+      "upload_cpu_us": 569.388,
+      "download_cpu_us": 458.073,
+      "paced_p99_us": 613.2,
+      "background_MiBps": 64.08,
+      "peak_RSS_MiB": 151.61328125,
+      "default_upload_MBps": 669.97,
+      "default_download_MBps": 729.14,
+      "default_paced_p99_us": 637.3,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        2,
+        4,
+        4
+      ],
+      "fastest_measured_upload_MBps": 692.37,
+      "fastest_measured_download_MBps": 765.16,
+      "fastest_measured_failed_samples": 0,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 10,
+    "top": [
+      {
+        "percent": 5.78,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 3.75,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 3.43,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 3.04,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 2.81,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 1.64,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.56,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 1.48,
+        "symbol": "runtime.stealWork"
+      },
+      {
+        "percent": 1.41,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 1.41,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.25,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 1.25,
+        "symbol": "runtime.findRunnable"
+      },
+      {
+        "percent": 1.25,
+        "symbol": "runtime.lock2"
+      },
+      {
+        "percent": 1.17,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.17,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 1.17,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 1.09,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.01,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 1.01,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 0.94,
+        "symbol": "<std::sys::sync::mutex::futex::Mutex>::lock_contended"
+      },
+      {
+        "percent": 0.94,
+        "symbol": "internal/runtime/syscall/linux.Syscall6"
+      },
+      {
+        "percent": 0.86,
+        "symbol": "<quinn_proto::endpoint::Endpoint>::accept"
+      },
+      {
+        "percent": 0.78,
+        "symbol": "<quinn::recv_stream::RecvStream as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.78,
+        "symbol": "runtime.chansend"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>, alloc::collections::btree::node::marker::Leaf>, alloc::collections::btree::node::marker::KV>>::remove_leaf_kv::<<alloc::collections::btree::map::entry::OccupiedEntry<std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>>>::remove_kv::{closure#0}, alloc::alloc::Global>"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 0.7,
+        "symbol": "runtime.netpoll"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 0.62,
+        "symbol": "0x00000000001b1af1"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "github.com/xtls/xray-core/transport/internet/xhysteria.(*sharedBridge).tryWriteBatch"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_adx"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "runtime.runqgrab"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "xhysteria::engine::server_udp::{closure#0}"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "0x00000000000b5a22"
+      },
+      {
+        "percent": 0.55,
+        "symbol": "0x00000000001b1b29"
+      }
+    ],
+    "benchmark_log": "profile-cores10.log",
+    "config": {
+      "cores": 10,
+      "client_workers": 4,
+      "server_workers": 8,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "upload_MBps": 699.62,
+      "download_MBps": 623.44,
+      "duplex_MBps": 743.47,
+      "upload_cpu_us": 603.275,
+      "download_cpu_us": 535.581,
+      "paced_p99_us": 693.2,
+      "background_MiBps": 63.9,
+      "peak_RSS_MiB": 146.953125,
+      "default_upload_MBps": 703.81,
+      "default_download_MBps": 760.29,
+      "default_paced_p99_us": 544.9,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 734.26,
+      "fastest_measured_download_MBps": 752.64,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": false,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 12,
+    "top": [
+      {
+        "percent": 6.68,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 4.14,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 3.19,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 3.12,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 2.18,
+        "symbol": "runtime.stealWork"
+      },
+      {
+        "percent": 1.96,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 1.89,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 1.67,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.52,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.45,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 1.31,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 1.31,
+        "symbol": "runtime.findRunnable"
+      },
+      {
+        "percent": 1.23,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 1.16,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 1.09,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.09,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 0.94,
+        "symbol": "runtime.lock2"
+      },
+      {
+        "percent": 0.87,
+        "symbol": "<xhysteria::engine::Bus>::register::{closure#0}"
+      },
+      {
+        "percent": 0.87,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_adx"
+      },
+      {
+        "percent": 0.87,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "<quinn_proto::connection::Connection>::process_early_payload"
+      },
+      {
+        "percent": 0.73,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 0.73,
+        "symbol": "runtime.netpoll"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "runtime.casgstatus"
+      },
+      {
+        "percent": 0.65,
+        "symbol": "runtime.runqgrab"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "<quinn_proto::endpoint::Endpoint>::accept"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "internal/runtime/syscall/linux.Syscall6"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "runtime.sellock"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<alloc::collections::btree::node::BalancingContext<usize, std::sys::pal::unix::stack_overflow::thread_info::ThreadInfo>>::merge_tracking_child_edge::<alloc::alloc::Global>"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<quinn::recv_stream::RecvStream as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<quinn_proto::connection::Connection>::detect_lost_packets"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<tokio::runtime::park::Inner>::park_timeout"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "memeqbody"
+      }
+    ],
+    "benchmark_log": "profile-cores12.log",
+    "config": {
+      "cores": 12,
+      "client_workers": 2,
+      "server_workers": 4,
+      "pool": 4,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "upload_MBps": 668.33,
+      "download_MBps": 831.11,
+      "duplex_MBps": 770.71,
+      "upload_cpu_us": 775.658,
+      "download_cpu_us": 504.694,
+      "paced_p99_us": 563.6,
+      "background_MiBps": 63.67,
+      "peak_RSS_MiB": 154.078125,
+      "default_upload_MBps": 740.04,
+      "default_download_MBps": 779.77,
+      "default_paced_p99_us": 546.5,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 763.57,
+      "fastest_measured_download_MBps": 759.34,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 14,
+    "top": [
+      {
+        "percent": 4.84,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 3.42,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 3.35,
+        "symbol": "runtime.stealWork"
+      },
+      {
+        "percent": 3.28,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 2.92,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 2.42,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 1.85,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 1.64,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.64,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.42,
+        "symbol": "runtime.lock2"
+      },
+      {
+        "percent": 1.28,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.28,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 1.21,
+        "symbol": "__vdso_clock_gettime"
+      },
+      {
+        "percent": 1.21,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 1.21,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 1.14,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.14,
+        "symbol": "runtime.findRunnable"
+      },
+      {
+        "percent": 1.0,
+        "symbol": "<quinn_proto::connection::Connection>::handle_decode"
+      },
+      {
+        "percent": 0.93,
+        "symbol": "memeqbody"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "<xhysteria::engine::Bus>::register::{closure#0}"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 0.85,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 0.78,
+        "symbol": "runtime.chansend"
+      },
+      {
+        "percent": 0.71,
+        "symbol": "<quinn::recv_stream::RecvStream as core::ops::drop::Drop>::drop"
+      },
+      {
+        "percent": 0.71,
+        "symbol": "0x00000000001b1af1"
+      },
+      {
+        "percent": 0.64,
+        "symbol": "<alloc::collections::btree::node::Handle<alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>, alloc::collections::btree::node::marker::Leaf>, alloc::collections::btree::node::marker::KV>>::remove_leaf_kv::<<alloc::collections::btree::map::entry::OccupiedEntry<std::ffi::os_str::OsString, core::option::Option<std::ffi::os_str::OsString>>>::remove_kv::{closure#0}, alloc::alloc::Global>"
+      },
+      {
+        "percent": 0.64,
+        "symbol": "<quinn_proto::connection::Connection>::handle_timeout"
+      },
+      {
+        "percent": 0.64,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 0.64,
+        "symbol": "ring::ec::suite_b::ops::p384::p384_elem_inv_squared"
+      },
+      {
+        "percent": 0.64,
+        "symbol": "runtime.runqgrab"
+      },
+      {
+        "percent": 0.57,
+        "symbol": "<quinn_proto::connection::Connection>::detect_lost_packets"
+      },
+      {
+        "percent": 0.57,
+        "symbol": "<xhysteria::udp::DatagramParts>::into_datagram"
+      },
+      {
+        "percent": 0.57,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 0.57,
+        "symbol": "github.com/xtls/xray-core/common/buf.copyInternal"
+      },
+      {
+        "percent": 0.57,
+        "symbol": "runtime.procyieldAsm.abi0"
+      },
+      {
+        "percent": 0.57,
+        "symbol": "0x00000000001b1b33"
+      }
+    ],
+    "benchmark_log": "profile-cores14.log",
+    "config": {
+      "cores": 14,
+      "client_workers": 4,
+      "server_workers": 8,
+      "pool": 2,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        0,
+        1
+      ],
+      "upload_MBps": 686.77,
+      "download_MBps": 641.13,
+      "duplex_MBps": 731.21,
+      "upload_cpu_us": 759.082,
+      "download_cpu_us": 542.831,
+      "paced_p99_us": 603.7,
+      "background_MiBps": 64.04,
+      "peak_RSS_MiB": 149.28515625,
+      "default_upload_MBps": 769.98,
+      "default_download_MBps": 791.3,
+      "default_paced_p99_us": 566.4,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 810.57,
+      "fastest_measured_download_MBps": 814.21,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    }
+  },
+  {
+    "cores": 16,
+    "top": [
+      {
+        "percent": 5.4,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_mul_mont_nohw"
+      },
+      {
+        "percent": 3.43,
+        "symbol": "runtime.memmove"
+      },
+      {
+        "percent": 3.36,
+        "symbol": "runtime.stealWork"
+      },
+      {
+        "percent": 3.21,
+        "symbol": "<quinn_proto::connection::Connection>::process_payload"
+      },
+      {
+        "percent": 3.21,
+        "symbol": "blake2b_simd::sse41::compress2_loop"
+      },
+      {
+        "percent": 2.26,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_ord_sqr_mont_nohw"
+      },
+      {
+        "percent": 1.75,
+        "symbol": "<quinn_proto::connection::Connection>::populate_packet"
+      },
+      {
+        "percent": 1.6,
+        "symbol": "runtime.lock2"
+      },
+      {
+        "percent": 1.53,
+        "symbol": "runtime.selectgo"
+      },
+      {
+        "percent": 1.39,
+        "symbol": "<core::pin::Pin<&mut xhysteria::engine::relay_server_tcp::{closure#0}::{closure#1}::{closure#1}> as core::future::future::Future>::poll"
+      },
+      {
+        "percent": 1.24,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_neg"
+      },
+      {
+        "percent": 1.24,
+        "symbol": "runtime.findRunnable"
+      },
+      {
+        "percent": 1.17,
+        "symbol": "ring_core_0_17_14__bn_gather5"
+      },
+      {
+        "percent": 1.17,
+        "symbol": "runtime.unlock2"
+      },
+      {
+        "percent": 1.17,
+        "symbol": "0x00000000001b1991"
+      },
+      {
+        "percent": 1.02,
+        "symbol": "<xhysteria::engine::Worker>::join"
+      },
+      {
+        "percent": 0.88,
+        "symbol": "0x00000000001b1c87"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "<quinn_proto::connection::Connection>::poll_transmit"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "__ecp_nistz256_add_tox"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "__ecp_nistz256_mul_montq"
+      },
+      {
+        "percent": 0.8,
+        "symbol": "runtime.checkTimersNoP"
+      },
+      {
+        "percent": 0.73,
+        "symbol": "memeqbody"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "internal/poll.(*FD).RawRead"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_point_add_affine_nohw"
+      },
+      {
+        "percent": 0.66,
+        "symbol": "runtime.procyieldAsm.abi0"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "<quinn_proto::connection::streams::SendStream>::finish"
+      },
+      {
+        "percent": 0.58,
+        "symbol": "malloc"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<alloc::collections::btree::map::BTreeMap<u64, quinn_proto::connection::spaces::SentPacket>>::remove::<u64>"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<quinn_proto::connection::Connection>::handle_decode"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<quinn_proto::token::IncomingToken>::from_header"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<ring::ec::suite_b::ecdsa::signing::NonceRandom as ring::rand::sealed::SecureRandom>::fill_impl"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "<xhysteria::engine::Bus>::register::{closure#0}"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "ring_core_0_17_14__ecp_nistz256_sqr_mont_nohw"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "runtime.chansend"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "runtime.futex.abi0"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "runtime.runqgrab"
+      },
+      {
+        "percent": 0.51,
+        "symbol": "0x00000000000b5a22"
+      }
+    ],
+    "benchmark_log": "profile-cores16.log",
+    "config": {
+      "cores": 16,
+      "client_workers": 2,
+      "server_workers": 4,
+      "pool": 4,
+      "affinity": [
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        0,
+        1,
+        2,
+        3
+      ],
+      "upload_MBps": 691.93,
+      "download_MBps": 825.09,
+      "duplex_MBps": 813.98,
+      "upload_cpu_us": 896.972,
+      "download_cpu_us": 505.528,
+      "paced_p99_us": 556.9,
+      "background_MiBps": 63.95,
+      "peak_RSS_MiB": 153.64453125,
+      "default_upload_MBps": 721.94,
+      "default_download_MBps": 810.01,
+      "default_paced_p99_us": 517.2,
+      "default_failed_samples": 3,
+      "default_valid_samples": {
+        "duplex": 3,
+        "download": 3,
+        "paced": 3
+      },
+      "loss_free_qualification_pass": true,
+      "selected_failed_samples": 0,
+      "fastest_measured_config": [
+        3,
+        8,
+        3
+      ],
+      "fastest_measured_upload_MBps": 847.49,
+      "fastest_measured_download_MBps": 811.61,
+      "fastest_measured_failed_samples": 3,
+      "latency_gate_pass": true,
+      "load_gate_pass": true
+    }
+  }
+]
