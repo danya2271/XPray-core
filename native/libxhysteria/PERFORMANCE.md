@@ -3143,3 +3143,39 @@ passes130engine tests. Source and native archives match baseline after revert.
 Full results, profile limits and next optimization direction:
 [AES-GCM and scheduling report](../../docs/hysteria-crypto-scheduling-performance.md).
 Ignored raw artifacts: `build_assets/crypto-scheduling-20261124/`.
+
+## Shared-payload/send-budget owner fusion (2026-11-24)
+
+Shared command payload leases move through the Rust queue until send-budget
+permits attach. One Bytes owner then contains the lease and both permits,
+replacing nested payload/budget owners. Allocation diagnostics confirm two→one
+live owner allocations per tested frame and complete cleanup after release.
+The validated 0–15 slot index fits in u8, preserving the amd64 Frame48B and
+budget-owner64B layout. Storage/wire ABI6, slots, credits and wakeup ordering
+are unchanged.
+
+Seven alternating same-binary micros on CPU4 save4.3–8.1% at64/4096/16384B.
+Five paired combined-budget samples: one-core upload178.42→182.45MB/s,
+download186.15→190.53; two-core292.03→293.73 /328.65→337.27.
+Pacedp994695→4603µs /2207→1845. Results are mixed elsewhere: one-core
+bulk-duplexp9959.319→65.428ms and independent managed-server throughput
+252.86→248.78MB/s. No universal speedup or RSS reduction is claimed.
+1000session peak-before-close RSS222.4→222.7MiB.
+
+Initial eight-core p99 concerns led to four more paired checks with the same
+binaries. All seven pairs give duplex665.16→676.79MB/s,p9927044→25920µs;
+pacedp993224→3229µs at63.99→64.00MiB/s attained background.
+Initial and additional observations remain separate and jointly summarized.
+
+133release/133debug library tests,release engine Clippy-Dwarnings,five-package
+fresh native Go race tests pass. One/two-core HTTP/mask/credit/capacity/100msRTT
+and masked third-party shared/socket stream checks pass. Strict UDP8000/8000
+and saturated UDP6000/6000 per budget have zero sampled drops/duplicates;
+managed retained-connection and saturated-drain tests pass. Six1000session
+capacity observations and Androidarm64/API26 build pass. No device/WAN/new
+15minute soak or production deployment claim.
+
+Full168final transport /6capacity /42micro observations,allocation checks,
+superseded candidate evidence,limits and reproduction:
+[shared-owner report](../../docs/hysteria-shared-owner-performance.md).
+Ignored artifacts: `build_assets/shared-owner-compact-20261124/`.

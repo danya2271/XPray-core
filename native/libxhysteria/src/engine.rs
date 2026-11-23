@@ -307,7 +307,7 @@ impl Drop for EndpointOwner {
 struct Frame {
     kind: u8,
     id: u64,
-    data: Bytes,
+    data: shared::FrameData,
 }
 
 impl Frame {
@@ -315,7 +315,7 @@ impl Frame {
         Self {
             kind,
             id,
-            data: data.into(),
+            data: shared::FrameData::Bytes(data.into()),
         }
     }
 }
@@ -389,7 +389,7 @@ struct Bus {
 }
 
 struct BufferedChunk {
-    data: Bytes,
+    data: shared::FrameData,
     _permit: OwnedSemaphorePermit,
     _process_permit: Option<OwnedSemaphorePermit>,
 }
@@ -620,9 +620,10 @@ impl Bus {
         );
         Ok((rx, receive_credit))
     }
-    async fn buffered_chunk(&self, data: Bytes) -> Result<Bytes> {
+    async fn buffered_chunk(&self, data: impl Into<shared::FrameData>) -> Result<Bytes> {
+        let data = data.into();
         let Some(budget) = &self.send_budget else {
-            return Ok(data);
+            return Ok(data.into_bytes());
         };
         let permit = budget.clone().acquire_many_owned(data.len() as u32).await?;
         let process_permit = match &self.process_send_budget {
@@ -635,9 +636,12 @@ impl Bus {
             _process_permit: process_permit,
         }))
     }
-    fn try_buffered_chunk(&self, data: Bytes) -> std::result::Result<Bytes, Bytes> {
+    fn try_buffered_chunk(
+        &self,
+        data: shared::FrameData,
+    ) -> std::result::Result<Bytes, shared::FrameData> {
         let Some(budget) = &self.send_budget else {
-            return Ok(data);
+            return Ok(data.into_bytes());
         };
         let Ok(permit) = budget.clone().try_acquire_many_owned(data.len() as u32) else {
             return Err(data);
@@ -677,7 +681,16 @@ impl Bus {
                     chunks[count] = chunk;
                     count += 1;
                 }
-                Err(data) => return (count, Some(Frame::new(DATA, command.id, data))),
+                Err(data) => {
+                    return (
+                        count,
+                        Some(Frame {
+                            kind: DATA,
+                            id: command.id,
+                            data,
+                        }),
+                    );
+                }
             }
         }
         (count, None)
@@ -2194,12 +2207,12 @@ fn bridge_tasks(
                     let mut drained = 0;
                     let mut bytes = 0;
                     while drained < 32 && bytes < 256 * 1024 {
-                        let Some((kind, id, data)) = bridge.pop(true)? else {
+                        let Some((kind, id, data)) = bridge.pop_deferred(true)? else {
                             break;
                         };
                         drained += 1;
                         bytes += data.len();
-                        let frame = match bus.try_command(&incoming, Frame::new(kind, id, data)) {
+                        let frame = match bus.try_command(&incoming, Frame { kind, id, data }) {
                             Ok(Some(frame)) => frame,
                             Ok(None) => continue,
                             Err(_) => return Ok(()),
@@ -3289,6 +3302,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_shared_payload_keeps_arena_and_both_budgets_until_last_slice() {
+        let mut bus = capacity_bus();
+        let process = Arc::new(Semaphore::new(8));
+        bus.process_send_budget = Some(process.clone());
+        let local = bus.send_budget.as_ref().unwrap().clone();
+        let bridge = shared::Bridge::new().unwrap();
+        let arena = Arc::downgrade(&bridge);
+        assert!(bridge.push(true, DATA, 1, b"12345678").unwrap());
+        let (_, _, payload) = bridge.pop_deferred(true).unwrap().unwrap();
+        assert!(matches!(payload, shared::FrameData::Payload(_)));
+        let pointer = payload.as_ptr();
+        drop(bridge);
+        let data = bus.buffered_chunk(payload).await.unwrap();
+        assert_eq!(data.as_ptr(), pointer);
+        assert_eq!(data.as_ref(), b"12345678");
+        assert_eq!(
+            (local.available_permits(), process.available_permits()),
+            (0, 0)
+        );
+        let retransmit = data.slice(4..);
+        drop(data);
+        drop(bus);
+        assert_eq!(retransmit.as_ref(), b"5678");
+        assert!(arena.upgrade().is_some());
+        assert_eq!(
+            (local.available_permits(), process.available_permits()),
+            (0, 0)
+        );
+        drop(retransmit);
+        assert!(arena.upgrade().is_none());
+        assert_eq!(
+            (local.available_permits(), process.available_permits()),
+            (8, 8)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_deferred_budget_wait_releases_arena_and_partial_reservation() {
+        for process_blocked in [false, true] {
+            let mut bus = capacity_bus();
+            let process = Arc::new(Semaphore::new(8));
+            bus.process_send_budget = Some(process.clone());
+            let local = bus.send_budget.as_ref().unwrap().clone();
+            let held = if process_blocked {
+                process.clone().try_acquire_many_owned(8).unwrap()
+            } else {
+                local.clone().try_acquire_many_owned(8).unwrap()
+            };
+            let bridge = shared::Bridge::new().unwrap();
+            let arena = Arc::downgrade(&bridge);
+            assert!(bridge.push(true, DATA, 1, b"12345678").unwrap());
+            let (_, _, payload) = bridge.pop_deferred(true).unwrap().unwrap();
+            drop(bridge);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(2), bus.buffered_chunk(payload))
+                    .await
+                    .is_err()
+            );
+            assert!(arena.upgrade().is_none());
+            assert_eq!(
+                local.available_permits(),
+                if process_blocked { 8 } else { 0 }
+            );
+            assert_eq!(
+                process.available_permits(),
+                if process_blocked { 0 } else { 8 }
+            );
+            drop(held);
+            assert_eq!(
+                (local.available_permits(), process.available_permits()),
+                (8, 8)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_try_budget_failure_preserves_the_lease_for_retry() {
+        let mut bus = capacity_bus();
+        let local = bus.send_budget.as_ref().unwrap().clone();
+        let process = Arc::new(Semaphore::new(8));
+        bus.process_send_budget = Some(process.clone());
+        let held = process.clone().try_acquire_many_owned(8).unwrap();
+        let bridge = shared::Bridge::new().unwrap();
+        assert!(bridge.push(true, DATA, 1, b"12345678").unwrap());
+        let (_, _, payload) = bridge.pop_deferred(true).unwrap().unwrap();
+        let pointer = payload.as_ptr();
+        let payload = bus.try_buffered_chunk(payload).unwrap_err();
+        assert!(matches!(payload, shared::FrameData::Payload(_)));
+        assert_eq!(payload.as_ptr(), pointer);
+        assert_eq!(payload.as_ref(), b"12345678");
+        assert_eq!(local.available_permits(), 8);
+        drop(held);
+        let data = bus.try_buffered_chunk(payload).unwrap();
+        assert_eq!(data.as_ptr(), pointer);
+        assert_eq!(
+            (local.available_permits(), process.available_permits()),
+            (0, 0)
+        );
+        drop(data);
+        assert_eq!(
+            (local.available_permits(), process.available_permits()),
+            (8, 8)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual shared-payload/send-budget ownership benchmark"]
+    async fn benchmark_shared_send_ownership() {
+        struct ReferenceChunk {
+            data: Bytes,
+            _permit: OwnedSemaphorePermit,
+            _process_permit: Option<OwnedSemaphorePermit>,
+        }
+        impl AsRef<[u8]> for ReferenceChunk {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        async fn reference_chunk(bus: &Bus, data: Bytes) -> Result<Bytes> {
+            let Some(budget) = &bus.send_budget else {
+                return Ok(data);
+            };
+            let permit = budget.clone().acquire_many_owned(data.len() as u32).await?;
+            let process_permit = match &bus.process_send_budget {
+                Some(budget) => Some(budget.clone().acquire_many_owned(data.len() as u32).await?),
+                None => None,
+            };
+            Ok(Bytes::from_owner(ReferenceChunk {
+                data,
+                _permit: permit,
+                _process_permit: process_permit,
+            }))
+        }
+        let reference = std::env::var_os("XHYS_SHARED_OWNER_REFERENCE").is_some();
+        let mut bus = capacity_bus();
+        bus.send_budget = Some(Arc::new(Semaphore::new(65536)));
+        bus.process_send_budget = Some(Arc::new(Semaphore::new(65536)));
+        let bridge = shared::Bridge::new().unwrap();
+        for size in [64, 4096, 16384] {
+            let payload = vec![0x5a; size];
+            #[cfg(feature = "allocation-profile")]
+            {
+                // Run this ignored fixture alone: the diagnostic allocator
+                // counts the complete test process, including other threads.
+                let before = crate::allocation_profile::live_objects();
+                assert!(bridge.push(true, DATA, 0, &payload).unwrap());
+                let (_, _, data) = bridge.pop_deferred(true).unwrap().unwrap();
+                let data = if reference {
+                    reference_chunk(&bus, data.into_bytes()).await.unwrap()
+                } else {
+                    bus.buffered_chunk(data).await.unwrap()
+                };
+                let live = crate::allocation_profile::live_objects() - before;
+                assert_eq!(live, if reference { 2 } else { 1 });
+                drop(data);
+                assert_eq!(crate::allocation_profile::live_objects(), before);
+                println!("reference={reference} bytes={size} live_owner_allocations={live}");
+            }
+            let started = Instant::now();
+            for id in 0..262144 {
+                assert!(bridge.push(true, DATA, id, &payload).unwrap());
+                let (_, _, data) = bridge.pop_deferred(true).unwrap().unwrap();
+                let data = if reference {
+                    reference_chunk(&bus, data.into_bytes()).await.unwrap()
+                } else {
+                    bus.buffered_chunk(data).await.unwrap()
+                };
+                std::hint::black_box(&data);
+                drop(data);
+            }
+            println!(
+                "reference={reference} bytes={size} ns_per_frame={:.3} frame_bytes={} buffered_owner_bytes={} reference_owner_bytes={}",
+                started.elapsed().as_nanos() as f64 / 262144.,
+                std::mem::size_of::<Frame>(),
+                std::mem::size_of::<BufferedChunk>(),
+                std::mem::size_of::<ReferenceChunk>(),
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn tcp_batch_flushes_before_waiting_for_local_or_process_budget() {
         for process_limit in [false, true] {
             let mut bus = capacity_bus();
@@ -3510,7 +3704,7 @@ mod tests {
                 } else {
                     let frame = received.try_recv().unwrap();
                     assert_eq!((frame.kind, frame.id), (DATAGRAM, 1));
-                    frame.data
+                    frame.data.into_bytes()
                 };
                 let (address, payload) = parse_address(&data).unwrap();
                 assert_eq!(address, b"target");
