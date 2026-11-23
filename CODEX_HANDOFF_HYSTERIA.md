@@ -1332,3 +1332,71 @@ upstream. Existing branch-specific differences and auxiliary worktrees remain.
 Future optimization should start from baseline, not reapply rejected candidates
 without new evidence. The 400/370 MB/s target is not newly qualified on 1/2 cores
 by this experiment.
+
+## Completed: AES-GCM and scheduler investigation (2026-11-24)
+
+Baseline `a8f604ee`, runtime unchanged from `4fd935d5`. User asked to investigate
+AES-GCM and scheduling/queues/wakeups. No production candidate was retained.
+The source and both native archives match baseline. No deployment/restart.
+
+Standalone `native/libxhysteria/tools/crypto-bench/` compares ring0.17.14
+and AWS-LC1.19.0/sys0.47.0 through rustls0.23.46 QUIC packet/header APIs.
+Dependencies are isolated from the main manifest/lockfile. Seven alternating
+repeats on CPU4,262144seal/open/header cycles each: AWS slower19.57% at64B,
+8.58% at512B,5.84% at1200B,4.46% at1452B. Cross-provider payload/header
+checks, tamper rejection and wrong-AAD rejection pass. Final source's separate
+56-observation validation and release Clippy -D warnings pass.
+
+Rejected scheduler experiments each have48fresh samples,3paired repeats,
+1/2physical cores,32flows,pool2,workers per role=budget,shared bridge,
+Salamander+WireGuard. Event interval7→31/global7 gives two-core
+pacedp991876→2100µs,duplexCPU+1.75%;one-core bulk+1–2% is insufficient.
+Global queue7→31/event7 gives one-core upload184.69→143.69MB/s,
+CPU333.742→420.886µs/64KiB. Two-core pacedp992205→2039µs butCPU+3.74%.
+Both matrices retain two baseline/one candidate nonzero-drop samples.
+Do not claim universal regression factors from three repeats.
+Event candidate passed130release engine tests,one ignored.
+
+Queue audit:coalesced pending swaps and full-ring SeqCst handshakes remain;
+DATA/credit already bypass control queue;bounded ring/payload leases/yields.
+No load-and-skip or notify-one replacement was accepted without wakeup proof.
+No new queue-size or batching patch.
+
+Fresh baseline managed-server profiles use independent client CPUs8–15,
+server/ingress/echoCPU4or4,5,two live generations,65536duplex exchanges.
+Attach after same two server PIDs stable4seconds;record8seconds499Hz userCPU,
+server generations+supervisor/echo only. Profiling executable `.text` exactly
+matches stripped baseline,SHA256
+94fae78c2a13ef7cf8dee735bd9b30fa3eb9817382d2ed9da32ac1cde0ca8f15.
+Both instrumented fixtures pass strict zero publicUDP/ingress drop gates.
+
+IMPORTANT:perf's automatic mixed Go/Rust labels are wrong for some addresses,
+even on unstripped build (AES appears as runtime.pclntab). Final summaries use
+first sampled IP mapped into nm -n -S -C exact function extents,not perf names.
+Initial stripped attempts are excluded. 2588/4846 samples;resolved groups:
+AES/header15.80%/15.27%,QUIC13.52%/13.78%,BLAKE2b3.98%/3.84%.
+About14.84%/15.68% unresolved,mainlylibc. No total copy/scheduler/kernel claim.
+Stable-thread voluntary switches188760/409371,involuntary61166/159398
+around recording window;24/37stablethreads,1/2new excluded. Counts do not
+prove redundant wakes. Instrumented throughput is not candidate acceptance.
+
+Report `docs/hysteria-crypto-scheduling-performance.md`.
+Data/historical patches `docs/hysteria-crypto-scheduling-20261124/`.
+Ignored raw scripts/logs/recordings/binaries:
+`build_assets/crypto-scheduling-20261124/`,including `profile-server.py` and
+`symbolize-profile.py`. Keep failed/initial diagnostics.
+
+Next useful research:measure packet fullness/rate and work/wakes per delivered
+MiB;reduce queue/ownership/credit handoffs while preserving bounds,p99 andloss.
+Do not reapply either rejected interval globally or replace ring on this host
+without new evidence. Standing authorization to commit/push accepted tooling
+and evidence to all four origin branches remains;ordinary commits/cherry-pick-x,
+atomic push,no force/upstream/VPS/neighbor-worktree changes.
+
+User follow-up asks whether ring also wins on ARM. Answer remains unknown:
+no extrapolation from Xeon. Host x86_64;ADB device list empty. Standalone
+dual-provider benchmark cross-build passes Androidarm64/API26 with NDK30.
+Prepared ignored `build_assets/crypto-scheduling-20261124/crypto-bench-android-arm64`,
+SHA25685a454b5d3128528dcf3c2bdc7ff5fe5a707e7b7dda3165f2174403a480de00e.
+No device execution or ARM performance claim. README includes cross-build/run
+recipe;measure on actual target before changing provider there.

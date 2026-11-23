@@ -1,0 +1,9 @@
+diff --git a/native/libxhysteria/src/engine.rs b/native/libxhysteria/src/engine.rs
+--- a/native/libxhysteria/src/engine.rs
++++ b/native/libxhysteria/src/engine.rs
+@@ -197 +197 @@
+-        .event_interval(7)
++        .event_interval(31)
+@@ -222 +222 @@
+-                    .event_interval(7)
++                    .event_interval(31)

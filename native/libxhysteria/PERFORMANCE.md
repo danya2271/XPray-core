@@ -3116,3 +3116,30 @@ Full 120 transport /14 micro /6 capacity observations, prior rejected range
 evidence, historical candidate patch and caveats:
 [low-core report](../../docs/hysteria-low-core-performance.md).
 Ignored raw artifacts: `build_assets/low-core-20261123/`.
+
+## AES-GCM providers and scheduler intervals (2026-11-24)
+
+Production retains ring and Tokio event/global queue intervals 7/7.
+Seven alternating same-binary QUIC AES128-GCM crypto repeats show AWS-LC
+slower than ring by 19.57% at64B,8.58% at512B,5.84% at1200B,4.46% at1452B
+on the Xeon E5-2698 v3. Added an independent locked manual comparison at
+`tools/crypto-bench/`; main runtime dependencies are unchanged.
+
+Two separate three-pair 1/2-core matrices, 96 total samples, reject changing
+event interval7→31 (two-core paced p991876→2100µs) and global queue7→31
+(one-core upload184.69→143.69MB/s,CPU333.742→420.886µs/64KiB).
+All nonzero UDP-drop observations remain recorded.
+
+Fresh eight-second profiles attach to already running baseline server
+generations and supervisor/echo, excluding the client. Exact ELF function
+extents replace incorrect mixed Go/Rust perf labels. Resolved user CPU:
+AES/header15.80%/15.27%,Quinn protocol13.52%/13.78%,BLAKE2b3.98%/3.84%.
+Approximately15% remains unresolved, mainly libc; kernel/off-CPU cost is
+outside these profiles. Code bytes match baseline; instrumented throughput
+is excluded from candidate acceptance.
+
+Crypto compatibility/tamper/AAD checks and release Clippy pass; event candidate
+passes130engine tests. Source and native archives match baseline after revert.
+Full results, profile limits and next optimization direction:
+[AES-GCM and scheduling report](../../docs/hysteria-crypto-scheduling-performance.md).
+Ignored raw artifacts: `build_assets/crypto-scheduling-20261124/`.
