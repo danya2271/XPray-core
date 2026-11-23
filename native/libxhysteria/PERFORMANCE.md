@@ -3085,3 +3085,34 @@ Reproduce via `bench-scaling.sh`. Complete per-core settings, final observations
 CPU profiles, ranges, chart and methodology:
 [scaling report](../../docs/hysteria-core-scaling-performance.md).
 Ignored raw artifacts: `build_assets/core-scaling-20261123/`.
+
+## One/two-core experiment acceptance (2026-11-24)
+
+No runtime patch was retained from the low-core round. Added
+`bench-low-core.py`, seven focused regression tests and final evidence.
+The driver compares before/after native harnesses with the same physical
+affinity, worker budgets and workload; records binary/driver hashes, relevant
+environment and complete drop observations. Failed invocations stop resumption.
+
+Bounded empty send metadata saved 55.5% in a repeated write/transmit/ACK
+microbenchmark, at up to 128 bytes per drained open send stream on amd64.
+Three-pair managed-server medians improved 230.05→231.11 MB/s on one core
+and 412.00→415.68 on two, with zero public UDP/ingress drops in all 24 samples.
+However, combined one-core duplex fell 179.92→172.73 MB/s, and two-core paced
+p99 rose 2226→2370 µs. Two candidate download samples had kernel UDP drops.
+Four/eight-core controls also remained mixed, so the cache was reverted.
+
+The candidate passed 325 release/326 debug proto tests, 130 engine tests,
+release library Clippy, five-package native Go race tests, one/two-core
+compatibility and masked third-party stream checks. Strict UDP delivered
+8000/8000 per budget without sampled kernel drops/duplicates. Six 1000-session
+capacity runs and Android arm64/API26 build passed. Linux native archive,
+harness and Xray binary were restored byte-for-byte to baseline; Android
+was rebuilt from baseline source. No new WAN/device/15-minute-soak claim.
+
+Seven driver tests plus seven scaling tests passed; a live eight-process
+one-core A/B smoke and same-manifest resumption passed.
+Full 120 transport /14 micro /6 capacity observations, prior rejected range
+evidence, historical candidate patch and caveats:
+[low-core report](../../docs/hysteria-low-core-performance.md).
+Ignored raw artifacts: `build_assets/low-core-20261123/`.

@@ -1,0 +1,4081 @@
+{
+  "manifest": {
+    "baseline": "19052c8ebd3650026fa6b2b5d71fb877d1541fce",
+    "candidate": "extend BTreeMap range end in place; unchanged search path",
+    "host": "Xeon E5-2698 v3; 16 physical cores / 32 SMT threads",
+    "end_to_end_scope": "combined client/server/target on CPUs4 or4,5; workers=budget,pool2,32flows",
+    "end_to_end_repeats": 3,
+    "control_scope": "4/8physical cores,4workers per role,pool2/4,3repeats",
+    "managed_scope": "server/ingress/echo on CPU4 or4,5; unchanged baseline load generator on8..15; mixed generations,32flows,3repeats",
+    "binaries": {
+      "interop-before.test": {
+        "sha256": "83f181dd99fba83916b62552730576b7b0528d75626f604ffea2f4b09c9d58ea"
+      },
+      "interop-inplace.test": {
+        "sha256": "967ea834f5b58256297b894ce60124798a17b356bc7d09f461ee673be86728c3"
+      },
+      "xray-before": {
+        "sha256": "0e567bcb6557ab9b2f314fec2343e0f8c263638242a7033c940a4a6b2e48fdeb"
+      },
+      "xray-inplace": {
+        "sha256": "d3a971cf8d51c1030c92cd3b4bc55081f26ec216e324e2cd68f07dac61e1cfba"
+      }
+    },
+    "decision": "rejected;production range-set source reverted",
+    "reason": "37\u201354% insertion micro CPU savings did not establish balanced combined throughput/CPU/p99 improvement"
+  },
+  "low_core": {
+    "observations": [
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 731350.0,
+          "MB/s": 179.22,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 22642.0,
+          "p99-us": 57819.0,
+          "process-cores": 0.9462,
+          "process-cpu-ns/op": 692005.0,
+          "tcp-flows": 32.0,
+          "B/op": 4918.0,
+          "allocs/op": 94.0,
+          "iterations": 8192,
+          "RSS-MiB": 65.3046875
+        },
+        "log": "inplace-n1-r1-before-duplex.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 468191.0,
+          "MB/s": 139.98,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9247,
+          "process-cpu-ns/op": 432963.0,
+          "tcp-flows": 32.0,
+          "B/op": 7509.0,
+          "allocs/op": 53.0,
+          "iterations": 8192,
+          "RSS-MiB": 133.1015625
+        },
+        "log": "inplace-n1-r1-before-upload.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 356663.0,
+          "MB/s": 183.75,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.957,
+          "process-cpu-ns/op": 341338.0,
+          "tcp-flows": 32.0,
+          "B/op": 2630.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 132.7734375
+        },
+        "log": "inplace-n1-r1-before-download.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 252230.0,
+          "background-MiB/s": 63.92,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 136.4,
+          "p99-us": 4422.0,
+          "process-cores": 0.929,
+          "process-cpu-ns/op": 234324.0,
+          "tcp-flows": 32.0,
+          "B/op": 1014.0,
+          "allocs/op": 27.0,
+          "iterations": 10000,
+          "RSS-MiB": 54.171875
+        },
+        "log": "inplace-n1-r1-before-paced.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 745604.0,
+          "MB/s": 175.79,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 23093.0,
+          "p99-us": 62622.0,
+          "process-cores": 0.946,
+          "process-cpu-ns/op": 705325.0,
+          "tcp-flows": 32.0,
+          "B/op": 5105.0,
+          "allocs/op": 95.0,
+          "iterations": 8192,
+          "RSS-MiB": 68.26953125
+        },
+        "log": "inplace-n1-r1-inplace-duplex.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 477586.0,
+          "MB/s": 137.22,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9267,
+          "process-cpu-ns/op": 442572.0,
+          "tcp-flows": 32.0,
+          "B/op": 7351.0,
+          "allocs/op": 52.0,
+          "iterations": 8192,
+          "RSS-MiB": 130.22265625
+        },
+        "log": "inplace-n1-r1-inplace-upload.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 363454.0,
+          "MB/s": 180.31,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9577,
+          "process-cpu-ns/op": 348084.0,
+          "tcp-flows": 32.0,
+          "B/op": 2586.0,
+          "allocs/op": 41.0,
+          "iterations": 8192,
+          "RSS-MiB": 132.23828125
+        },
+        "log": "inplace-n1-r1-inplace-download.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 265457.0,
+          "background-MiB/s": 64.42,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 142.5,
+          "p99-us": 4513.0,
+          "process-cores": 0.9291,
+          "process-cpu-ns/op": 246647.0,
+          "tcp-flows": 32.0,
+          "B/op": 990.0,
+          "allocs/op": 28.0,
+          "iterations": 10000,
+          "RSS-MiB": 52.15625
+        },
+        "log": "inplace-n1-r1-inplace-paced.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 421020.0,
+          "MB/s": 311.32,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 12565.0,
+          "p99-us": 41371.0,
+          "process-cores": 1.789,
+          "process-cpu-ns/op": 753348.0,
+          "tcp-flows": 32.0,
+          "B/op": 5007.0,
+          "allocs/op": 106.0,
+          "iterations": 8192,
+          "RSS-MiB": 68.046875
+        },
+        "log": "inplace-n2-r1-before-duplex.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 231899.0,
+          "MB/s": 282.61,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.731,
+          "process-cpu-ns/op": 401361.0,
+          "tcp-flows": 32.0,
+          "B/op": 6818.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 179.39453125
+        },
+        "log": "inplace-n2-r1-before-upload.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 197370.0,
+          "MB/s": 332.05,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.806,
+          "process-cpu-ns/op": 356528.0,
+          "tcp-flows": 32.0,
+          "B/op": 2392.0,
+          "allocs/op": 44.0,
+          "iterations": 8192,
+          "RSS-MiB": 76.796875
+        },
+        "log": "inplace-n2-r1-before-download.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "before",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 203735.0,
+          "background-MiB/s": 63.96,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 145.1,
+          "p99-us": 2153.0,
+          "process-cores": 1.414,
+          "process-cpu-ns/op": 288030.0,
+          "tcp-flows": 32.0,
+          "B/op": 881.0,
+          "allocs/op": 26.0,
+          "iterations": 10000,
+          "RSS-MiB": 56.4140625
+        },
+        "log": "inplace-n2-r1-before-paced.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 429755.0,
+          "MB/s": 304.99,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 12792.0,
+          "p99-us": 50550.0,
+          "process-cores": 1.797,
+          "process-cpu-ns/op": 772325.0,
+          "tcp-flows": 32.0,
+          "B/op": 5009.0,
+          "allocs/op": 106.0,
+          "iterations": 8192,
+          "RSS-MiB": 66.8515625
+        },
+        "log": "inplace-n2-r1-inplace-duplex.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 235066.0,
+          "MB/s": 278.8,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.734,
+          "process-cpu-ns/op": 407603.0,
+          "tcp-flows": 32.0,
+          "B/op": 6966.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 174.06640625
+        },
+        "log": "inplace-n2-r1-inplace-upload.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 204824.0,
+          "MB/s": 319.96,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.81,
+          "process-cpu-ns/op": 370698.0,
+          "tcp-flows": 32.0,
+          "B/op": 2401.0,
+          "allocs/op": 45.0,
+          "iterations": 8192,
+          "RSS-MiB": 86.28515625
+        },
+        "log": "inplace-n2-r1-inplace-download.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 1,
+        "revision": "inplace",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 208339.0,
+          "background-MiB/s": 64.24,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 149.7,
+          "p99-us": 2261.0,
+          "process-cores": 1.426,
+          "process-cpu-ns/op": 296999.0,
+          "tcp-flows": 32.0,
+          "B/op": 895.0,
+          "allocs/op": 26.0,
+          "iterations": 10000,
+          "RSS-MiB": 51.625
+        },
+        "log": "inplace-n2-r1-inplace-paced.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 431843.0,
+          "MB/s": 303.52,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 12811.0,
+          "p99-us": 41749.0,
+          "process-cores": 1.789,
+          "process-cpu-ns/op": 772623.0,
+          "tcp-flows": 32.0,
+          "B/op": 4947.0,
+          "allocs/op": 105.0,
+          "iterations": 8192,
+          "RSS-MiB": 67.06640625
+        },
+        "log": "inplace-n2-r2-inplace-duplex.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 235419.0,
+          "MB/s": 278.38,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.742,
+          "process-cpu-ns/op": 410015.0,
+          "tcp-flows": 32.0,
+          "B/op": 7049.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 184.7890625
+        },
+        "log": "inplace-n2-r2-inplace-upload.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 208895.0,
+          "MB/s": 313.73,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.807,
+          "process-cpu-ns/op": 377464.0,
+          "tcp-flows": 32.0,
+          "B/op": 2673.0,
+          "allocs/op": 44.0,
+          "iterations": 8192,
+          "RSS-MiB": 92.19140625
+        },
+        "log": "inplace-n2-r2-inplace-download.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 201990.0,
+          "background-MiB/s": 64.03,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 148.0,
+          "p99-us": 2110.0,
+          "process-cores": 1.42,
+          "process-cpu-ns/op": 286881.0,
+          "tcp-flows": 32.0,
+          "B/op": 855.0,
+          "allocs/op": 26.0,
+          "iterations": 10000,
+          "RSS-MiB": 53.68359375
+        },
+        "log": "inplace-n2-r2-inplace-paced.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 425607.0,
+          "MB/s": 307.97,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 12687.0,
+          "p99-us": 45519.0,
+          "process-cores": 1.785,
+          "process-cpu-ns/op": 759805.0,
+          "tcp-flows": 32.0,
+          "B/op": 4977.0,
+          "allocs/op": 106.0,
+          "iterations": 8192,
+          "RSS-MiB": 68.64453125
+        },
+        "log": "inplace-n2-r2-before-duplex.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 227912.0,
+          "MB/s": 287.55,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.753,
+          "process-cpu-ns/op": 399538.0,
+          "tcp-flows": 32.0,
+          "B/op": 6993.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 163.171875
+        },
+        "log": "inplace-n2-r2-before-upload.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 197517.0,
+          "MB/s": 331.8,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.816,
+          "process-cpu-ns/op": 358629.0,
+          "tcp-flows": 32.0,
+          "B/op": 2428.0,
+          "allocs/op": 44.0,
+          "iterations": 8192,
+          "RSS-MiB": 72.33984375
+        },
+        "log": "inplace-n2-r2-before-download.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 204306.0,
+          "background-MiB/s": 64.48,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 145.5,
+          "p99-us": 2252.0,
+          "process-cores": 1.415,
+          "process-cpu-ns/op": 289126.0,
+          "tcp-flows": 32.0,
+          "B/op": 900.0,
+          "allocs/op": 26.0,
+          "iterations": 10000,
+          "RSS-MiB": 56.1328125
+        },
+        "log": "inplace-n2-r2-before-paced.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 753353.0,
+          "MB/s": 173.98,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 23388.0,
+          "p99-us": 64216.0,
+          "process-cores": 0.9455,
+          "process-cpu-ns/op": 712326.0,
+          "tcp-flows": 32.0,
+          "B/op": 5084.0,
+          "allocs/op": 95.0,
+          "iterations": 8192,
+          "RSS-MiB": 63.35546875
+        },
+        "log": "inplace-n1-r2-inplace-duplex.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 369355.0,
+          "MB/s": 177.43,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9449,
+          "process-cpu-ns/op": 349014.0,
+          "tcp-flows": 32.0,
+          "B/op": 7020.0,
+          "allocs/op": 38.0,
+          "iterations": 8192,
+          "RSS-MiB": 154.15625
+        },
+        "log": "inplace-n1-r2-inplace-upload.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 352604.0,
+          "MB/s": 185.86,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9562,
+          "process-cpu-ns/op": 337157.0,
+          "tcp-flows": 32.0,
+          "B/op": 2709.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 85.44140625
+        },
+        "log": "inplace-n1-r2-inplace-download.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "inplace",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 253403.0,
+          "background-MiB/s": 64.32,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 139.9,
+          "p99-us": 4502.0,
+          "process-cores": 0.9295,
+          "process-cpu-ns/op": 235532.0,
+          "tcp-flows": 32.0,
+          "B/op": 967.0,
+          "allocs/op": 27.0,
+          "iterations": 10000,
+          "RSS-MiB": 52.296875
+        },
+        "log": "inplace-n1-r2-inplace-paced.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 742641.0,
+          "MB/s": 176.49,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 22977.0,
+          "p99-us": 59676.0,
+          "process-cores": 0.946,
+          "process-cpu-ns/op": 702551.0,
+          "tcp-flows": 32.0,
+          "B/op": 5075.0,
+          "allocs/op": 95.0,
+          "iterations": 8192,
+          "RSS-MiB": 67.30859375
+        },
+        "log": "inplace-n1-r2-before-duplex.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 366070.0,
+          "MB/s": 179.03,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9448,
+          "process-cpu-ns/op": 345850.0,
+          "tcp-flows": 32.0,
+          "B/op": 6778.0,
+          "allocs/op": 38.0,
+          "iterations": 8192,
+          "RSS-MiB": 163.82421875
+        },
+        "log": "inplace-n1-r2-before-upload.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 348132.0,
+          "MB/s": 188.25,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9557,
+          "process-cpu-ns/op": 332710.0,
+          "tcp-flows": 32.0,
+          "B/op": 2595.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 88.26171875
+        },
+        "log": "inplace-n1-r2-before-download.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 2,
+        "revision": "before",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 244784.0,
+          "background-MiB/s": 64.43,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 135.5,
+          "p99-us": 4607.0,
+          "process-cores": 0.9291,
+          "process-cpu-ns/op": 227419.0,
+          "tcp-flows": 32.0,
+          "B/op": 991.0,
+          "allocs/op": 27.0,
+          "iterations": 10000,
+          "RSS-MiB": 56.5703125
+        },
+        "log": "inplace-n1-r2-before-paced.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 728657.0,
+          "MB/s": 179.88,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 22692.0,
+          "p99-us": 66239.0,
+          "process-cores": 0.9423,
+          "process-cpu-ns/op": 686628.0,
+          "tcp-flows": 32.0,
+          "B/op": 5073.0,
+          "allocs/op": 94.0,
+          "iterations": 8192,
+          "RSS-MiB": 65.70703125
+        },
+        "log": "inplace-n1-r3-before-duplex.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 365583.0,
+          "MB/s": 179.26,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.945,
+          "process-cpu-ns/op": 345477.0,
+          "tcp-flows": 32.0,
+          "B/op": 6982.0,
+          "allocs/op": 38.0,
+          "iterations": 8192,
+          "RSS-MiB": 170.890625
+        },
+        "log": "inplace-n1-r3-before-upload.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 363129.0,
+          "MB/s": 180.48,
+          "kernel-udp-drops": 10.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9573,
+          "process-cpu-ns/op": 347637.0,
+          "tcp-flows": 32.0,
+          "B/op": 2563.0,
+          "allocs/op": 40.0,
+          "iterations": 8192,
+          "RSS-MiB": 135.90234375
+        },
+        "log": "inplace-n1-r3-before-download.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 252320.0,
+          "background-MiB/s": 64.2,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 135.5,
+          "p99-us": 3864.0,
+          "process-cores": 0.9258,
+          "process-cpu-ns/op": 233610.0,
+          "tcp-flows": 32.0,
+          "B/op": 947.0,
+          "allocs/op": 27.0,
+          "iterations": 10000,
+          "RSS-MiB": 55.671875
+        },
+        "log": "inplace-n1-r3-before-paced.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 740588.0,
+          "MB/s": 176.98,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 23359.0,
+          "p99-us": 58054.0,
+          "process-cores": 0.9414,
+          "process-cpu-ns/op": 697219.0,
+          "tcp-flows": 32.0,
+          "B/op": 4964.0,
+          "allocs/op": 93.0,
+          "iterations": 8192,
+          "RSS-MiB": 65.64453125
+        },
+        "log": "inplace-n1-r3-inplace-duplex.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 369071.0,
+          "MB/s": 177.57,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.946,
+          "process-cpu-ns/op": 349138.0,
+          "tcp-flows": 32.0,
+          "B/op": 6915.0,
+          "allocs/op": 38.0,
+          "iterations": 8192,
+          "RSS-MiB": 147.6171875
+        },
+        "log": "inplace-n1-r3-inplace-upload.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 361744.0,
+          "MB/s": 181.17,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 0.9574,
+          "process-cpu-ns/op": 346339.0,
+          "tcp-flows": 32.0,
+          "B/op": 2611.0,
+          "allocs/op": 41.0,
+          "iterations": 8192,
+          "RSS-MiB": 136.0078125
+        },
+        "log": "inplace-n1-r3-inplace-download.log"
+      },
+      {
+        "cores": 1,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 259803.0,
+          "background-MiB/s": 64.09,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 139.4,
+          "p99-us": 4788.0,
+          "process-cores": 0.9284,
+          "process-cpu-ns/op": 241202.0,
+          "tcp-flows": 32.0,
+          "B/op": 1056.0,
+          "allocs/op": 29.0,
+          "iterations": 10000,
+          "RSS-MiB": 52.62109375
+        },
+        "log": "inplace-n1-r3-inplace-paced.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 418847.0,
+          "MB/s": 312.93,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 12583.0,
+          "p99-us": 48118.0,
+          "process-cores": 1.798,
+          "process-cpu-ns/op": 753173.0,
+          "tcp-flows": 32.0,
+          "B/op": 5078.0,
+          "allocs/op": 106.0,
+          "iterations": 8192,
+          "RSS-MiB": 68.30078125
+        },
+        "log": "inplace-n2-r3-before-duplex.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 232371.0,
+          "MB/s": 282.03,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.735,
+          "process-cpu-ns/op": 403281.0,
+          "tcp-flows": 32.0,
+          "B/op": 6793.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 173.83984375
+        },
+        "log": "inplace-n2-r3-before-upload.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 198924.0,
+          "MB/s": 329.45,
+          "kernel-udp-drops": 12.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.815,
+          "process-cpu-ns/op": 360957.0,
+          "tcp-flows": 32.0,
+          "B/op": 2418.0,
+          "allocs/op": 44.0,
+          "iterations": 8192,
+          "RSS-MiB": 79.1953125
+        },
+        "log": "inplace-n2-r3-before-download.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "before",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 200509.0,
+          "background-MiB/s": 64.18,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 144.1,
+          "p99-us": 2257.0,
+          "process-cores": 1.408,
+          "process-cpu-ns/op": 282256.0,
+          "tcp-flows": 32.0,
+          "B/op": 867.0,
+          "allocs/op": 26.0,
+          "iterations": 10000,
+          "RSS-MiB": 55.515625
+        },
+        "log": "inplace-n2-r3-before-paced.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "duplex",
+        "metrics": {
+          "ns/op": 427748.0,
+          "MB/s": 306.42,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 12758.0,
+          "p99-us": 46076.0,
+          "process-cores": 1.786,
+          "process-cpu-ns/op": 763927.0,
+          "tcp-flows": 32.0,
+          "B/op": 5404.0,
+          "allocs/op": 106.0,
+          "iterations": 8192,
+          "RSS-MiB": 66.87890625
+        },
+        "log": "inplace-n2-r3-inplace-duplex.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "upload",
+        "metrics": {
+          "ns/op": 230866.0,
+          "MB/s": 283.87,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.746,
+          "process-cpu-ns/op": 403200.0,
+          "tcp-flows": 32.0,
+          "B/op": 6966.0,
+          "allocs/op": 42.0,
+          "iterations": 8192,
+          "RSS-MiB": 178.8984375
+        },
+        "log": "inplace-n2-r3-inplace-upload.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "download",
+        "metrics": {
+          "ns/op": 206197.0,
+          "MB/s": 317.83,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "process-cores": 1.813,
+          "process-cpu-ns/op": 373872.0,
+          "tcp-flows": 32.0,
+          "B/op": 2459.0,
+          "allocs/op": 44.0,
+          "iterations": 8192,
+          "RSS-MiB": 88.73046875
+        },
+        "log": "inplace-n2-r3-inplace-download.log"
+      },
+      {
+        "cores": 2,
+        "repeat": 3,
+        "revision": "inplace",
+        "kind": "paced",
+        "metrics": {
+          "ns/op": 206656.0,
+          "background-MiB/s": 63.87,
+          "kernel-udp-drops": 0.0,
+          "native-client-engines": 2.0,
+          "p50-us": 147.4,
+          "p99-us": 2265.0,
+          "process-cores": 1.419,
+          "process-cpu-ns/op": 293218.0,
+          "tcp-flows": 32.0,
+          "B/op": 880.0,
+          "allocs/op": 26.0,
+          "iterations": 10000,
+          "RSS-MiB": 54.46484375
+        },
+        "log": "inplace-n2-r3-inplace-paced.log"
+      }
+    ],
+    "summary": [
+      {
+        "cores": 1,
+        "kind": "duplex",
+        "before": {
+          "ns/op": {
+            "median": 731350.0,
+            "min": 728657.0,
+            "max": 742641.0
+          },
+          "MB/s": {
+            "median": 179.22,
+            "min": 176.49,
+            "max": 179.88
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 22692.0,
+            "min": 22642.0,
+            "max": 22977.0
+          },
+          "p99-us": {
+            "median": 59676.0,
+            "min": 57819.0,
+            "max": 66239.0
+          },
+          "process-cores": {
+            "median": 0.946,
+            "min": 0.9423,
+            "max": 0.9462
+          },
+          "process-cpu-ns/op": {
+            "median": 692005.0,
+            "min": 686628.0,
+            "max": 702551.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 5073.0,
+            "min": 4918.0,
+            "max": 5075.0
+          },
+          "allocs/op": {
+            "median": 94.0,
+            "min": 94.0,
+            "max": 95.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 65.70703125,
+            "min": 65.3046875,
+            "max": 67.30859375
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 745604.0,
+            "min": 740588.0,
+            "max": 753353.0
+          },
+          "MB/s": {
+            "median": 175.79,
+            "min": 173.98,
+            "max": 176.98
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 23359.0,
+            "min": 23093.0,
+            "max": 23388.0
+          },
+          "p99-us": {
+            "median": 62622.0,
+            "min": 58054.0,
+            "max": 64216.0
+          },
+          "process-cores": {
+            "median": 0.9455,
+            "min": 0.9414,
+            "max": 0.946
+          },
+          "process-cpu-ns/op": {
+            "median": 705325.0,
+            "min": 697219.0,
+            "max": 712326.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 5084.0,
+            "min": 4964.0,
+            "max": 5105.0
+          },
+          "allocs/op": {
+            "median": 95.0,
+            "min": 93.0,
+            "max": 95.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 65.64453125,
+            "min": 63.35546875,
+            "max": 68.26953125
+          }
+        }
+      },
+      {
+        "cores": 1,
+        "kind": "upload",
+        "before": {
+          "ns/op": {
+            "median": 366070.0,
+            "min": 365583.0,
+            "max": 468191.0
+          },
+          "MB/s": {
+            "median": 179.03,
+            "min": 139.98,
+            "max": 179.26
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 0.9448,
+            "min": 0.9247,
+            "max": 0.945
+          },
+          "process-cpu-ns/op": {
+            "median": 345850.0,
+            "min": 345477.0,
+            "max": 432963.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 6982.0,
+            "min": 6778.0,
+            "max": 7509.0
+          },
+          "allocs/op": {
+            "median": 38.0,
+            "min": 38.0,
+            "max": 53.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 163.82421875,
+            "min": 133.1015625,
+            "max": 170.890625
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 369355.0,
+            "min": 369071.0,
+            "max": 477586.0
+          },
+          "MB/s": {
+            "median": 177.43,
+            "min": 137.22,
+            "max": 177.57
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 0.9449,
+            "min": 0.9267,
+            "max": 0.946
+          },
+          "process-cpu-ns/op": {
+            "median": 349138.0,
+            "min": 349014.0,
+            "max": 442572.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 7020.0,
+            "min": 6915.0,
+            "max": 7351.0
+          },
+          "allocs/op": {
+            "median": 38.0,
+            "min": 38.0,
+            "max": 52.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 147.6171875,
+            "min": 130.22265625,
+            "max": 154.15625
+          }
+        }
+      },
+      {
+        "cores": 1,
+        "kind": "download",
+        "before": {
+          "ns/op": {
+            "median": 356663.0,
+            "min": 348132.0,
+            "max": 363129.0
+          },
+          "MB/s": {
+            "median": 183.75,
+            "min": 180.48,
+            "max": 188.25
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 10.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 0.957,
+            "min": 0.9557,
+            "max": 0.9573
+          },
+          "process-cpu-ns/op": {
+            "median": 341338.0,
+            "min": 332710.0,
+            "max": 347637.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 2595.0,
+            "min": 2563.0,
+            "max": 2630.0
+          },
+          "allocs/op": {
+            "median": 42.0,
+            "min": 40.0,
+            "max": 42.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 132.7734375,
+            "min": 88.26171875,
+            "max": 135.90234375
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 361744.0,
+            "min": 352604.0,
+            "max": 363454.0
+          },
+          "MB/s": {
+            "median": 181.17,
+            "min": 180.31,
+            "max": 185.86
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 0.9574,
+            "min": 0.9562,
+            "max": 0.9577
+          },
+          "process-cpu-ns/op": {
+            "median": 346339.0,
+            "min": 337157.0,
+            "max": 348084.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 2611.0,
+            "min": 2586.0,
+            "max": 2709.0
+          },
+          "allocs/op": {
+            "median": 41.0,
+            "min": 41.0,
+            "max": 42.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 132.23828125,
+            "min": 85.44140625,
+            "max": 136.0078125
+          }
+        }
+      },
+      {
+        "cores": 1,
+        "kind": "paced",
+        "before": {
+          "ns/op": {
+            "median": 252230.0,
+            "min": 244784.0,
+            "max": 252320.0
+          },
+          "background-MiB/s": {
+            "median": 64.2,
+            "min": 63.92,
+            "max": 64.43
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 135.5,
+            "min": 135.5,
+            "max": 136.4
+          },
+          "p99-us": {
+            "median": 4422.0,
+            "min": 3864.0,
+            "max": 4607.0
+          },
+          "process-cores": {
+            "median": 0.929,
+            "min": 0.9258,
+            "max": 0.9291
+          },
+          "process-cpu-ns/op": {
+            "median": 233610.0,
+            "min": 227419.0,
+            "max": 234324.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 991.0,
+            "min": 947.0,
+            "max": 1014.0
+          },
+          "allocs/op": {
+            "median": 27.0,
+            "min": 27.0,
+            "max": 27.0
+          },
+          "iterations": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "RSS-MiB": {
+            "median": 55.671875,
+            "min": 54.171875,
+            "max": 56.5703125
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 259803.0,
+            "min": 253403.0,
+            "max": 265457.0
+          },
+          "background-MiB/s": {
+            "median": 64.32,
+            "min": 64.09,
+            "max": 64.42
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 139.9,
+            "min": 139.4,
+            "max": 142.5
+          },
+          "p99-us": {
+            "median": 4513.0,
+            "min": 4502.0,
+            "max": 4788.0
+          },
+          "process-cores": {
+            "median": 0.9291,
+            "min": 0.9284,
+            "max": 0.9295
+          },
+          "process-cpu-ns/op": {
+            "median": 241202.0,
+            "min": 235532.0,
+            "max": 246647.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 990.0,
+            "min": 967.0,
+            "max": 1056.0
+          },
+          "allocs/op": {
+            "median": 28.0,
+            "min": 27.0,
+            "max": 29.0
+          },
+          "iterations": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "RSS-MiB": {
+            "median": 52.296875,
+            "min": 52.15625,
+            "max": 52.62109375
+          }
+        }
+      },
+      {
+        "cores": 2,
+        "kind": "duplex",
+        "before": {
+          "ns/op": {
+            "median": 421020.0,
+            "min": 418847.0,
+            "max": 425607.0
+          },
+          "MB/s": {
+            "median": 311.32,
+            "min": 307.97,
+            "max": 312.93
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 12583.0,
+            "min": 12565.0,
+            "max": 12687.0
+          },
+          "p99-us": {
+            "median": 45519.0,
+            "min": 41371.0,
+            "max": 48118.0
+          },
+          "process-cores": {
+            "median": 1.789,
+            "min": 1.785,
+            "max": 1.798
+          },
+          "process-cpu-ns/op": {
+            "median": 753348.0,
+            "min": 753173.0,
+            "max": 759805.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 5007.0,
+            "min": 4977.0,
+            "max": 5078.0
+          },
+          "allocs/op": {
+            "median": 106.0,
+            "min": 106.0,
+            "max": 106.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 68.30078125,
+            "min": 68.046875,
+            "max": 68.64453125
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 429755.0,
+            "min": 427748.0,
+            "max": 431843.0
+          },
+          "MB/s": {
+            "median": 304.99,
+            "min": 303.52,
+            "max": 306.42
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 12792.0,
+            "min": 12758.0,
+            "max": 12811.0
+          },
+          "p99-us": {
+            "median": 46076.0,
+            "min": 41749.0,
+            "max": 50550.0
+          },
+          "process-cores": {
+            "median": 1.789,
+            "min": 1.786,
+            "max": 1.797
+          },
+          "process-cpu-ns/op": {
+            "median": 772325.0,
+            "min": 763927.0,
+            "max": 772623.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 5009.0,
+            "min": 4947.0,
+            "max": 5404.0
+          },
+          "allocs/op": {
+            "median": 106.0,
+            "min": 105.0,
+            "max": 106.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 66.87890625,
+            "min": 66.8515625,
+            "max": 67.06640625
+          }
+        }
+      },
+      {
+        "cores": 2,
+        "kind": "upload",
+        "before": {
+          "ns/op": {
+            "median": 231899.0,
+            "min": 227912.0,
+            "max": 232371.0
+          },
+          "MB/s": {
+            "median": 282.61,
+            "min": 282.03,
+            "max": 287.55
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 1.735,
+            "min": 1.731,
+            "max": 1.753
+          },
+          "process-cpu-ns/op": {
+            "median": 401361.0,
+            "min": 399538.0,
+            "max": 403281.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 6818.0,
+            "min": 6793.0,
+            "max": 6993.0
+          },
+          "allocs/op": {
+            "median": 42.0,
+            "min": 42.0,
+            "max": 42.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 173.83984375,
+            "min": 163.171875,
+            "max": 179.39453125
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 235066.0,
+            "min": 230866.0,
+            "max": 235419.0
+          },
+          "MB/s": {
+            "median": 278.8,
+            "min": 278.38,
+            "max": 283.87
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 1.742,
+            "min": 1.734,
+            "max": 1.746
+          },
+          "process-cpu-ns/op": {
+            "median": 407603.0,
+            "min": 403200.0,
+            "max": 410015.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 6966.0,
+            "min": 6966.0,
+            "max": 7049.0
+          },
+          "allocs/op": {
+            "median": 42.0,
+            "min": 42.0,
+            "max": 42.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 178.8984375,
+            "min": 174.06640625,
+            "max": 184.7890625
+          }
+        }
+      },
+      {
+        "cores": 2,
+        "kind": "download",
+        "before": {
+          "ns/op": {
+            "median": 197517.0,
+            "min": 197370.0,
+            "max": 198924.0
+          },
+          "MB/s": {
+            "median": 331.8,
+            "min": 329.45,
+            "max": 332.05
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 12.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 1.815,
+            "min": 1.806,
+            "max": 1.816
+          },
+          "process-cpu-ns/op": {
+            "median": 358629.0,
+            "min": 356528.0,
+            "max": 360957.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 2418.0,
+            "min": 2392.0,
+            "max": 2428.0
+          },
+          "allocs/op": {
+            "median": 44.0,
+            "min": 44.0,
+            "max": 44.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 76.796875,
+            "min": 72.33984375,
+            "max": 79.1953125
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 206197.0,
+            "min": 204824.0,
+            "max": 208895.0
+          },
+          "MB/s": {
+            "median": 317.83,
+            "min": 313.73,
+            "max": 319.96
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "process-cores": {
+            "median": 1.81,
+            "min": 1.807,
+            "max": 1.813
+          },
+          "process-cpu-ns/op": {
+            "median": 373872.0,
+            "min": 370698.0,
+            "max": 377464.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 2459.0,
+            "min": 2401.0,
+            "max": 2673.0
+          },
+          "allocs/op": {
+            "median": 44.0,
+            "min": 44.0,
+            "max": 45.0
+          },
+          "iterations": {
+            "median": 8192,
+            "min": 8192,
+            "max": 8192
+          },
+          "RSS-MiB": {
+            "median": 88.73046875,
+            "min": 86.28515625,
+            "max": 92.19140625
+          }
+        }
+      },
+      {
+        "cores": 2,
+        "kind": "paced",
+        "before": {
+          "ns/op": {
+            "median": 203735.0,
+            "min": 200509.0,
+            "max": 204306.0
+          },
+          "background-MiB/s": {
+            "median": 64.18,
+            "min": 63.96,
+            "max": 64.48
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 145.1,
+            "min": 144.1,
+            "max": 145.5
+          },
+          "p99-us": {
+            "median": 2252.0,
+            "min": 2153.0,
+            "max": 2257.0
+          },
+          "process-cores": {
+            "median": 1.414,
+            "min": 1.408,
+            "max": 1.415
+          },
+          "process-cpu-ns/op": {
+            "median": 288030.0,
+            "min": 282256.0,
+            "max": 289126.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 881.0,
+            "min": 867.0,
+            "max": 900.0
+          },
+          "allocs/op": {
+            "median": 26.0,
+            "min": 26.0,
+            "max": 26.0
+          },
+          "iterations": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "RSS-MiB": {
+            "median": 56.1328125,
+            "min": 55.515625,
+            "max": 56.4140625
+          }
+        },
+        "inplace": {
+          "ns/op": {
+            "median": 206656.0,
+            "min": 201990.0,
+            "max": 208339.0
+          },
+          "background-MiB/s": {
+            "median": 64.03,
+            "min": 63.87,
+            "max": 64.24
+          },
+          "kernel-udp-drops": {
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "native-client-engines": {
+            "median": 2.0,
+            "min": 2.0,
+            "max": 2.0
+          },
+          "p50-us": {
+            "median": 148.0,
+            "min": 147.4,
+            "max": 149.7
+          },
+          "p99-us": {
+            "median": 2261.0,
+            "min": 2110.0,
+            "max": 2265.0
+          },
+          "process-cores": {
+            "median": 1.42,
+            "min": 1.419,
+            "max": 1.426
+          },
+          "process-cpu-ns/op": {
+            "median": 293218.0,
+            "min": 286881.0,
+            "max": 296999.0
+          },
+          "tcp-flows": {
+            "median": 32.0,
+            "min": 32.0,
+            "max": 32.0
+          },
+          "B/op": {
+            "median": 880.0,
+            "min": 855.0,
+            "max": 895.0
+          },
+          "allocs/op": {
+            "median": 26.0,
+            "min": 26.0,
+            "max": 26.0
+          },
+          "iterations": {
+            "median": 10000,
+            "min": 10000,
+            "max": 10000
+          },
+          "RSS-MiB": {
+            "median": 53.68359375,
+            "min": 51.625,
+            "max": 54.46484375
+          }
+        }
+      }
+    ]
+  },
+  "controls": [
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 281689.0,
+        "MB/s": 465.31,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 8147.0,
+        "p99-us": 30078.0,
+        "process-cores": 3.227,
+        "process-cpu-ns/op": 908963.0,
+        "tcp-flows": 32.0,
+        "B/op": 5139.0,
+        "allocs/op": 111.0,
+        "iterations": 8192,
+        "RSS-MiB": 69.64453125
+      },
+      "log": "inplace-control-n4-r1-before-duplex.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 147585.0,
+        "MB/s": 444.05,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.133,
+        "process-cpu-ns/op": 462439.0,
+        "tcp-flows": 32.0,
+        "B/op": 7186.0,
+        "allocs/op": 46.0,
+        "iterations": 8192,
+        "RSS-MiB": 177.359375
+      },
+      "log": "inplace-control-n4-r1-before-upload.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 140486.0,
+        "MB/s": 466.49,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.123,
+        "process-cpu-ns/op": 438832.0,
+        "tcp-flows": 32.0,
+        "B/op": 2539.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 93.66796875
+      },
+      "log": "inplace-control-n4-r1-before-download.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 149092.0,
+        "background-MiB/s": 63.72,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 121.4,
+        "p99-us": 916.2,
+        "process-cores": 1.682,
+        "process-cpu-ns/op": 250820.0,
+        "tcp-flows": 32.0,
+        "B/op": 743.0,
+        "allocs/op": 22.0,
+        "iterations": 10000,
+        "RSS-MiB": 55.62109375
+      },
+      "log": "inplace-control-n4-r1-before-paced.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 280857.0,
+        "MB/s": 466.69,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 8147.0,
+        "p99-us": 30029.0,
+        "process-cores": 3.239,
+        "process-cpu-ns/op": 909773.0,
+        "tcp-flows": 32.0,
+        "B/op": 5102.0,
+        "allocs/op": 111.0,
+        "iterations": 8192,
+        "RSS-MiB": 68.64453125
+      },
+      "log": "inplace-control-n4-r1-inplace-duplex.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 149185.0,
+        "MB/s": 439.29,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.129,
+        "process-cpu-ns/op": 466752.0,
+        "tcp-flows": 32.0,
+        "B/op": 7017.0,
+        "allocs/op": 46.0,
+        "iterations": 8192,
+        "RSS-MiB": 187.4453125
+      },
+      "log": "inplace-control-n4-r1-inplace-upload.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 140924.0,
+        "MB/s": 465.04,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.139,
+        "process-cpu-ns/op": 442398.0,
+        "tcp-flows": 32.0,
+        "B/op": 2561.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 86.74609375
+      },
+      "log": "inplace-control-n4-r1-inplace-download.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 153538.0,
+        "background-MiB/s": 63.83,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 125.0,
+        "p99-us": 1220.0,
+        "process-cores": 1.651,
+        "process-cpu-ns/op": 253519.0,
+        "tcp-flows": 32.0,
+        "B/op": 772.0,
+        "allocs/op": 23.0,
+        "iterations": 10000,
+        "RSS-MiB": 54.35546875
+      },
+      "log": "inplace-control-n4-r1-inplace-paced.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 192282.0,
+        "MB/s": 681.67,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 5167.0,
+        "p99-us": 20424.0,
+        "process-cores": 5.801,
+        "process-cpu-ns/op": 1115393.0,
+        "tcp-flows": 32.0,
+        "B/op": 5335.0,
+        "allocs/op": 116.0,
+        "iterations": 8192,
+        "RSS-MiB": 71.71484375
+      },
+      "log": "inplace-control-n8-r1-before-duplex.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 107740.0,
+        "MB/s": 608.28,
+        "kernel-udp-drops": 7035.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.54,
+        "process-cpu-ns/op": 596941.0,
+        "tcp-flows": 32.0,
+        "B/op": 7400.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 205.98828125
+      },
+      "log": "inplace-control-n8-r1-before-upload.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 95269.0,
+        "MB/s": 687.9,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.489,
+        "process-cpu-ns/op": 522965.0,
+        "tcp-flows": 32.0,
+        "B/op": 2556.0,
+        "allocs/op": 52.0,
+        "iterations": 8192,
+        "RSS-MiB": 107.984375
+      },
+      "log": "inplace-control-n8-r1-before-download.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 120632.0,
+        "background-MiB/s": 63.83,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 103.9,
+        "p99-us": 669.7,
+        "process-cores": 1.922,
+        "process-cpu-ns/op": 231919.0,
+        "tcp-flows": 32.0,
+        "B/op": 661.0,
+        "allocs/op": 21.0,
+        "iterations": 10000,
+        "RSS-MiB": 56.80078125
+      },
+      "log": "inplace-control-n8-r1-before-paced.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 189885.0,
+        "MB/s": 690.27,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 5206.0,
+        "p99-us": 19896.0,
+        "process-cores": 5.897,
+        "process-cpu-ns/op": 1119698.0,
+        "tcp-flows": 32.0,
+        "B/op": 5274.0,
+        "allocs/op": 115.0,
+        "iterations": 8192,
+        "RSS-MiB": 68.1015625
+      },
+      "log": "inplace-control-n8-r1-inplace-duplex.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 109056.0,
+        "MB/s": 600.94,
+        "kernel-udp-drops": 3134.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.419,
+        "process-cpu-ns/op": 591000.0,
+        "tcp-flows": 32.0,
+        "B/op": 7282.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 215.80078125
+      },
+      "log": "inplace-control-n8-r1-inplace-upload.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 93307.0,
+        "MB/s": 702.37,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.48,
+        "process-cpu-ns/op": 511420.0,
+        "tcp-flows": 32.0,
+        "B/op": 2552.0,
+        "allocs/op": 51.0,
+        "iterations": 8192,
+        "RSS-MiB": 101.63671875
+      },
+      "log": "inplace-control-n8-r1-inplace-download.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 123867.0,
+        "background-MiB/s": 63.77,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 106.0,
+        "p99-us": 682.1,
+        "process-cores": 1.936,
+        "process-cpu-ns/op": 239884.0,
+        "tcp-flows": 32.0,
+        "B/op": 719.0,
+        "allocs/op": 22.0,
+        "iterations": 10000,
+        "RSS-MiB": 54.8203125
+      },
+      "log": "inplace-control-n8-r1-inplace-paced.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 190441.0,
+        "MB/s": 688.26,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 5289.0,
+        "p99-us": 19291.0,
+        "process-cores": 5.909,
+        "process-cpu-ns/op": 1125318.0,
+        "tcp-flows": 32.0,
+        "B/op": 5256.0,
+        "allocs/op": 115.0,
+        "iterations": 8192,
+        "RSS-MiB": 67.9296875
+      },
+      "log": "inplace-control-n8-r2-inplace-duplex.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 107204.0,
+        "MB/s": 611.32,
+        "kernel-udp-drops": 4689.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.554,
+        "process-cpu-ns/op": 595443.0,
+        "tcp-flows": 32.0,
+        "B/op": 7335.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 223.87109375
+      },
+      "log": "inplace-control-n8-r2-inplace-upload.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 93276.0,
+        "MB/s": 702.6,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.488,
+        "process-cpu-ns/op": 511933.0,
+        "tcp-flows": 32.0,
+        "B/op": 2463.0,
+        "allocs/op": 49.0,
+        "iterations": 8192,
+        "RSS-MiB": 103.65625
+      },
+      "log": "inplace-control-n8-r2-inplace-download.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 126109.0,
+        "background-MiB/s": 64.23,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 107.2,
+        "p99-us": 687.2,
+        "process-cores": 1.906,
+        "process-cpu-ns/op": 240329.0,
+        "tcp-flows": 32.0,
+        "B/op": 717.0,
+        "allocs/op": 22.0,
+        "iterations": 10000,
+        "RSS-MiB": 55.2734375
+      },
+      "log": "inplace-control-n8-r2-inplace-paced.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 185357.0,
+        "MB/s": 707.13,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 5135.0,
+        "p99-us": 19834.0,
+        "process-cores": 5.926,
+        "process-cpu-ns/op": 1098516.0,
+        "tcp-flows": 32.0,
+        "B/op": 5293.0,
+        "allocs/op": 115.0,
+        "iterations": 8192,
+        "RSS-MiB": 70.171875
+      },
+      "log": "inplace-control-n8-r2-before-duplex.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 107446.0,
+        "MB/s": 609.95,
+        "kernel-udp-drops": 2633.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.424,
+        "process-cpu-ns/op": 582826.0,
+        "tcp-flows": 32.0,
+        "B/op": 7206.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 217.53515625
+      },
+      "log": "inplace-control-n8-r2-before-upload.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 91851.0,
+        "MB/s": 713.51,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.547,
+        "process-cpu-ns/op": 509595.0,
+        "tcp-flows": 32.0,
+        "B/op": 2526.0,
+        "allocs/op": 51.0,
+        "iterations": 8192,
+        "RSS-MiB": 101.52734375
+      },
+      "log": "inplace-control-n8-r2-before-download.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 122229.0,
+        "background-MiB/s": 63.81,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 103.9,
+        "p99-us": 659.2,
+        "process-cores": 1.911,
+        "process-cpu-ns/op": 233612.0,
+        "tcp-flows": 32.0,
+        "B/op": 726.0,
+        "allocs/op": 21.0,
+        "iterations": 10000,
+        "RSS-MiB": 59.5859375
+      },
+      "log": "inplace-control-n8-r2-before-paced.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 280566.0,
+        "MB/s": 467.17,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 8160.0,
+        "p99-us": 35500.0,
+        "process-cores": 3.286,
+        "process-cpu-ns/op": 922012.0,
+        "tcp-flows": 32.0,
+        "B/op": 5113.0,
+        "allocs/op": 111.0,
+        "iterations": 8192,
+        "RSS-MiB": 69.0703125
+      },
+      "log": "inplace-control-n4-r2-inplace-duplex.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 150474.0,
+        "MB/s": 435.53,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.13,
+        "process-cpu-ns/op": 471053.0,
+        "tcp-flows": 32.0,
+        "B/op": 7000.0,
+        "allocs/op": 46.0,
+        "iterations": 8192,
+        "RSS-MiB": 177.50390625
+      },
+      "log": "inplace-control-n4-r2-inplace-upload.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 141273.0,
+        "MB/s": 463.9,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.169,
+        "process-cpu-ns/op": 447701.0,
+        "tcp-flows": 32.0,
+        "B/op": 2535.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 88.3046875
+      },
+      "log": "inplace-control-n4-r2-inplace-download.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 161108.0,
+        "background-MiB/s": 63.93,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 128.0,
+        "p99-us": 1205.0,
+        "process-cores": 1.718,
+        "process-cpu-ns/op": 276764.0,
+        "tcp-flows": 32.0,
+        "B/op": 786.0,
+        "allocs/op": 24.0,
+        "iterations": 10000,
+        "RSS-MiB": 56.2734375
+      },
+      "log": "inplace-control-n4-r2-inplace-paced.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 279536.0,
+        "MB/s": 468.89,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 8100.0,
+        "p99-us": 32930.0,
+        "process-cores": 3.259,
+        "process-cpu-ns/op": 910997.0,
+        "tcp-flows": 32.0,
+        "B/op": 5116.0,
+        "allocs/op": 111.0,
+        "iterations": 8192,
+        "RSS-MiB": 71.73046875
+      },
+      "log": "inplace-control-n4-r2-before-duplex.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 153645.0,
+        "MB/s": 426.54,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.088,
+        "process-cpu-ns/op": 474462.0,
+        "tcp-flows": 32.0,
+        "B/op": 7045.0,
+        "allocs/op": 46.0,
+        "iterations": 8192,
+        "RSS-MiB": 170.46875
+      },
+      "log": "inplace-control-n4-r2-before-upload.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 139844.0,
+        "MB/s": 468.64,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.137,
+        "process-cpu-ns/op": 438722.0,
+        "tcp-flows": 32.0,
+        "B/op": 2553.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 87.59765625
+      },
+      "log": "inplace-control-n4-r2-before-download.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 148971.0,
+        "background-MiB/s": 63.77,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 121.3,
+        "p99-us": 903.1,
+        "process-cores": 1.696,
+        "process-cpu-ns/op": 252648.0,
+        "tcp-flows": 32.0,
+        "B/op": 758.0,
+        "allocs/op": 23.0,
+        "iterations": 10000,
+        "RSS-MiB": 55.75390625
+      },
+      "log": "inplace-control-n4-r2-before-paced.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 274872.0,
+        "MB/s": 476.85,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 7908.0,
+        "p99-us": 32680.0,
+        "process-cores": 3.262,
+        "process-cpu-ns/op": 896727.0,
+        "tcp-flows": 32.0,
+        "B/op": 5223.0,
+        "allocs/op": 111.0,
+        "iterations": 8192,
+        "RSS-MiB": 74.0234375
+      },
+      "log": "inplace-control-n4-r3-before-duplex.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 148828.0,
+        "MB/s": 440.35,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.133,
+        "process-cpu-ns/op": 466354.0,
+        "tcp-flows": 32.0,
+        "B/op": 7045.0,
+        "allocs/op": 46.0,
+        "iterations": 8192,
+        "RSS-MiB": 180.265625
+      },
+      "log": "inplace-control-n4-r3-before-upload.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 140040.0,
+        "MB/s": 467.98,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.136,
+        "process-cpu-ns/op": 439157.0,
+        "tcp-flows": 32.0,
+        "B/op": 2542.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 87.4609375
+      },
+      "log": "inplace-control-n4-r3-before-download.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 152764.0,
+        "background-MiB/s": 64.15,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 122.2,
+        "p99-us": 1010.0,
+        "process-cores": 1.697,
+        "process-cpu-ns/op": 259214.0,
+        "tcp-flows": 32.0,
+        "B/op": 759.0,
+        "allocs/op": 23.0,
+        "iterations": 10000,
+        "RSS-MiB": 53.4609375
+      },
+      "log": "inplace-control-n4-r3-before-paced.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 282834.0,
+        "MB/s": 463.42,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 8123.0,
+        "p99-us": 32657.0,
+        "process-cores": 3.212,
+        "process-cpu-ns/op": 908446.0,
+        "tcp-flows": 32.0,
+        "B/op": 5155.0,
+        "allocs/op": 110.0,
+        "iterations": 8192,
+        "RSS-MiB": 67.34765625
+      },
+      "log": "inplace-control-n4-r3-inplace-duplex.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 150401.0,
+        "MB/s": 435.74,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.14,
+        "process-cpu-ns/op": 472286.0,
+        "tcp-flows": 32.0,
+        "B/op": 6967.0,
+        "allocs/op": 46.0,
+        "iterations": 8192,
+        "RSS-MiB": 179.3828125
+      },
+      "log": "inplace-control-n4-r3-inplace-upload.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 131498.0,
+        "MB/s": 498.38,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "process-cores": 3.219,
+        "process-cpu-ns/op": 423379.0,
+        "tcp-flows": 32.0,
+        "B/op": 2482.0,
+        "allocs/op": 48.0,
+        "iterations": 8192,
+        "RSS-MiB": 72.8515625
+      },
+      "log": "inplace-control-n4-r3-inplace-download.log"
+    },
+    {
+      "cores": 4,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 151635.0,
+        "background-MiB/s": 63.97,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 2.0,
+        "p50-us": 124.5,
+        "p99-us": 1080.0,
+        "process-cores": 1.68,
+        "process-cpu-ns/op": 254728.0,
+        "tcp-flows": 32.0,
+        "B/op": 731.0,
+        "allocs/op": 23.0,
+        "iterations": 10000,
+        "RSS-MiB": 54.265625
+      },
+      "log": "inplace-control-n4-r3-inplace-paced.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 190993.0,
+        "MB/s": 686.27,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 5052.0,
+        "p99-us": 25465.0,
+        "process-cores": 5.824,
+        "process-cpu-ns/op": 1112450.0,
+        "tcp-flows": 32.0,
+        "B/op": 5261.0,
+        "allocs/op": 116.0,
+        "iterations": 8192,
+        "RSS-MiB": 72.6328125
+      },
+      "log": "inplace-control-n8-r3-before-duplex.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 107023.0,
+        "MB/s": 612.35,
+        "kernel-udp-drops": 3479.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.515,
+        "process-cpu-ns/op": 590269.0,
+        "tcp-flows": 32.0,
+        "B/op": 7400.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 213.3125
+      },
+      "log": "inplace-control-n8-r3-before-upload.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 93787.0,
+        "MB/s": 698.77,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.508,
+        "process-cpu-ns/op": 516584.0,
+        "tcp-flows": 32.0,
+        "B/op": 2544.0,
+        "allocs/op": 51.0,
+        "iterations": 8192,
+        "RSS-MiB": 105.6796875
+      },
+      "log": "inplace-control-n8-r3-before-download.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 125017.0,
+        "background-MiB/s": 63.99,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 105.1,
+        "p99-us": 689.0,
+        "process-cores": 1.927,
+        "process-cpu-ns/op": 240893.0,
+        "tcp-flows": 32.0,
+        "B/op": 733.0,
+        "allocs/op": 22.0,
+        "iterations": 10000,
+        "RSS-MiB": 56.75390625
+      },
+      "log": "inplace-control-n8-r3-before-paced.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "duplex",
+      "metrics": {
+        "ns/op": 189945.0,
+        "MB/s": 690.05,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 5226.0,
+        "p99-us": 19207.0,
+        "process-cores": 5.756,
+        "process-cpu-ns/op": 1093379.0,
+        "tcp-flows": 32.0,
+        "B/op": 5201.0,
+        "allocs/op": 114.0,
+        "iterations": 8192,
+        "RSS-MiB": 68.0390625
+      },
+      "log": "inplace-control-n8-r3-inplace-duplex.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "upload",
+      "metrics": {
+        "ns/op": 106101.0,
+        "MB/s": 617.68,
+        "kernel-udp-drops": 3226.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.573,
+        "process-cpu-ns/op": 591343.0,
+        "tcp-flows": 32.0,
+        "B/op": 7255.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 216.984375
+      },
+      "log": "inplace-control-n8-r3-inplace-upload.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "download",
+      "metrics": {
+        "ns/op": 93625.0,
+        "MB/s": 699.98,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "process-cores": 5.53,
+        "process-cpu-ns/op": 517817.0,
+        "tcp-flows": 32.0,
+        "B/op": 2515.0,
+        "allocs/op": 50.0,
+        "iterations": 8192,
+        "RSS-MiB": 95.99609375
+      },
+      "log": "inplace-control-n8-r3-inplace-download.log"
+    },
+    {
+      "cores": 8,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "paced",
+      "metrics": {
+        "ns/op": 124173.0,
+        "background-MiB/s": 63.59,
+        "kernel-udp-drops": 0.0,
+        "native-client-engines": 4.0,
+        "p50-us": 106.4,
+        "p99-us": 684.1,
+        "process-cores": 1.885,
+        "process-cpu-ns/op": 234215.0,
+        "tcp-flows": 32.0,
+        "B/op": 722.0,
+        "allocs/op": 21.0,
+        "iterations": 10000,
+        "RSS-MiB": 54.49609375
+      },
+      "log": "inplace-control-n8-r3-inplace-paced.log"
+    }
+  ],
+  "managed": [
+    {
+      "cores": 1,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 541206.0,
+        "MB/s": 242.19,
+        "client-cpu-ns/op": 533212.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 619.4,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 46673.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 16780.0,
+        "p95-us": 24895.0,
+        "p99-us": 34564.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 396729.0,
+        "server-peak-rss-MiB": 104.0,
+        "server-total-cores": 0.9233,
+        "supervisor-echo-cpu-ns/op": 102977.0,
+        "supervisor-echo-peak-rss-MiB": 41.07,
+        "B/op": 1964.0,
+        "allocs/op": 46.0,
+        "server-total-cpu-ns/op": 499706.0
+      },
+      "log": "managed-inplace-n1-r1-before-transfer.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 45404.0,
+        "client-cpu-ns/op": 47104.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 1425.0,
+        "p95-us": 2102.0,
+        "p99-us": 2480.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 29700.0,
+        "server-peak-rss-MiB": 92.12,
+        "server-total-cores": 0.8835,
+        "supervisor-echo-cpu-ns/op": 10415.0,
+        "supervisor-echo-peak-rss-MiB": 37.93,
+        "B/op": 231.0,
+        "allocs/op": 5.0,
+        "server-total-cpu-ns/op": 40115.0
+      },
+      "log": "managed-inplace-n1-r1-before-latency.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 541577.0,
+        "MB/s": 242.02,
+        "client-cpu-ns/op": 533656.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 563.4,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 50342.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 16751.0,
+        "p95-us": 25075.0,
+        "p99-us": 34302.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 397644.0,
+        "server-peak-rss-MiB": 103.3,
+        "server-total-cores": 0.924,
+        "supervisor-echo-cpu-ns/op": 102782.0,
+        "supervisor-echo-peak-rss-MiB": 39.18,
+        "B/op": 1972.0,
+        "allocs/op": 46.0,
+        "server-total-cpu-ns/op": 500426.0
+      },
+      "log": "managed-inplace-n1-r1-inplace-transfer.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 44818.0,
+        "client-cpu-ns/op": 45404.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 1405.0,
+        "p95-us": 2086.0,
+        "p99-us": 2468.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 29300.0,
+        "server-peak-rss-MiB": 92.8,
+        "server-total-cores": 0.8846,
+        "supervisor-echo-cpu-ns/op": 10344.0,
+        "supervisor-echo-peak-rss-MiB": 35.86,
+        "B/op": 231.0,
+        "allocs/op": 5.0,
+        "server-total-cpu-ns/op": 39644.0
+      },
+      "log": "managed-inplace-n1-r1-inplace-latency.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 527980.0,
+        "MB/s": 248.25,
+        "client-cpu-ns/op": 508356.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 934.9,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 50138.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 16351.0,
+        "p95-us": 24088.0,
+        "p99-us": 34252.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 387573.0,
+        "server-peak-rss-MiB": 104.0,
+        "server-total-cores": 0.9223,
+        "supervisor-echo-cpu-ns/op": 99406.0,
+        "supervisor-echo-peak-rss-MiB": 39.61,
+        "B/op": 1967.0,
+        "allocs/op": 46.0,
+        "server-total-cpu-ns/op": 486979.0
+      },
+      "log": "managed-inplace-n1-r2-before-transfer.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 46206.0,
+        "client-cpu-ns/op": 48947.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 1447.0,
+        "p95-us": 2148.0,
+        "p99-us": 2545.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 30200.0,
+        "server-peak-rss-MiB": 92.46,
+        "server-total-cores": 0.8839,
+        "supervisor-echo-cpu-ns/op": 10644.0,
+        "supervisor-echo-peak-rss-MiB": 36.04,
+        "B/op": 231.0,
+        "allocs/op": 5.0,
+        "server-total-cpu-ns/op": 40844.0
+      },
+      "log": "managed-inplace-n1-r2-before-latency.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 536870.0,
+        "MB/s": 244.14,
+        "client-cpu-ns/op": 518072.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 807.2,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 50722.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 16648.0,
+        "p95-us": 24487.0,
+        "p99-us": 33076.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 394287.0,
+        "server-peak-rss-MiB": 103.1,
+        "server-total-cores": 0.9225,
+        "supervisor-echo-cpu-ns/op": 100982.0,
+        "supervisor-echo-peak-rss-MiB": 39.35,
+        "B/op": 1964.0,
+        "allocs/op": 46.0,
+        "server-total-cpu-ns/op": 495269.0
+      },
+      "log": "managed-inplace-n1-r2-inplace-transfer.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 45449.0,
+        "client-cpu-ns/op": 47353.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 1424.0,
+        "p95-us": 2118.0,
+        "p99-us": 2503.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 29600.0,
+        "server-peak-rss-MiB": 89.64,
+        "server-total-cores": 0.8828,
+        "supervisor-echo-cpu-ns/op": 10521.0,
+        "supervisor-echo-peak-rss-MiB": 35.74,
+        "B/op": 231.0,
+        "allocs/op": 5.0,
+        "server-total-cpu-ns/op": 40121.0
+      },
+      "log": "managed-inplace-n1-r2-inplace-latency.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 559212.0,
+        "MB/s": 234.39,
+        "client-cpu-ns/op": 545864.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 510.4,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 46074.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 17373.0,
+        "p95-us": 25479.0,
+        "p99-us": 34269.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 411377.0,
+        "server-peak-rss-MiB": 103.7,
+        "server-total-cores": 0.9229,
+        "supervisor-echo-cpu-ns/op": 104750.0,
+        "supervisor-echo-peak-rss-MiB": 41.2,
+        "B/op": 1965.0,
+        "allocs/op": 46.0,
+        "server-total-cpu-ns/op": 516127.0
+      },
+      "log": "managed-inplace-n1-r3-before-transfer.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 45599.0,
+        "client-cpu-ns/op": 47829.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 1431.0,
+        "p95-us": 2112.0,
+        "p99-us": 2489.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 29750.0,
+        "server-peak-rss-MiB": 92.45,
+        "server-total-cores": 0.8831,
+        "supervisor-echo-cpu-ns/op": 10520.0,
+        "supervisor-echo-peak-rss-MiB": 35.85,
+        "B/op": 231.0,
+        "allocs/op": 5.0,
+        "server-total-cpu-ns/op": 40270.0
+      },
+      "log": "managed-inplace-n1-r3-before-latency.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 536172.0,
+        "MB/s": 244.46,
+        "client-cpu-ns/op": 521229.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 526.8,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 41282.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 16700.0,
+        "p95-us": 24631.0,
+        "p99-us": 31529.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 393066.0,
+        "server-peak-rss-MiB": 103.4,
+        "server-total-cores": 0.9219,
+        "supervisor-echo-cpu-ns/op": 101234.0,
+        "supervisor-echo-peak-rss-MiB": 39.12,
+        "B/op": 1975.0,
+        "allocs/op": 46.0,
+        "server-total-cpu-ns/op": 494300.0
+      },
+      "log": "managed-inplace-n1-r3-inplace-transfer.log"
+    },
+    {
+      "cores": 1,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 44986.0,
+        "client-cpu-ns/op": 46116.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 1412.0,
+        "p95-us": 2090.0,
+        "p99-us": 2460.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 29350.0,
+        "server-peak-rss-MiB": 92.19,
+        "server-total-cores": 0.8833,
+        "supervisor-echo-cpu-ns/op": 10388.0,
+        "supervisor-echo-peak-rss-MiB": 35.71,
+        "B/op": 231.0,
+        "allocs/op": 5.0,
+        "server-total-cpu-ns/op": 39738.0
+      },
+      "log": "managed-inplace-n1-r3-inplace-latency.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 298844.0,
+        "MB/s": 438.6,
+        "client-cpu-ns/op": 482483.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 821.2,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 108494.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 9131.0,
+        "p95-us": 15024.0,
+        "p99-us": 19804.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 436096.0,
+        "server-peak-rss-MiB": 108.2,
+        "server-total-cores": 1.804,
+        "supervisor-echo-cpu-ns/op": 102957.0,
+        "supervisor-echo-peak-rss-MiB": 40.92,
+        "B/op": 1917.0,
+        "allocs/op": 45.0,
+        "server-total-cpu-ns/op": 539053.0
+      },
+      "log": "managed-inplace-n2-r1-before-transfer.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 1,
+      "revision": "before",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 35631.0,
+        "client-cpu-ns/op": 56522.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 993.2,
+        "p95-us": 2330.0,
+        "p99-us": 3440.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 47150.0,
+        "server-peak-rss-MiB": 94.89,
+        "server-total-cores": 1.719,
+        "supervisor-echo-cpu-ns/op": 14110.0,
+        "supervisor-echo-peak-rss-MiB": 35.78,
+        "B/op": 235.0,
+        "allocs/op": 6.0,
+        "server-total-cpu-ns/op": 61260.0
+      },
+      "log": "managed-inplace-n2-r1-before-latency.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 303064.0,
+        "MB/s": 432.49,
+        "client-cpu-ns/op": 492865.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 965.9,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 117739.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 9295.0,
+        "p95-us": 15252.0,
+        "p99-us": 20422.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 442200.0,
+        "server-peak-rss-MiB": 106.2,
+        "server-total-cores": 1.804,
+        "supervisor-echo-cpu-ns/op": 104658.0,
+        "supervisor-echo-peak-rss-MiB": 41.46,
+        "B/op": 1910.0,
+        "allocs/op": 45.0,
+        "server-total-cpu-ns/op": 546858.0
+      },
+      "log": "managed-inplace-n2-r1-inplace-transfer.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 1,
+      "revision": "inplace",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 34934.0,
+        "client-cpu-ns/op": 54391.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 970.0,
+        "p95-us": 2298.0,
+        "p99-us": 3378.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 46250.0,
+        "server-peak-rss-MiB": 94.86,
+        "server-total-cores": 1.723,
+        "supervisor-echo-cpu-ns/op": 13957.0,
+        "supervisor-echo-peak-rss-MiB": 35.65,
+        "B/op": 238.0,
+        "allocs/op": 6.0,
+        "server-total-cpu-ns/op": 60207.0
+      },
+      "log": "managed-inplace-n2-r1-inplace-latency.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 303763.0,
+        "MB/s": 431.49,
+        "client-cpu-ns/op": 496425.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 740.6,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 117761.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 9287.0,
+        "p95-us": 15465.0,
+        "p99-us": 20216.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 444031.0,
+        "server-peak-rss-MiB": 105.5,
+        "server-total-cores": 1.807,
+        "supervisor-echo-cpu-ns/op": 104940.0,
+        "supervisor-echo-peak-rss-MiB": 38.37,
+        "B/op": 1928.0,
+        "allocs/op": 45.0,
+        "server-total-cpu-ns/op": 548971.0
+      },
+      "log": "managed-inplace-n2-r2-before-transfer.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 2,
+      "revision": "before",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 35144.0,
+        "client-cpu-ns/op": 55321.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 980.2,
+        "p95-us": 2286.0,
+        "p99-us": 3385.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 46600.0,
+        "server-peak-rss-MiB": 92.79,
+        "server-total-cores": 1.724,
+        "supervisor-echo-cpu-ns/op": 13985.0,
+        "supervisor-echo-peak-rss-MiB": 38.03,
+        "B/op": 238.0,
+        "allocs/op": 6.0,
+        "server-total-cpu-ns/op": 60585.0
+      },
+      "log": "managed-inplace-n2-r2-before-latency.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 299649.0,
+        "MB/s": 437.42,
+        "client-cpu-ns/op": 484447.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 803.5,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 111629.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 9171.0,
+        "p95-us": 15045.0,
+        "p99-us": 20091.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 437622.0,
+        "server-peak-rss-MiB": 108.0,
+        "server-total-cores": 1.805,
+        "supervisor-echo-cpu-ns/op": 103364.0,
+        "supervisor-echo-peak-rss-MiB": 38.6,
+        "B/op": 1918.0,
+        "allocs/op": 45.0,
+        "server-total-cpu-ns/op": 540986.0
+      },
+      "log": "managed-inplace-n2-r2-inplace-transfer.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 2,
+      "revision": "inplace",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 34540.0,
+        "client-cpu-ns/op": 52998.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 954.9,
+        "p95-us": 2294.0,
+        "p99-us": 3344.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 45650.0,
+        "server-peak-rss-MiB": 93.34,
+        "server-total-cores": 1.72,
+        "supervisor-echo-cpu-ns/op": 13772.0,
+        "supervisor-echo-peak-rss-MiB": 37.84,
+        "B/op": 238.0,
+        "allocs/op": 6.0,
+        "server-total-cpu-ns/op": 59422.0
+      },
+      "log": "managed-inplace-n2-r2-inplace-latency.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 299012.0,
+        "MB/s": 438.35,
+        "client-cpu-ns/op": 483206.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 728.9,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 128102.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 9196.0,
+        "p95-us": 14974.0,
+        "p99-us": 19159.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 437927.0,
+        "server-peak-rss-MiB": 107.8,
+        "server-total-cores": 1.808,
+        "supervisor-echo-cpu-ns/op": 102708.0,
+        "supervisor-echo-peak-rss-MiB": 41.15,
+        "B/op": 1914.0,
+        "allocs/op": 45.0,
+        "server-total-cpu-ns/op": 540635.0
+      },
+      "log": "managed-inplace-n2-r3-before-transfer.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 3,
+      "revision": "before",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 34929.0,
+        "client-cpu-ns/op": 54323.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 965.4,
+        "p95-us": 2310.0,
+        "p99-us": 3434.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 46350.0,
+        "server-peak-rss-MiB": 95.07,
+        "server-total-cores": 1.722,
+        "supervisor-echo-cpu-ns/op": 13798.0,
+        "supervisor-echo-peak-rss-MiB": 36.01,
+        "B/op": 238.0,
+        "allocs/op": 6.0,
+        "server-total-cpu-ns/op": 60148.0
+      },
+      "log": "managed-inplace-n2-r3-before-latency.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "transfer",
+      "metrics": {
+        "ns/op": 295708.0,
+        "MB/s": 443.25,
+        "client-cpu-ns/op": 479012.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 859.7,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 121257.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 9028.0,
+        "p95-us": 15091.0,
+        "p99-us": 20123.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 433350.0,
+        "server-peak-rss-MiB": 108.6,
+        "server-total-cores": 1.808,
+        "supervisor-echo-cpu-ns/op": 101264.0,
+        "supervisor-echo-peak-rss-MiB": 41.18,
+        "B/op": 1918.0,
+        "allocs/op": 45.0,
+        "server-total-cpu-ns/op": 534614.0
+      },
+      "log": "managed-inplace-n2-r3-inplace-transfer.log"
+    },
+    {
+      "cores": 2,
+      "repeat": 3,
+      "revision": "inplace",
+      "kind": "latency",
+      "metrics": {
+        "ns/op": 34954.0,
+        "client-cpu-ns/op": 54174.0,
+        "ingress-drops": 0.0,
+        "ingress-peak-queue-KiB": 0.0,
+        "ingress-queue-drops": 0.0,
+        "ingress-queued": 0.0,
+        "ingress-send-drops": 0.0,
+        "p50-us": 972.3,
+        "p95-us": 2295.0,
+        "p99-us": 3401.0,
+        "public-udp-drops": 0.0,
+        "public-udp-queue-bytes": 0.0,
+        "server-cpu-ns/op": 46250.0,
+        "server-peak-rss-MiB": 92.81,
+        "server-total-cores": 1.723,
+        "supervisor-echo-cpu-ns/op": 13970.0,
+        "supervisor-echo-peak-rss-MiB": 37.69,
+        "B/op": 238.0,
+        "allocs/op": 6.0,
+        "server-total-cpu-ns/op": 60220.0
+      },
+      "log": "managed-inplace-n2-r3-inplace-latency.log"
+    }
+  ],
+  "micro": [
+    {
+      "repeat": 1,
+      "revision": "old",
+      "gaps": 0,
+      "ns_per_insert": 47.852,
+      "log": "inplace-micro-r1-old.log"
+    },
+    {
+      "repeat": 1,
+      "revision": "old",
+      "gaps": 8,
+      "ns_per_insert": 73.541,
+      "log": "inplace-micro-r1-old.log"
+    },
+    {
+      "repeat": 1,
+      "revision": "old",
+      "gaps": 64,
+      "ns_per_insert": 122.799,
+      "log": "inplace-micro-r1-old.log"
+    },
+    {
+      "repeat": 1,
+      "revision": "new",
+      "gaps": 0,
+      "ns_per_insert": 21.886,
+      "log": "inplace-micro-r1-new.log"
+    },
+    {
+      "repeat": 1,
+      "revision": "new",
+      "gaps": 8,
+      "ns_per_insert": 37.741,
+      "log": "inplace-micro-r1-new.log"
+    },
+    {
+      "repeat": 1,
+      "revision": "new",
+      "gaps": 64,
+      "ns_per_insert": 76.844,
+      "log": "inplace-micro-r1-new.log"
+    },
+    {
+      "repeat": 2,
+      "revision": "old",
+      "gaps": 0,
+      "ns_per_insert": 47.274,
+      "log": "inplace-micro-r2-old.log"
+    },
+    {
+      "repeat": 2,
+      "revision": "old",
+      "gaps": 8,
+      "ns_per_insert": 72.005,
+      "log": "inplace-micro-r2-old.log"
+    },
+    {
+      "repeat": 2,
+      "revision": "old",
+      "gaps": 64,
+      "ns_per_insert": 121.246,
+      "log": "inplace-micro-r2-old.log"
+    },
+    {
+      "repeat": 2,
+      "revision": "new",
+      "gaps": 0,
+      "ns_per_insert": 21.825,
+      "log": "inplace-micro-r2-new.log"
+    },
+    {
+      "repeat": 2,
+      "revision": "new",
+      "gaps": 8,
+      "ns_per_insert": 39.668,
+      "log": "inplace-micro-r2-new.log"
+    },
+    {
+      "repeat": 2,
+      "revision": "new",
+      "gaps": 64,
+      "ns_per_insert": 78.997,
+      "log": "inplace-micro-r2-new.log"
+    },
+    {
+      "repeat": 3,
+      "revision": "old",
+      "gaps": 0,
+      "ns_per_insert": 47.419,
+      "log": "inplace-micro-r3-old.log"
+    },
+    {
+      "repeat": 3,
+      "revision": "old",
+      "gaps": 8,
+      "ns_per_insert": 72.671,
+      "log": "inplace-micro-r3-old.log"
+    },
+    {
+      "repeat": 3,
+      "revision": "old",
+      "gaps": 64,
+      "ns_per_insert": 120.87,
+      "log": "inplace-micro-r3-old.log"
+    },
+    {
+      "repeat": 3,
+      "revision": "new",
+      "gaps": 0,
+      "ns_per_insert": 21.363,
+      "log": "inplace-micro-r3-new.log"
+    },
+    {
+      "repeat": 3,
+      "revision": "new",
+      "gaps": 8,
+      "ns_per_insert": 37.082,
+      "log": "inplace-micro-r3-new.log"
+    },
+    {
+      "repeat": 3,
+      "revision": "new",
+      "gaps": 64,
+      "ns_per_insert": 76.849,
+      "log": "inplace-micro-r3-new.log"
+    },
+    {
+      "repeat": 4,
+      "revision": "old",
+      "gaps": 0,
+      "ns_per_insert": 47.255,
+      "log": "inplace-micro-r4-old.log"
+    },
+    {
+      "repeat": 4,
+      "revision": "old",
+      "gaps": 8,
+      "ns_per_insert": 72.706,
+      "log": "inplace-micro-r4-old.log"
+    },
+    {
+      "repeat": 4,
+      "revision": "old",
+      "gaps": 64,
+      "ns_per_insert": 121.227,
+      "log": "inplace-micro-r4-old.log"
+    },
+    {
+      "repeat": 4,
+      "revision": "new",
+      "gaps": 0,
+      "ns_per_insert": 21.614,
+      "log": "inplace-micro-r4-new.log"
+    },
+    {
+      "repeat": 4,
+      "revision": "new",
+      "gaps": 8,
+      "ns_per_insert": 37.129,
+      "log": "inplace-micro-r4-new.log"
+    },
+    {
+      "repeat": 4,
+      "revision": "new",
+      "gaps": 64,
+      "ns_per_insert": 77.621,
+      "log": "inplace-micro-r4-new.log"
+    },
+    {
+      "repeat": 5,
+      "revision": "old",
+      "gaps": 0,
+      "ns_per_insert": 47.057,
+      "log": "inplace-micro-r5-old.log"
+    },
+    {
+      "repeat": 5,
+      "revision": "old",
+      "gaps": 8,
+      "ns_per_insert": 72.542,
+      "log": "inplace-micro-r5-old.log"
+    },
+    {
+      "repeat": 5,
+      "revision": "old",
+      "gaps": 64,
+      "ns_per_insert": 121.361,
+      "log": "inplace-micro-r5-old.log"
+    },
+    {
+      "repeat": 5,
+      "revision": "new",
+      "gaps": 0,
+      "ns_per_insert": 21.622,
+      "log": "inplace-micro-r5-new.log"
+    },
+    {
+      "repeat": 5,
+      "revision": "new",
+      "gaps": 8,
+      "ns_per_insert": 37.346,
+      "log": "inplace-micro-r5-new.log"
+    },
+    {
+      "repeat": 5,
+      "revision": "new",
+      "gaps": 64,
+      "ns_per_insert": 76.985,
+      "log": "inplace-micro-r5-new.log"
+    },
+    {
+      "repeat": 6,
+      "revision": "old",
+      "gaps": 0,
+      "ns_per_insert": 47.344,
+      "log": "inplace-micro-r6-old.log"
+    },
+    {
+      "repeat": 6,
+      "revision": "old",
+      "gaps": 8,
+      "ns_per_insert": 72.242,
+      "log": "inplace-micro-r6-old.log"
+    },
+    {
+      "repeat": 6,
+      "revision": "old",
+      "gaps": 64,
+      "ns_per_insert": 121.378,
+      "log": "inplace-micro-r6-old.log"
+    },
+    {
+      "repeat": 6,
+      "revision": "new",
+      "gaps": 0,
+      "ns_per_insert": 21.665,
+      "log": "inplace-micro-r6-new.log"
+    },
+    {
+      "repeat": 6,
+      "revision": "new",
+      "gaps": 8,
+      "ns_per_insert": 37.271,
+      "log": "inplace-micro-r6-new.log"
+    },
+    {
+      "repeat": 6,
+      "revision": "new",
+      "gaps": 64,
+      "ns_per_insert": 77.229,
+      "log": "inplace-micro-r6-new.log"
+    },
+    {
+      "repeat": 7,
+      "revision": "old",
+      "gaps": 0,
+      "ns_per_insert": 47.25,
+      "log": "inplace-micro-r7-old.log"
+    },
+    {
+      "repeat": 7,
+      "revision": "old",
+      "gaps": 8,
+      "ns_per_insert": 72.444,
+      "log": "inplace-micro-r7-old.log"
+    },
+    {
+      "repeat": 7,
+      "revision": "old",
+      "gaps": 64,
+      "ns_per_insert": 122.392,
+      "log": "inplace-micro-r7-old.log"
+    },
+    {
+      "repeat": 7,
+      "revision": "new",
+      "gaps": 0,
+      "ns_per_insert": 21.884,
+      "log": "inplace-micro-r7-new.log"
+    },
+    {
+      "repeat": 7,
+      "revision": "new",
+      "gaps": 8,
+      "ns_per_insert": 37.206,
+      "log": "inplace-micro-r7-new.log"
+    },
+    {
+      "repeat": 7,
+      "revision": "new",
+      "gaps": 64,
+      "ns_per_insert": 76.701,
+      "log": "inplace-micro-r7-new.log"
+    }
+  ]
+}

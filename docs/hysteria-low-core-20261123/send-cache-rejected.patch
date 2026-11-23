@@ -1,0 +1,81 @@
+diff --git a/native/libxhysteria/vendor/quinn-proto/src/connection/send_buffer.rs b/native/libxhysteria/vendor/quinn-proto/src/connection/send_buffer.rs
+--- a/native/libxhysteria/vendor/quinn-proto/src/connection/send_buffer.rs
++++ b/native/libxhysteria/vendor/quinn-proto/src/connection/send_buffer.rs
+@@ -5,0 +6,3 @@
++
++// Keep only the smallest write batch's empty metadata, never payload owners.
++const CACHED_SEGMENTS: usize = 4;
+@@ -79,2 +82,4 @@
+-                if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+-                    self.unacked_segments.shrink_to_fit();
++                if self.unacked_segments.capacity() > CACHED_SEGMENTS
++                    && self.unacked_segments.len() * 4 < self.unacked_segments.capacity()
++                {
++                    self.unacked_segments.shrink_to(CACHED_SEGMENTS);
+@@ -434 +439 @@
+-        assert_eq!(buf.unacked_segments.capacity(), 0);
++        assert!(buf.unacked_segments.capacity() <= CACHED_SEGMENTS);
+@@ -443,0 +449 @@
++            Arc,
+@@ -445 +450,0 @@
+-            Arc,
+@@ -478 +483 @@
+-        assert_eq!(buf.unacked_segments.capacity(), 0);
++        assert!(buf.unacked_segments.capacity() <= CACHED_SEGMENTS);
+@@ -538,3 +543,3 @@
+-                    assert_eq!(
+-                        actual.unacked_segments.capacity(),
+-                        reference.unacked_segments.capacity()
++                    assert!(
++                        actual.unacked_segments.capacity()
++                            <= ((actual.unacked_segments.len() + 1) * 4).max(CACHED_SEGMENTS)
+@@ -565 +570 @@
+-            assert_eq!(actual.unacked_segments.capacity(), 0);
++            assert!(actual.unacked_segments.capacity() <= CACHED_SEGMENTS);
+@@ -606 +611 @@
+-                        assert_eq!(buf.unacked_segments.capacity(), 0);
++                        assert!(buf.unacked_segments.capacity() <= CACHED_SEGMENTS);
+@@ -617,0 +623,43 @@
++    #[test]
++    fn small_drained_metadata_is_reused_and_discard_releases_it() {
++        let mut buf = SendBuffer::new();
++        let mut capacity = 0;
++        for cycle in 0..64u64 {
++            buf.write(Bytes::from_static(b"work"));
++            if cycle != 0 {
++                assert_eq!(buf.unacked_segments.capacity(), capacity);
++            }
++            capacity = buf.unacked_segments.capacity();
++            buf.poll_transmit(32);
++            buf.ack(cycle * 4..cycle * 4 + 4);
++            assert!(buf.unacked_segments.is_empty());
++            assert_eq!(buf.unacked_len, 0);
++            assert!(buf.unacked_segments.capacity() <= CACHED_SEGMENTS);
++        }
++        buf.discard();
++        assert_eq!(buf.offset(), 256);
++        assert_eq!(buf.unacked_segments.capacity(), 0);
++    }
++
++    #[test]
++    #[ignore = "manual repeated-write/ACK CPU benchmark"]
++    fn benchmark_repeated_small_write_ack() {
++        let reference = std::env::var_os("XHYS_SEND_CACHE_REFERENCE").is_some();
++        let mut buf = SendBuffer::new();
++        let started = std::time::Instant::now();
++        for cycle in 0..524288u64 {
++            buf.write(Bytes::from_static(b"work"));
++            buf.poll_transmit(32);
++            buf.ack(cycle * 4..cycle * 4 + 4);
++            if reference {
++                buf.unacked_segments.shrink_to_fit();
++            }
++            std::hint::black_box(&buf);
++        }
++        println!(
++            "reference={reference} cached_metadata_bytes={} ns_per_cycle={:.3}",
++            buf.unacked_segments.capacity() * std::mem::size_of::<Bytes>(),
++            started.elapsed().as_nanos() as f64 / 524288.
++        );
++    }
++
