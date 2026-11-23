@@ -3001,3 +3001,26 @@ Artifacts and raw logs are in ignored `build_assets/assembler-drain-20261121/`.
 `reproducer-before.log` contains the expected failing regressions. The fixture
 samples use `memory-*-r*-final.log`, and the transport checks use
 `acceptance-cpu*.log` and `interop-functional.log`.
+
+## Single-block Salamander CPU optimization (2026-11-23)
+
+Passwords of4–120bytes use one-shot unkeyed BLAKE2b-256 over the unchanged
+PSK||salt input. Longer passwords retain the prehashed streaming algorithm.
+No packet batching delay, wire change, queue/window adjustment or stream-limit
+change. Inline mask storage on amd64 shrinks224→136bytes; long passwords
+additionally own a boxed224byte state, so the storage saving is conditional.
+
+Seven same-binary hash-plus-XOR micro samples save about1–8% for short keys.
+After all concurrent task checks finished, five alternating both-native
+512MiB bulk controls give upload379.85→384.65MB/s and CPU429.71→425.46µs/64KiB;
+download343.24→349.76MB/s and505.85→493.33µs/64KiB. User instructions fall
+0.58%/0.59%. Five one-core managed-server controls are essentially unchanged:
+243.90→244.16MB/s and497.84→497.34µs/duplex exchange. Four-core three-sample
+medians751.09→755.51MB/s and608.46→606.12µs. Latency results are mixed.
+
+Initial noisy observations are retained separately; the first matrix does
+not support a universal throughput/CPU/RSS/latency factor. Full results,
+validation and caveats: [Salamander report](../../docs/hysteria-salamander-direct-performance.md).
+Rejected send-cursor, copy/XOR fusion and four-packet BLAKE2b batching:
+[experiment report](../../docs/hysteria-send-cursor-experiment.md).
+Ignored final artifacts: `build_assets/salamander-direct-20261123/`.
