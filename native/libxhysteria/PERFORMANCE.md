@@ -3179,3 +3179,43 @@ Full168final transport /6capacity /42micro observations,allocation checks,
 superseded candidate evidence,limits and reproduction:
 [shared-owner report](../../docs/hysteria-shared-owner-performance.md).
 Ignored artifacts: `build_assets/shared-owner-compact-20261124/`.
+
+## Bridge queue, notification and route fast paths (2026-11-24)
+
+Requested audit items1/2/4: queued Go sends allocate deadline timers only when
+the writer queue is full; reservations no longer notify Rust before ring
+publication; the single Go reader caches one live connection, and the Rust
+shared command pump routes up to eight already-published noncontrol frames
+under one table lock. Control ordering,32descriptor/256KiB turn limits,
+credits,memory bounds and SeqCst handshakes retain baseline settings.
+
+Seven same-binary CPU4 micros: Go table/last-flow lookup16.770→9.033ns;
+Rust groups2/4/8 save11.14/19.16/22.44% per frame. Group1 calls the original
+method and is not lock-amortization evidence. Available-queue future-deadline
+sends have0allocations; old timer-policy throughput was not microbenchmarked.
+
+Five-pair combined1/2core pacedp994585→4441 /2286→2146µs.
+Managed2core throughput451.10→457.93MB/s,CPU521.012→513.409µs/op;
+managed1core bulkp9936787→38064µs worsens. Initial one-core upload and8core
+duplex concerns led to5additional pairs and6four-variant diagnostic repeats.
+Retain all240transport observations,including the initial regressions.
+All14same-binary8coreduplex pairs:728.62→727.75MB/s,p9921290→19956µs.
+One-core upload remains bimodal: all16pairs median183.03→163.99MB/s,
+mean165.34→163.57;below160MB/s7/16baseline vs8/16candidate. Both isolated
+components reproduce the modes;cause unresolved. No general upload improvement,
+universal transport speedup or material RSS reduction is established.
+1000-session peakRSS222.2→221.9MiB is essentially unchanged.
+
+134release/134debug Rust tests,release engine Clippy-Dwarnings,fresh5package
+native Go race tests pass. One/two-core functional/HTTP/mask/100msRTT and
+masked third-party shared/socket stream checks pass without skips.
+Strict UDP8000/8000 and saturatedUDP6000/6000 per budget have zero sampled
+drops/duplicates;retained/saturated-drain tests pass. Six1000-session capacity
+runs and Androidarm64/API26 build pass. Nonzero-drop benchmark observations
+remain included;no device/WAN/new15minute-soak/deployment claim.
+
+Accepted for deterministic operation/allocation reduction and micro CPU wins,
+with mixed macro results explicitly retained. Methods,56Rust/28Go micros,
+240transport/6capacity samples,hashes and reproduction:
+[bridge fastpaths report](../../docs/hysteria-bridge-fastpaths-performance.md).
+Ignored artifacts: `build_assets/bridge-fastpaths-20261124/`.

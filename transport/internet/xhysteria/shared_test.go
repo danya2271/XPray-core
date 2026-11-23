@@ -433,6 +433,29 @@ func TestDirectAndQueuedPublicationsPreserveDataFINOrder(t *testing.T) {
 	}
 }
 
+func TestQueuedReservationNotifiesRustOnlyAfterPublication(t *testing.T) {
+	b := testSharedBridge(t)
+	e := &Engine{bridge: b, done: make(chan struct{}), out: make(chan frame, 1)}
+	// An earlier unpublished frame forces the queue path despite ring space.
+	e.queued.Store(1)
+	message := frame{kind: dataFrame, id: 7, data: []byte("queued")}
+	direct, err := e.prepareFrame(&message)
+	if direct || err != nil {
+		t.Fatalf("prepare: direct=%t err=%v", direct, err)
+	}
+	if atomic.LoadUint32(b.word(40)) != 0 || atomic.LoadUint32(b.word(64)) != 0 {
+		t.Fatal("unpublished reservation woke Rust or advanced the ring")
+	}
+	if err := b.writeBatch([]frame{message}); err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadUint32(b.word(40)) != 1 || atomic.LoadUint32(b.word(64)) != 1 {
+		t.Fatal("published frame did not notify Rust")
+	}
+	message.release()
+	e.queued.Add(-2)
+}
+
 func TestSharedPayloadBufferSurvivesEngineCloseAndDescriptorReuse(t *testing.T) {
 	bridge := testSharedBridge(t)
 	atomic.AndUint32(bridge.word(60), ^uint32(1))
