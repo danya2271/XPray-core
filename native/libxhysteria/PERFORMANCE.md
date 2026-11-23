@@ -3024,3 +3024,32 @@ validation and caveats: [Salamander report](../../docs/hysteria-salamander-direc
 Rejected send-cursor, copy/XOR fusion and four-packet BLAKE2b batching:
 [experiment report](../../docs/hysteria-send-cursor-experiment.md).
 Ignored final artifacts: `build_assets/salamander-direct-20261123/`.
+
+## 400/370 MB/s target qualification (2026-11-23)
+
+Seven paired original512MiB samples compare explicit four/one native workers
+per role, using the same4fd935d5runtime and CPUs4–7,GOMAXPROCS4, one pooled
+QUIC session, shared bridge and Salamander+WireGuard.
+One worker reaches409.60MB/s upload and429.85MB/s download by median, versus
+385.16/350.24with four. Process CPU422.734→399.601µs per64KiB upload,
+489.036→397.151download; peakRSS90.80→70.87MiB /55.09→51.38.
+PacedTCPp99438.8→401.8µs at31.61→31.76MiB/s attained background.
+Upload target400passes5/7, download370passes7/7; this is a median result,
+not a per-run minimum. No global runtime default or many-user worker budget
+is changed based on the single-session fixture.
+
+Before runtime initialization, the measured profile sets
+`XRAY_HYSTERIA_CLIENT_WORKERS=1` and `XRAY_HYSTERIA_SERVER_WORKERS=1`.
+Reproduce via `bench-throughput.sh`, with `XHYS_BENCH_AFFINITY=4-7`.
+All observations, binary hash, method and summaries are preserved.
+
+Earlier1GiB samples gave427.325/387.475MB/s while an original512MiB
+four-worker control gave382.57/357.56. Both remain recorded; sample length/
+host differences cannot substitute for a same-size configuration comparison.
+
+Three candidates were fully reverted: receive batching8→16chunks regressed
+download386.78→348.06MB/s; stateless last-send-segment lookup388.17→366.99;
+AVX2XOR359.97→350.21despite a6–8%packet-masking micro win.
+Task runtime source remains identical to4fd935d5. Raw data/source snapshots:
+ignored `build_assets/throughput-400-370-20261123/`.
+Full report:[target qualification](../../docs/hysteria-throughput-target-performance.md).
