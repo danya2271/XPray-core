@@ -1146,3 +1146,63 @@ Reports:docs/hysteria-salamander-direct-performance.md and
 docs/hysteria-send-cursor-experiment.md. Commit/push all task paths normally
 to four origin branches; no force/upstream push, remote deployment/restart
 or neighboring-worktree edits.
+
+## 400 MB/s Upload / 370 MB/s Download Qualification (2026-11-23)
+
+User sets target400/370MB/s. This round introduces no runtime code change:
+all three measured code candidates were completely reverted.
+Accepted outcome is an explicitly measured one-worker-per-role profile,
+plus native/libxhysteria/bench-throughput.sh and the qualification report.
+No global runtime defaults are reduced based on a single-session benchmark.
+
+Seven alternating paired ORIGINAL512MiB samples, same4fd935d5binary,
+both-native loopback, shared bridge, one pooled QUIC session,
+Salamander+WireGuard, CPUs4–7,GOMAXPROCS4:
+4→1native workers per role gives upload385.16→409.60MB/s,
+download350.24→429.85. Process CPU422.734→399.601µs per64KiB upload,
+489.036→397.151download; peakRSS90.80→70.87MiB /55.09→51.38.
+TCPidle p99192.2→189.5µs, UDP181.7→180.5, paced438.8→401.8 at
+31.61→31.76MiB/s attained background. Target400upload passes5/7
+(392.70–412.79);370download7/7 (418.76–439.48). Goal reached by median,
+not a per-run minimum guarantee, WAN/device factor or many-user aggregate
+throughput guarantee. The settings apply before runtime initialization;
+the first client fixes its shared-runtime worker count.
+Three-sample search also measures2workers416.87/394.68MB/s, kept separate.
+
+Ten earlier1GiB baseline samples gave427.325/387.475MB/s; an original512MiB
+four-worker control gave382.57/357.56,0/5target passes. Both remain recorded:
+do not substitute larger samples/changed host conditions for the512MiBgoal.
+
+Candidate1 raised QUIC receive chunks8→16, no added wait/credit/window change:
+upload428.98→424.99MB/s, download386.78→348.06, CPU451.367→505.611µs
+download.130engine tests pass; rejected and engine.rs restored exactly.
+Candidate2 checked newest SendBuffer chunk first without fields/cursor:
+325proto tests pass; microtail8chunks12.112→4.598ns, but head5.388→6.541ns.
+Five paired transport samples upload427.18→420.51,download388.17→366.99MB/s,
+downloadCPU447.817→477.032µs and instructions19.309→19.463billion.
+Rejected; send_buffer.rs and experiment tests restored exactly.
+Candidate3 runtime-dispatchedAVX2XOR passes131engine tests, improves
+1200/1452byte hash+XOR micro6.1%/7.6%, but paired512MiBdownload
+359.97→350.21MB/s,CPU475.164→488.644µs. Fully reverted with all logs/source.
+Production stream compatibility, windows/budgets,8read chunks,SeqCst wakes
+and all earlier accepted changes remain unchanged.
+
+Artifacts:ignored build_assets/throughput-400-370-20261123/, including
+baseline/candidate binaries, profile, complete per-run data/counters,
+candidate source/test snapshots and reproduction scripts.
+Report:docs/hysteria-throughput-target-performance.md.
+Fresh restored baseline:130engine,324release/325debug Quinn-proto and
+selected-library Clippy,5Go race packages, both-bridge third-party192live/
+1200churn, masks/shortflows/cap recovery/concurrent transfers/100msRTT pass.
+StrictUDP8000/8000 kernel drops/duplicates0. Three1000-session capacity
+samples pass512MiB guard, peakRSS median222.3MiB (not a1GiBcgroup).
+Profile1worker compatibility/RTT/masks and strictUDP8000/8000 also pass.
+Restored xray matches original0e567bcb... byte-for-byte; restore native
+archives after rejected builds too, not merely source files.
+Benchmark script passes bash-n/ShellCheck and actual reuse/build-path bulk
+smokes. Built harness matches baseline263af5d8...; full-build smoke gives
+409.97/438.35MB/s with1worker, kept separate from7paired qualification.
+
+Task commits publish benchmark script and qualification docs to four origin
+branches. No force/upstream push, production deployment/restart or neighboring
+worktree edit. Keep all candidates, sample sizes and failed observations.
