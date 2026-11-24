@@ -1568,3 +1568,225 @@ Android native archive SHA
 Standing authorization:explicit-path ordinary commit,cherry-pick-x on fresh
 disposable worktrees,atomic push all4origin branches,verify remote heads.
 No force/upstream push,VPS action,existing auxiliary/neighbor worktree edits.
+
+## Active per-frame work investigation (2026-11-24)
+
+User requested audit targets1/2/3/4/5 after the bridge fastpaths round.
+BaselineHEAD6cfd8baf2c9ce363d1123090498d70dbd336b418.
+Ignored artifacts build_assets/bridge-work-20261124/;draft report
+docs/hysteria-bridge-work-performance.md. No new commit/publication yet.
+
+Current candidate: lazy queued Conn.waitWrite timer; reusable protected
+eventfd callback; Rust shared DATA publication groups up to4ready frames
+under one credit acquisition/lock/head publication; native receive arrays
+8→16ready chunks; bounded per-payload-slot Go metadata reuse through new
+common/buf.ReusableBuffer. Buffer.Release has no metadata writes after its
+owned callback. Current reuse uses a per-slot Go mutex to establish Go-side
+happens-before independent of C atomics. ABI6,ring8,slots16,DATA16KiB,credits,
+byte budgets,workers,Tokio7/7,crypto andSeqCst wakeup handshakes unchanged.
+Receive workspace descriptor count does change;do not claim all memory bounds
+unchanged. Bytes still copy into the shared arena.
+
+9candidate source/test hashes and full snapshots in source-hashes.json/source/.
+Measured Linux native archive69b55b710694c79bd3dcb4de931ad5a868f18f4697a024d4ff8fb8100d64417e.
+Baseline before-harness SHA9781fe6ff3a7be8b132fe8b70e5d462cbe7250311b5163b6bfcf55964c38ae1b.
+Before-Xray copied from accepted prior bridge-fastpaths after build.
+No runtime source edit since snapshot. Do not edit while finish.sh runs:
+it builds race/Android and temporary diagnostic Go source/restores exact source.
+
+Completed:137release/137debug Rust tests,4ignored;releaseClippy-Dwarnings;
+fresh Go race common/buf+xhysteria and4other packages. Rust tests cover
+publication wrapping/inline fallback/onecredit/multiple flows. Go tests cover
+queued0alloc/expiry/close,notification0alloc/errorrearm/concurrency,metadata
+0alloc/concurrent UDP slot reuse,and callback-time buffer rebinding.
+
+Baseline diagnostic8runs withCPU/mem/mutex/block profiles reproduces
+136–137MB/s/53allocs vs192–194MB/s/36–37allocs per64KiB.
+Separate8counter-only before runs show slow mode~207kDATA/GiB,~5.2kB/frame;
+fast~100kDATA/GiB,~10.6kB/frame. This establishes extra framing work,not the
+original scheduling/packetization trigger. Fixture SetDeadline on cnc wrapper
+is a no-op;timer fix is not the proven cause/cure of upload bimodality.
+
+Initial screening51samples,before/batch8/batch16. Eight upload repeats per
+variant still show both modes;16ready chunks alone does not eliminate it.
+Three-pair1corepaced p994348→3849us and8coreduplex731.26→770.80MB/s for
+batch16 before metadata reuse. Those binaries/source snapshots remain separate.
+
+Final candidate micros:7pairs timer301.4→251.7ns no-deadline,772.8→316.3ns
+future-deadline,3→0allocs. Same-binary eventfd195.8→159.7ns,2→0allocs;
+metadata124.0→61.77ns,1→0allocs(reference/candidate channel-escaped metadata,
+excludes actual bridge per-slot mutex). Native grouped publication2/4frames
+758.981→719.261 /757.445→691.721ns/frame;1frameessentiallyflat.
+Its micro does not rearm go_pending each group;do not claim measured syscall
+savings from that test. Total98micro observations.
+
+Main5pair1/2core matrix80samples complete:1coreduplex184.04→187.16MB/s,
+upload182.98→184.62,download193.27→197.74;pacedp994455→3550us.
+2coreduplex319.22→324.48,upload296.91→298.84,download335.49→337.41;
+pacedp991844→1661. Saturated2coreduplex p9943132→49258us worsens.
+Allocs fall substantially. Do not infer large intrinsic RSS improvement from
+the1coredownload131.21→83.32MiB mixed process peak;capacity check pending.
+Kernel drop samples2coredownload1per revision;retain all observations.
+
+4/8core3pair controls48samples complete:4coreduplex487.56→497.50MB/s,
+upload462.46→473.32,download488.89→492.13;pacedp991194→1278us worsens.
+8coreduplex727.00→682.36MB/s worsens,p9921874→23089us;
+upload652.44→658.56,download746.16→754.18,pacedp992698→2860us worsens.
+All3eightcoreupload samples per version have UDP drops;other controls zero.
+Do not hide these initial regressions or claim universal scaling win.
+
+Managed3pairs24samples complete:1core254.58→258.84MB/s,totalCPU474.684→466.443us,
+bulk p9936761→38575us worsens;latencyp992441→2406us.
+2core459.63→465.04MB/s,CPU512.549→507.126us,p9919298→18613us;
+latencyp993455→3335us. Strict ingress/publicUDPdrop gates zero.
+
+Currently running exec session19762: finish.sh (finish-progress.log).
+Controls+managed done;validate.sh has completed1/2corefunctional/streams/
+strictUDP8000/8000perbudget,no loss/duplicates. At checkpoint saturated/drain
+stage,then6capacity observations,AndroidAPI26,then frame-diagnostic-after.py.
+All task builds/tests/benchmarks sequential with no overlap timed matrices.
+
+NEXT after finish.sh completes: run recheck.py >recheck-progress.log. It
+predeclares4additional pairs for2duplex/4paced/8duplex/8paced;at4/8cores also
+rotates batch16(no Go metadata reuse) to isolate cache costs.44observations:
+32final before/after +12component diagnostics. Keep initial/additional/joint.
+Then assess whether per-slot mutex metadata cache has persistent scale cost.
+Possible bounded follow-up,NOT applied/tested: shared.go.atomic and
+atomic-slot.patch replace per-slot mutex with Go ready CAS/store,marking
+Go metadata complete before native free-slot release. This reduces4mutex
+atomic operations to2state operations and avoids publishing a slot while
+still holding its metadata mutex. Race/lifetime proof and fresh exact-source
+measurements required before adoption;do not present as completed.
+
+export.py expects all acceptance/after-frame/recheck outputs,verifies137tests,
+6package race,allUDP/drain/capacity,source hashes and normal archive. It
+exports184final/recheck+63screen/isolation,6capacity,98micro,24diagnostic
+observations when all expected files exist. Decision/acceptance prose still
+needs honest final assessment. If runtime changes,rebuild/relabel evidence
+instead of rerunning against stale source hashes/binaries.
+
+Remaining:finish validation,rechecks,accept/reject or bounded fix of cache
+scale concern;final report/results,PERFORMANCE and this handoff update;
+explicit-path commit,ordinarycherry-pick-x on fresh detached worktrees,atomic
+pushall4origin,verify remote heads,remove only newly created worktrees.
+Standing user publication authorization applies,no permission question needed.
+
+LATEST: mutex candidate finished all checks and44additional observations.
+All7eight-coreduplex pairs732.19→706.12MB/s,CPU1049.042→1087.848us,
+p9920140→21195us;additional4pairs alone improve,but initial regression remains
+in joint data. No-cache batch16 also mixed. All247transport/6capacity/98micro/
+24diagnostic records frozen in docs/hysteria-bridge-work-20261124/mutex-candidate.json,
+decisionpending/superseded. It is not the published final runtime.
+
+Applied one bounded follow-up: Go per-slot ready CAS/store instead of mutex.
+Release marks Go metadata complete BEFORE native free-bit return;read acquires
+ready and rejects duplicate live leases BEFORE incrementing owner refs.
+Buffer.Release still has no writes after callback. New duplicate-live-lease
+test and existing concurrency/lifetime/0alloc tests pass fresh Go race.
+No adaptive Go read batching or further Rust/crypto/queue-bound changes.
+
+Current exact-source artifacts/snapshots/scripts:
+build_assets/bridge-work-atomic-20261124/. 9source/test hashes there.
+Exec81258 runs build-final.sh then finish.sh:137release tests/Clippy,
+fresh2package race,98micros,new1/2core5pair matrix80,controls48,managed24,
+remaining4package race,debug137,functional/UDP/drain/capacity/Android,
+then frame-diagnostic-after.py. At latest checkpoint lowcore repeat3 finished.
+Do not overlap any other builds/tests/benchmarks.
+
+After exec81258 completes,run this NEW root's recheck.py sequentially.
+It predeclares4pairs×4cases(2duplex,4paced,8duplex,8paced)×3versions
+(before,after,mutex),48observations:32final+16mutexcomponent. Exact mutex binary
+copied as interop-mutex.test. Then run NEW export.py accepted/rejected/pending;
+it retains historical51screening separately,archives prior mutex evidence,
+verifies current sources/libs/full acceptance,and rewrites final report/data.
+Its generation has only been syntax-checked;inspect output assertions.
+No final acceptance/publication yet. Assess mixed metrics honestly;original
+upload trigger remains unresolved even though doubled framing is established.
+
+LATEST VALIDATION UPDATE: exec81258 stopped in ready-state validate.sh because
+supervisor TestControlLostAckReplaysExistingChannelWithoutChangingOwner got
+EOF + read/proc/stat ESRCH after deliberate controller exit86. Initial log
+preserved as go-race-initial-failed.log. Plain no-native10repeat did not
+reproduce;source inspection identifies os.IsNotExist excludes ESRCH returned
+if process disappears after pidfd_open/before or during proc read.
+Necessary separate reliability fix now uncommitted:
+cmd/nodex-xray-supervisor/broker_recovery_linux.go introduces processStatusGone
+using errors.Is(ENOENT/ESRCH),used by brokerDead and waitBrokerExit.
+New broker_recovery_linux_test.go checks actual proc PathError ESRCH,ENOENT,
+wrappedESRCH,nil,EACCES/EIO;existing live-unresponsive test protects no replay.
+20focused groups +fresh4package native race now pass. Source hashes in
+broker-source-hashes.json. This code is separate cmd package,not part of the
+transport benchmark binaries. Commit separately before performance commit.
+
+Active exec59563 resumes validate.sh after that fix,then after-frame diagnostics
+and NEW recheck.py. At latest checkpoint strictUDP1corepassed,2corefunctional
+running. Ready-state main80/controls48/managed24 already complete. Initial
+new1coreupload183.85→145.45median,mean176.654→160.604,slow1/5vs3/5;
+4/8controls still mixed. Do not hide mode imbalance or claim it fixed.
+Recheck expanded after this new concern to5cases(1upload,2duplex,4paced,
+8duplex,8paced)×4pairs×3versions(before,after,mutex)=60samples:
+40final before/after +20mutexcomparison. New exporter expects60,includes
+broker failure/fix/focused evidence,192final/recheck+20mutexcomparison+
+51historicalscreening,6capacity,98micro,24diagnostic. Check generated
+joint1upload summary includes initial5 +extra4,not extra4alone.
+
+Historical mutex-candidate.patch now stored beside its JSON;verified in an
+isolated temporary Git index to reconstruct all9measured source snapshots
+from6cfd8baf. No user index/worktree changes from that check. Raw8C2after-frame
+diagnostics retain both modes (~100k vs~200kframes/GiB);trigger still unresolved.
+No third layout/read-batching candidate has been applied. Ready CAS/store is
+the only bounded follow-up;finish current evidence before selecting/publishing.
+
+## Final per-frame work checkpoint (2026-11-24; supersedes active notes above)
+
+All validation, after-frame diagnostics and60additional observations completed;
+no background task from this experiment remains. The exact ready-state runtime
+is accepted for per-frame operation/allocation reduction,not a universal speed,
+latency or RSS improvement. No further runtime edit was made during publication.
+Separate supervisor ESRCH correction is already committed ascffb8e6f.
+
+All192final/recheck+20mutex-isolation+51historical-screening transport samples,
+6capacity,98micro and24diagnostic observations are retained in
+docs/hysteria-bridge-work-20261124/results.json. Historical mutex variant:
+mutex-candidate.json and mutex-candidate.patch;superseded,not current runtime.
+Export verifies all9current source/test hashes,archives,acceptance logs and
+fresh prepublication137release/137debug/Clippy/6package race checks.
+No task builds/tests overlap timed matrices.
+
+Final micros:future-deadline queued send776.20→316.70ns,3→0allocs;
+eventfd195.10→160.00ns,2→0allocs;escaped metadata122.70→61.66ns,
+1→0allocs(excludes slot ready synchronization);native2/4frame groups
+save5.85/8.48%(no eventfd pending rearm in micro).
+
+Keep all mixed transport findings visible:
+- 1corepacedp994554→3581µs;2core1769→1828worsens.
+- All9one-core upload pairs:median183.32→183.92MB/s,
+  mean165.98→166.76,below160MB/s4/9per revision. Trigger unresolved.
+- All9two-core duplex:319.84→322.04MB/s,p9943734→47977µs.
+- All7eight-core duplex:731.82→703.11MB/s,
+  CPU1049.94→1087.12µs/op,p9920876→23371µs. Additional4alone improve,
+  but do not cancel the joint regression.
+- Managed1/2coretransfer254.34→257.93 /458.14→466.58MB/s.
+- 1000session peakRSS219.50→222.40MiB,throughput167.03→166.03MiB/s,
+  heartbeatp993795→3938.8µs. No intrinsic RSS/capacity win established.
+- All8instrumented after-frame runs are slow (~200–208kDATA/GiB);
+  baseline diagnostics show both modes. They are not acceptance throughput
+  and do not establish the original packetization/scheduler trigger.
+
+Linux native archive69b55b710694c79bd3dcb4de931ad5a868f18f4697a024d4ff8fb8100d64417e.
+Android archiveafdb17ba2426f754e35a67d32f9baa5e674f0d17bb95ae34862d7ef21fbdbdf6.
+Report docs/hysteria-bridge-work-performance.md and PERFORMANCE.md are final.
+No ARM performance/WAN/new15minute-soak/full-repository-green/deployment claim.
+
+User explicitly reiterated:commit all current changes and push all branches.
+Publish both supervisor and measured runtime commits to the4origin branches
+with ordinarycherry-pick-x on new disposable detached worktrees and atomic push.
+Verify remote heads and leave the main worktree clean. Do not force push,
+push upstream,modify VPSs or existing auxiliary/neighbor worktrees.
+
+Branch compatibility audit found only the intentional regular-buffer Size
+difference in touched runtime/test files:android4096,all3serverbranches8192.
+Preserve those values during cherry-pick. Numeric A/B source hashes refer to
+android's measured source,not serverbranches8KiB settings;report notes this.
+Publication worktrees are disposable and receive separate fresh native race
+checks before atomic push.
