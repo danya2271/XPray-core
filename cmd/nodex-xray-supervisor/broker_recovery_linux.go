@@ -85,6 +85,12 @@ func (s *supervisor) checkpointDirectBrokerLocked() error {
 	return nil
 }
 
+// A proc file can disappear after pidfd_open or after opening /proc/<pid>/stat.
+// Linux can report either ENOENT or ESRCH for that exit race.
+func processStatusGone(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH)
+}
+
 func brokerDead(pid int, start uint64) (bool, error) {
 	fd, err := unix.PidfdOpen(pid, 0)
 	if err == unix.ESRCH {
@@ -95,7 +101,7 @@ func brokerDead(pid int, start uint64) (bool, error) {
 	}
 	defer unix.Close(fd)
 	ticks, err := processStart(pid)
-	if os.IsNotExist(err) {
+	if processStatusGone(err) {
 		return true, nil
 	}
 	if err != nil {
@@ -122,7 +128,7 @@ func waitBrokerExit(ctx context.Context, client brokerClient) error {
 	}
 	defer unix.Close(fd)
 	ticks, err := processStart(client.pid)
-	if os.IsNotExist(err) || err == nil && ticks != client.startTicks {
+	if processStatusGone(err) || err == nil && ticks != client.startTicks {
 		return nil
 	}
 	if err != nil {
