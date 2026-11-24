@@ -39,7 +39,7 @@ use tokio::{
 
 const OPEN_TCP: u8 = 1;
 const OPEN_UDP: u8 = 2;
-const DATA: u8 = 3;
+pub(crate) const DATA: u8 = 3;
 const DATAGRAM: u8 = 4;
 const FIN: u8 = 5;
 const CLOSE: u8 = 6;
@@ -743,6 +743,11 @@ impl Bus {
         chunks: &[Bytes],
         frame_size: usize,
     ) -> Result<usize> {
+        if let Some(shared) = &self.shared {
+            return shared
+                .send_payload_chunks(id, credit, chunks, frame_size)
+                .await;
+        }
         let mut parts = [b"".as_slice(); 16];
         let mut count = 0;
         let mut size = 0;
@@ -1581,7 +1586,7 @@ async fn relay_client_tcp(
     let stopped = tx.stopped();
     let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
     let down = async {
-        let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
+        let mut chunks = std::array::from_fn::<_, 16, _>(|_| Bytes::new());
         let mut budget = 0;
         while let Some(count) = rx.read_chunks(&mut chunks).await? {
             budget += bus
@@ -1660,7 +1665,7 @@ async fn relay_server_tcp(
         let stopped = tx.stopped();
         let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
         let down = async {
-            let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
+            let mut chunks = std::array::from_fn::<_, 16, _>(|_| Bytes::new());
             let mut budget = 0;
             while let Some(count) = rx.read_chunks(&mut chunks).await? {
                 let received = bus

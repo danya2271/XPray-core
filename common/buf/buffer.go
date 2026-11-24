@@ -120,6 +120,7 @@ func (b *Buffer) Release() {
 	default:
 		b.UDP = nil
 		owner.release()
+		return
 	}
 	b.UDP = nil
 }
