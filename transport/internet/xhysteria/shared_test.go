@@ -9,10 +9,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/xtls/xray-core/common/buf"
 	xnet "github.com/xtls/xray-core/common/net"
@@ -46,11 +49,103 @@ func testSharedBridge(t *testing.T) *sharedBridge {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b.wakeRaw, err = b.wake.SyscallConn()
+	b.wakeWriter, err = newEventWriter(b.wake)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestSharedWakeupAllocationsAndErrorRearm(t *testing.T) {
+	b := testSharedBridge(t)
+	if n := testing.AllocsPerRun(100, func() {
+		atomic.StoreUint32(b.word(40), 0)
+		if err := b.notifyRust(); err != nil {
+			t.Fatal(err)
+		}
+	}); n != 0 {
+		t.Fatalf("eventfd notification allocated %.1f times", n)
+	}
+	b.wake.Close()
+	atomic.StoreUint32(b.word(40), 0)
+	if err := b.notifyRust(); err == nil {
+		t.Fatal("closed wake descriptor succeeded")
+	}
+	if atomic.LoadUint32(b.word(40)) != 0 {
+		t.Fatal("failed wake did not rearm pending")
+	}
+}
+
+func TestSharedConcurrentWakeupRearming(t *testing.T) {
+	b := testSharedBridge(t)
+	var workers sync.WaitGroup
+	for range 8 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for range 1000 {
+				atomic.StoreUint32(b.word(40), 0)
+				if err := b.notifyRust(); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	workers.Wait()
+}
+
+func legacyEventSignal(raw syscall.RawConn) error {
+	var writeErr error
+	err := raw.Control(func(fd uintptr) {
+		for {
+			_, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, fd, uintptr(unsafe.Pointer(&eventfdSignal[0])), uintptr(len(eventfdSignal)))
+			if errno == unix.EINTR {
+				continue
+			}
+			if errno != 0 && errno != unix.EAGAIN {
+				writeErr = errno
+			}
+			break
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return writeErr
+}
+
+func BenchmarkEventSignal(b *testing.B) {
+	for _, cached := range []bool{false, true} {
+		name := "legacy"
+		if cached {
+			name = "reused"
+		}
+		b.Run(name, func(b *testing.B) {
+			fd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+			if err != nil {
+				b.Fatal(err)
+			}
+			file := os.NewFile(uintptr(fd), "benchmark-eventfd")
+			defer file.Close()
+			writer, err := newEventWriter(file)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				var err error
+				if cached {
+					err = writer.write()
+				} else {
+					err = legacyEventSignal(writer.raw)
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func TestSharedBridgeBatchWraparoundAndWakeups(t *testing.T) {
@@ -494,6 +589,100 @@ func TestSharedPayloadBufferSurvivesEngineCloseAndDescriptorReuse(t *testing.T) 
 	buf.ReleaseMulti(buffers)
 	if atomic.LoadUint32(bridge.word(60))&1 == 0 || bridge.owner.refs.Load() != 0 {
 		t.Fatal("payload owner was not released")
+	}
+}
+
+func TestSharedPayloadMetadataReuseAllocatesNothing(t *testing.T) {
+	b := testSharedBridge(t)
+	var first *buf.Buffer
+	if n := testing.AllocsPerRun(100, func() {
+		head := atomic.LoadUint32(b.word(192))
+		atomic.AndUint32(b.word(60), ^uint32(1))
+		d := b.data[sharedHeader+sharedCapacity*sharedStride+int(head&(sharedCapacity-1))*sharedStride:]
+		binary.LittleEndian.PutUint32(d, uint32(dataFrame)|sharedPayloadFlag)
+		binary.LittleEndian.PutUint32(d[4:], 1)
+		b.data[sharedRingBytes+sharedPayloadSlots*sharedPayloadSize] = byte(head)
+		atomic.StoreUint32(b.word(192), head+1)
+		f, err := b.read()
+		if err != nil || f.storage == nil || f.data[0] != byte(head) {
+			t.Fatal("reused payload changed")
+		}
+		if first == nil {
+			first = f.storage
+		} else if f.storage != first {
+			t.Fatal("slot metadata was replaced")
+		}
+		f.release()
+	}); n != 0 {
+		t.Fatalf("reused payload allocated %.1f times", n)
+	}
+	if b.owner.refs.Load() != 1 || atomic.LoadUint32(b.word(60)) != (1<<sharedPayloadSlots)-1 {
+		t.Fatal("payload metadata reuse retained an owner or slot")
+	}
+}
+
+func TestSharedPayloadMetadataConcurrentReuse(t *testing.T) {
+	b := testSharedBridge(t)
+	const count = 2000
+	var producer sync.WaitGroup
+	producer.Go(func() {
+		for head := uint32(0); head < count; head++ {
+			for atomic.LoadUint32(b.word(60))&1 == 0 {
+				if atomic.LoadUint32(b.word(32)) != 0 {
+					return
+				}
+				runtime.Gosched()
+			}
+			atomic.AndUint32(b.word(60), ^uint32(1))
+			d := b.data[sharedHeader+sharedCapacity*sharedStride+int(head&(sharedCapacity-1))*sharedStride:]
+			binary.LittleEndian.PutUint32(d, uint32(datagramFrame)|sharedPayloadFlag)
+			binary.LittleEndian.PutUint32(d[4:], 1)
+			b.data[sharedRingBytes+sharedPayloadSlots*sharedPayloadSize] = byte(head)
+			atomic.StoreUint32(b.word(192), head+1)
+			if _, err := b.notify.Write(eventfdSignal[:]); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	})
+	target := xnet.UDPDestination(xnet.LocalHostIP, 53)
+	for head := uint32(0); head < count; head++ {
+		f, err := b.read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.data[0] != byte(head) || f.storage.UDP != nil {
+			t.Fatal("reused payload or UDP metadata changed")
+		}
+		f.storage.UDP = &target
+		f.release()
+	}
+	producer.Wait()
+}
+
+func TestSharedPayloadMetadataRejectsDuplicateLiveLease(t *testing.T) {
+	b := testSharedBridge(t)
+	atomic.AndUint32(b.word(60), ^uint32(1))
+	b.data[sharedRingBytes+sharedPayloadSlots*sharedPayloadSize] = 7
+	for index := range 2 {
+		d := b.data[sharedHeader+sharedCapacity*sharedStride+index*sharedStride:]
+		binary.LittleEndian.PutUint32(d, uint32(dataFrame)|sharedPayloadFlag)
+		binary.LittleEndian.PutUint32(d[4:], 1)
+	}
+	atomic.StoreUint32(b.word(192), 2)
+	first, err := b.read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.read(); err == nil {
+		t.Fatal("duplicate live payload lease succeeded")
+	}
+	if first.storage.Bytes()[0] != 7 || b.owner.refs.Load() != 2 {
+		t.Fatal("rejected duplicate modified the live lease or retained another owner")
+	}
+	first.release()
+	if b.owner.refs.Load() != 1 {
+		t.Fatal("live lease did not release its owner")
 	}
 }
 
