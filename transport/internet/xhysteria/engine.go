@@ -1171,10 +1171,31 @@ func (c *Conn) waitWrite(f *frame) error {
 			}
 			reserved = true
 		}
+		var remaining time.Duration
+		if !until.IsZero() {
+			remaining = time.Until(until)
+			if remaining <= 0 {
+				return os.ErrDeadlineExceeded
+			}
+		}
+		if f != nil {
+			// The queued path can still complete immediately. Only a full
+			// writer queue needs a timer and the blocking select below.
+			select {
+			case <-c.closed:
+				return net.ErrClosed
+			case <-changed:
+				continue
+			case c.engine.out <- *f:
+				reserved = false
+				return nil
+			default:
+			}
+		}
 		var timeout <-chan time.Time
 		var timer *time.Timer
 		if !until.IsZero() {
-			timer = time.NewTimer(time.Until(until))
+			timer = time.NewTimer(remaining)
 			timeout = timer.C
 		}
 		var send chan frame

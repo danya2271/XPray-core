@@ -4,13 +4,12 @@
 //! Payload leases outlive descriptor consumption; release returns independent slots.
 
 use crate::{
-    engine::{CREDIT, CREDIT_COUNTS},
+    engine::{CREDIT, CREDIT_COUNTS, DATA},
     h3_transport::Result,
 };
 use bytes::Bytes;
 use std::{
-    fmt,
-    io,
+    fmt, io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     ptr::NonNull,
     sync::{
@@ -18,7 +17,10 @@ use std::{
         atomic::{AtomicU32, Ordering},
     },
 };
-use tokio::{io::unix::AsyncFd, sync::Notify};
+use tokio::{
+    io::unix::AsyncFd,
+    sync::{Notify, Semaphore},
+};
 
 /// A leased payload need not allocate a Bytes owner until its final consumer
 /// attaches the send-budget permits. Moving this value keeps the slot pinned.
@@ -292,6 +294,116 @@ impl Bridge {
         }
     }
 
+    pub(crate) async fn send_payload_chunks(
+        &self,
+        id: u64,
+        credit: &Semaphore,
+        chunks: &[Bytes],
+        frame_size: usize,
+    ) -> Result<usize> {
+        if frame_size == 0 || frame_size > PAYLOAD_SIZE {
+            return Err("invalid shared TCP frame size".into());
+        }
+        let total: usize = chunks.iter().map(Bytes::len).sum();
+        let mut remaining = total;
+        let mut cursor = (0, 0);
+        while remaining != 0 {
+            // Only reserve credits that are already available. A lone ready
+            // frame never waits for a larger group; keep the same flow bound.
+            let mut pending = remaining
+                .div_ceil(frame_size)
+                .min(credit.available_permits().max(1))
+                .min(4);
+            credit
+                .acquire_many(pending as u32)
+                .await
+                .map_err(|_| "closed native flow")?
+                .forget();
+            while pending != 0 {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                let published = {
+                    let _writer = self.event_writer.lock().unwrap();
+                    if self.closed() {
+                        return Err("Go bridge closed".into());
+                    }
+                    self.push_payload_chunks(
+                        id,
+                        chunks,
+                        frame_size,
+                        pending,
+                        &mut cursor,
+                        &mut remaining,
+                    )?
+                };
+                pending -= published;
+                self.notify_go();
+                if published == 0 {
+                    changed.await;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    fn push_payload_chunks(
+        &self,
+        id: u64,
+        chunks: &[Bytes],
+        frame_size: usize,
+        frames: usize,
+        cursor: &mut (usize, usize),
+        remaining: &mut usize,
+    ) -> Result<usize> {
+        let header = self.header();
+        let index = header.event_head.value.load(Ordering::Relaxed);
+        let mut count = index.wrapping_sub(header.event_tail.value.load(Ordering::Acquire));
+        if count > CAPACITY {
+            return Err("corrupt shared ring indices".into());
+        }
+        if count == CAPACITY {
+            header.event_waiting.store(1, Ordering::SeqCst);
+            count = index.wrapping_sub(header.event_tail.value.load(Ordering::SeqCst));
+        }
+        let published = frames.min((CAPACITY - count) as usize);
+        for frame in 0..published {
+            let len = frame_size.min(*remaining);
+            let slot = self.slot(false, index.wrapping_add(frame as u32));
+            let payload_slot = self.acquire_payload(false);
+            let kind = u32::from(DATA)
+                | payload_slot.map_or(0, |slot| PAYLOAD_FLAG | ((slot as u32) << 16));
+            let payload = payload_slot.map_or_else(
+                || unsafe { slot.add(16) },
+                |slot| self.payload_pointer(false, slot),
+            );
+            unsafe {
+                slot.cast::<u32>().write(kind);
+                slot.add(4).cast::<u32>().write(len as u32);
+                slot.add(8).cast::<u64>().write(id);
+                let mut copied = 0;
+                while copied != len {
+                    while cursor.1 == chunks[cursor.0].len() {
+                        cursor.0 += 1;
+                        cursor.1 = 0;
+                    }
+                    let source = &chunks[cursor.0][cursor.1..];
+                    let n = source.len().min(len - copied);
+                    std::ptr::copy_nonoverlapping(source.as_ptr(), payload.add(copied), n);
+                    cursor.1 += n;
+                    copied += n;
+                }
+            }
+            *remaining -= len;
+        }
+        if published != 0 {
+            header
+                .event_head
+                .value
+                .store(index.wrapping_add(published as u32), Ordering::Release);
+        }
+        Ok(published)
+    }
+
     pub fn notification_fd(&self) -> Result<AsyncFd<OwnedFd>> {
         let fd = unsafe { libc::fcntl(self.native.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
@@ -559,6 +671,161 @@ impl Drop for Bridge {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn chunked_publication_preserves_bytes_boundaries_and_wrapping() {
+        for inline in [false, true] {
+            let bridge = Bridge::new().unwrap();
+            let start = u32::MAX - 3;
+            bridge
+                .header()
+                .event_head
+                .value
+                .store(start, Ordering::Relaxed);
+            bridge
+                .header()
+                .event_tail
+                .value
+                .store(start, Ordering::Relaxed);
+            if inline {
+                bridge.header().event_free.store(0, Ordering::Relaxed);
+            }
+            let chunks: Vec<Bytes> = [0, 1, 1400, 70000, 0, 4096, 18000]
+                .into_iter()
+                .enumerate()
+                .map(|(index, len)| Bytes::from(vec![index as u8; len]))
+                .collect();
+            let expected: Vec<u8> = chunks
+                .iter()
+                .flat_map(|bytes| bytes.iter().copied())
+                .collect();
+            let credit = Semaphore::new(4);
+            let sending = bridge.send_payload_chunks(17, &credit, &chunks, PAYLOAD_SIZE);
+            let receiving = async {
+                let mut actual = Vec::new();
+                while actual.len() < expected.len() {
+                    if let Some((kind, id, data)) = bridge.pop(false).unwrap() {
+                        assert_eq!((kind, id), (DATA, 17));
+                        assert_eq!(
+                            data.len(),
+                            (expected.len() - actual.len()).min(PAYLOAD_SIZE)
+                        );
+                        actual.extend_from_slice(&data);
+                        drop(data);
+                        credit.add_permits(1);
+                        bridge.changed.notify_waiters();
+                    } else {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                actual
+            };
+            let (sent, actual) = tokio::join!(sending, receiving);
+            assert_eq!(sent.unwrap(), expected.len());
+            assert_eq!(actual, expected);
+            assert_eq!(credit.available_permits(), 4);
+            assert_eq!(
+                bridge.header().event_free.load(Ordering::Relaxed),
+                if inline { 0 } else { (1 << PAYLOAD_SLOTS) - 1 }
+            );
+            assert!(bridge.pop(false).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_publication_uses_single_credit_without_waiting_for_a_group() {
+        let bridge = Bridge::new().unwrap();
+        let credit = Semaphore::new(1);
+        let chunks = [Bytes::from(vec![7; 4 * PAYLOAD_SIZE])];
+        let sending = bridge.send_payload_chunks(7, &credit, &chunks, PAYLOAD_SIZE);
+        tokio::pin!(sending);
+        tokio::select! {
+            biased;
+            _ = &mut sending => panic!("four frames used one flow credit"),
+            _ = tokio::task::yield_now() => (),
+        }
+        let (_, _, first) = bridge
+            .pop(false)
+            .unwrap()
+            .expect("one ready credit must publish");
+        assert_eq!(first.len(), PAYLOAD_SIZE);
+        assert!(bridge.pop(false).unwrap().is_none());
+        assert_eq!(credit.available_permits(), 0);
+        credit.close();
+        assert!(sending.await.is_err());
+        assert!(bridge.pop(false).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn chunked_publication_concurrent_flows_keep_their_payloads() {
+        let bridge = Bridge::new().unwrap();
+        let credit_a = Semaphore::new(4);
+        let credit_b = Semaphore::new(4);
+        let a = [Bytes::from(vec![0xa7; 12 * PAYLOAD_SIZE + 13])];
+        let b = [Bytes::from(vec![0xb8; 11 * PAYLOAD_SIZE + 9])];
+        let receive = async {
+            let mut totals = [0, 0];
+            while totals != [a[0].len(), b[0].len()] {
+                if let Some((kind, id, data)) = bridge.pop(false).unwrap() {
+                    assert_eq!(kind, DATA);
+                    let (index, byte, credit) = match id {
+                        1 => (0, 0xa7, &credit_a),
+                        2 => (1, 0xb8, &credit_b),
+                        _ => panic!("changed flow id"),
+                    };
+                    assert!(data.iter().all(|value| *value == byte));
+                    totals[index] += data.len();
+                    drop(data);
+                    credit.add_permits(1);
+                    bridge.changed.notify_waiters();
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        let (sent_a, sent_b, ()) = tokio::join!(
+            bridge.send_payload_chunks(1, &credit_a, &a, PAYLOAD_SIZE),
+            bridge.send_payload_chunks(2, &credit_b, &b, PAYLOAD_SIZE),
+            receive
+        );
+        assert_eq!(sent_a.unwrap(), a[0].len());
+        assert_eq!(sent_b.unwrap(), b[0].len());
+        assert_eq!(credit_a.available_permits(), 4);
+        assert_eq!(credit_b.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual shared publication and credit batching CPU benchmark"]
+    async fn benchmark_chunked_publication() {
+        let reference = std::env::var_os("XHYS_PUBLISH_REFERENCE").is_some();
+        for count in [1, 2, 4] {
+            let bridge = Bridge::new().unwrap();
+            let credit = Semaphore::new(4);
+            let chunks = [Bytes::from(vec![7; count * PAYLOAD_SIZE])];
+            let started = std::time::Instant::now();
+            for _ in 0..65536 {
+                if reference {
+                    for part in chunks[0].chunks(PAYLOAD_SIZE) {
+                        credit.acquire().await.unwrap().forget();
+                        bridge.send(DATA, 1, part).await.unwrap();
+                    }
+                } else {
+                    bridge
+                        .send_payload_chunks(1, &credit, &chunks, PAYLOAD_SIZE)
+                        .await
+                        .unwrap();
+                }
+                for _ in 0..count {
+                    std::hint::black_box(bridge.pop(false).unwrap().unwrap());
+                }
+                credit.add_permits(count);
+            }
+            println!(
+                "reference={reference} frames={count} ns_per_frame={:.3}",
+                started.elapsed().as_nanos() as f64 / (65536 * count) as f64,
+            );
+        }
+    }
+
     #[test]
     fn popped_credit_counts_use_static_storage_without_changing_other_payloads() {
         let bridge = Bridge::new().unwrap();
@@ -797,25 +1064,33 @@ mod tests {
                 assert!(bridge.push(false, 3, u64::from(id), b"queued").unwrap());
             }
             let sender = bridge.clone();
-            let mut task = tokio::spawn(async move {
-                sender.send_vectored(3, 99, &[b"after", b"-full"]).await
-            });
+            let mut task =
+                tokio::spawn(
+                    async move { sender.send_vectored(3, 99, &[b"after", b"-full"]).await },
+                );
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(10), &mut task)
-                    .await.is_err()
+                    .await
+                    .is_err()
             );
             assert_eq!(bridge.header().event_waiting.load(Ordering::SeqCst), 1);
             if close {
                 bridge.close();
                 assert!(
                     tokio::time::timeout(std::time::Duration::from_secs(1), task)
-                        .await.unwrap().unwrap().is_err()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_err()
                 );
             } else {
                 assert_eq!(bridge.pop(false).unwrap().unwrap().1, 0);
                 bridge.changed.notify_waiters();
                 tokio::time::timeout(std::time::Duration::from_secs(1), task)
-                    .await.unwrap().unwrap().unwrap();
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
                 for expected in 1..CAPACITY {
                     assert_eq!(bridge.pop(false).unwrap().unwrap().1, u64::from(expected));
                 }

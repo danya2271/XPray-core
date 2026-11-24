@@ -72,12 +72,18 @@ type sharedBridge struct {
 	notify, wake   *os.File
 	space          *os.File
 	once           sync.Once
-	wakeRaw        syscall.RawConn
+	wakeWriter     *eventWriter
 	notifyReader   *eventReader
 	spaceReader    *eventReader
 	owner          *sharedOwner
 	ownerOnce      sync.Once
-	payloadRelease [sharedPayloadSlots]func()
+	payloadBuffers [sharedPayloadSlots]payloadBuffer
+}
+
+type payloadBuffer struct {
+	ready   atomic.Uint32
+	buffer  buf.ReusableBuffer
+	release func()
 }
 
 type sharedOwner struct {
@@ -118,7 +124,13 @@ func (b *sharedBridge) initializeOwner(handle unsafe.Pointer) {
 	}
 	b.owner = owner
 	for slot := range sharedPayloadSlots {
-		b.payloadRelease[slot] = func() {
+		payload := &b.payloadBuffers[slot]
+		payload.ready.Store(1)
+		payload.release = func() {
+			// Finish all Go metadata writes before returning the native slot.
+			// The next Go reader also acquires this state, independently of
+			// native atomics that Go's race detector cannot observe.
+			payload.ready.Store(1)
 			atomic.OrUint32((*uint32)(unsafe.Pointer(&owner.data[60])), 1<<slot)
 			owner.release()
 		}
@@ -130,6 +142,48 @@ type eventReader struct {
 	value    [8]byte
 	err      error
 	callback func(uintptr) bool
+}
+
+type eventWriter struct {
+	raw      syscall.RawConn
+	mu       sync.Mutex
+	err      error
+	callback func(uintptr)
+}
+
+func newEventWriter(file *os.File) (*eventWriter, error) {
+	raw, err := file.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	writer := &eventWriter{raw: raw}
+	writer.callback = writer.signal
+	return writer, nil
+}
+
+func (w *eventWriter) signal(fd uintptr) {
+	for {
+		_, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, fd, uintptr(unsafe.Pointer(&eventfdSignal[0])), uintptr(len(eventfdSignal)))
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno != 0 && errno != unix.EAGAIN {
+			w.err = errno
+		}
+		return
+	}
+}
+
+func (w *eventWriter) write() error {
+	// A consumer can rearm pending before an earlier Control call returns.
+	// Serialize the reusable callback result, including error paths.
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.err = nil
+	if err := w.raw.Control(w.callback); err != nil {
+		return err
+	}
+	return w.err
 }
 
 func newEventReader(file *os.File) (*eventReader, error) {
@@ -192,7 +246,7 @@ func sharedFromView(view C.XhysSharedView) (*sharedBridge, error) {
 		}
 	}()
 	var err error
-	b.wakeRaw, err = wake.SyscallConn()
+	b.wakeWriter, err = newEventWriter(wake)
 	if err != nil {
 		b.close()
 		return nil, err
@@ -253,34 +307,18 @@ func (b *sharedBridge) notifyRust() error {
 	if atomic.SwapUint32(b.word(40), 1) != 0 {
 		return nil
 	}
-	if b.wakeRaw == nil {
+	if b.wakeWriter == nil {
 		_, err := b.wake.Write(eventfdSignal[:])
 		if err != nil {
 			atomic.SwapUint32(b.word(40), 0)
 		}
 		return err
 	}
-	var writeErr error
-	err := b.wakeRaw.Control(func(fd uintptr) {
-		for {
-			_, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, fd, uintptr(unsafe.Pointer(&eventfdSignal[0])), uintptr(len(eventfdSignal)))
-			if errno == unix.EINTR {
-				continue
-			}
-			if errno != 0 && errno != unix.EAGAIN {
-				writeErr = errno
-			}
-			break
-		}
-	})
+	err := b.wakeWriter.write()
 	if err != nil {
 		atomic.SwapUint32(b.word(40), 0)
-		return err
 	}
-	if writeErr != nil {
-		atomic.SwapUint32(b.word(40), 0)
-	}
-	return writeErr
+	return err
 }
 
 func (b *sharedBridge) close() error {
@@ -318,10 +356,14 @@ func (b *sharedBridge) read() (frame, error) {
 				if owner == nil {
 					return frame{}, errors.New("shared payload has no arena owner")
 				}
+				payload := &b.payloadBuffers[slot]
+				if !payload.ready.CompareAndSwap(1, 0) {
+					return frame{}, errors.New("native payload slot still leased")
+				}
 				owner.refs.Add(1)
 				offset := sharedRingBytes + (sharedPayloadSlots+slot)*sharedPayloadSize
 				f.data = owner.data[offset : offset+int(n) : offset+int(n)]
-				f.storage = buf.FromBytesWithRelease(f.data, b.payloadRelease[slot])
+				f.storage = payload.buffer.Reset(f.data, payload.release)
 			} else if f.kind == writableFrame && n == 1 && d[16] < byte(len(creditCounts)) {
 				f.data = creditCounts[d[16] : int(d[16])+1]
 			} else if n != 0 {

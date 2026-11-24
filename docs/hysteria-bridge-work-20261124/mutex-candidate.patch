@@ -1,0 +1,973 @@
+diff --git a/common/buf/buffer.go b/common/buf/buffer.go
+--- a/common/buf/buffer.go
++++ b/common/buf/buffer.go
+@@ -120,6 +120,7 @@
+ 	default:
+ 		b.UDP = nil
+ 		owner.release()
++		return
+ 	}
+ 	b.UDP = nil
+ }
+diff --git a/native/libxhysteria/src/engine.rs b/native/libxhysteria/src/engine.rs
+--- a/native/libxhysteria/src/engine.rs
++++ b/native/libxhysteria/src/engine.rs
+@@ -39,7 +39,7 @@
+ 
+ const OPEN_TCP: u8 = 1;
+ const OPEN_UDP: u8 = 2;
+-const DATA: u8 = 3;
++pub(crate) const DATA: u8 = 3;
+ const DATAGRAM: u8 = 4;
+ const FIN: u8 = 5;
+ const CLOSE: u8 = 6;
+@@ -743,6 +743,11 @@
+         chunks: &[Bytes],
+         frame_size: usize,
+     ) -> Result<usize> {
++        if let Some(shared) = &self.shared {
++            return shared
++                .send_payload_chunks(id, credit, chunks, frame_size)
++                .await;
++        }
+         let mut parts = [b"".as_slice(); 16];
+         let mut count = 0;
+         let mut size = 0;
+@@ -1581,7 +1586,7 @@
+     let stopped = tx.stopped();
+     let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
+     let down = async {
+-        let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
++        let mut chunks = std::array::from_fn::<_, 16, _>(|_| Bytes::new());
+         let mut budget = 0;
+         while let Some(count) = rx.read_chunks(&mut chunks).await? {
+             budget += bus
+@@ -1660,7 +1665,7 @@
+         let stopped = tx.stopped();
+         let up = relay_tcp_upload(&mut tx, &mut commands, &bus, id);
+         let down = async {
+-            let mut chunks = std::array::from_fn::<_, 8, _>(|_| Bytes::new());
++            let mut chunks = std::array::from_fn::<_, 16, _>(|_| Bytes::new());
+             let mut budget = 0;
+             while let Some(count) = rx.read_chunks(&mut chunks).await? {
+                 let received = bus
+diff --git a/native/libxhysteria/src/shared.rs b/native/libxhysteria/src/shared.rs
+--- a/native/libxhysteria/src/shared.rs
++++ b/native/libxhysteria/src/shared.rs
+@@ -4,13 +4,12 @@
+ //! Payload leases outlive descriptor consumption; release returns independent slots.
+ 
+ use crate::{
+-    engine::{CREDIT, CREDIT_COUNTS},
++    engine::{CREDIT, CREDIT_COUNTS, DATA},
+     h3_transport::Result,
+ };
+ use bytes::Bytes;
+ use std::{
+-    fmt,
+-    io,
++    fmt, io,
+     os::fd::{AsRawFd, FromRawFd, OwnedFd},
+     ptr::NonNull,
+     sync::{
+@@ -18,7 +17,10 @@
+         atomic::{AtomicU32, Ordering},
+     },
+ };
+-use tokio::{io::unix::AsyncFd, sync::Notify};
++use tokio::{
++    io::unix::AsyncFd,
++    sync::{Notify, Semaphore},
++};
+ 
+ /// A leased payload need not allocate a Bytes owner until its final consumer
+ /// attaches the send-budget permits. Moving this value keeps the slot pinned.
+@@ -292,6 +294,116 @@
+         }
+     }
+ 
++    pub(crate) async fn send_payload_chunks(
++        &self,
++        id: u64,
++        credit: &Semaphore,
++        chunks: &[Bytes],
++        frame_size: usize,
++    ) -> Result<usize> {
++        if frame_size == 0 || frame_size > PAYLOAD_SIZE {
++            return Err("invalid shared TCP frame size".into());
++        }
++        let total: usize = chunks.iter().map(Bytes::len).sum();
++        let mut remaining = total;
++        let mut cursor = (0, 0);
++        while remaining != 0 {
++            // Only reserve credits that are already available. A lone ready
++            // frame never waits for a larger group; keep the same flow bound.
++            let mut pending = remaining
++                .div_ceil(frame_size)
++                .min(credit.available_permits().max(1))
++                .min(4);
++            credit
++                .acquire_many(pending as u32)
++                .await
++                .map_err(|_| "closed native flow")?
++                .forget();
++            while pending != 0 {
++                let changed = self.changed.notified();
++                tokio::pin!(changed);
++                let published = {
++                    let _writer = self.event_writer.lock().unwrap();
++                    if self.closed() {
++                        return Err("Go bridge closed".into());
++                    }
++                    self.push_payload_chunks(
++                        id,
++                        chunks,
++                        frame_size,
++                        pending,
++                        &mut cursor,
++                        &mut remaining,
++                    )?
++                };
++                pending -= published;
++                self.notify_go();
++                if published == 0 {
++                    changed.await;
++                }
++            }
++        }
++        Ok(total)
++    }
++
++    fn push_payload_chunks(
++        &self,
++        id: u64,
++        chunks: &[Bytes],
++        frame_size: usize,
++        frames: usize,
++        cursor: &mut (usize, usize),
++        remaining: &mut usize,
++    ) -> Result<usize> {
++        let header = self.header();
++        let index = header.event_head.value.load(Ordering::Relaxed);
++        let mut count = index.wrapping_sub(header.event_tail.value.load(Ordering::Acquire));
++        if count > CAPACITY {
++            return Err("corrupt shared ring indices".into());
++        }
++        if count == CAPACITY {
++            header.event_waiting.store(1, Ordering::SeqCst);
++            count = index.wrapping_sub(header.event_tail.value.load(Ordering::SeqCst));
++        }
++        let published = frames.min((CAPACITY - count) as usize);
++        for frame in 0..published {
++            let len = frame_size.min(*remaining);
++            let slot = self.slot(false, index.wrapping_add(frame as u32));
++            let payload_slot = self.acquire_payload(false);
++            let kind = u32::from(DATA)
++                | payload_slot.map_or(0, |slot| PAYLOAD_FLAG | ((slot as u32) << 16));
++            let payload = payload_slot.map_or_else(
++                || unsafe { slot.add(16) },
++                |slot| self.payload_pointer(false, slot),
++            );
++            unsafe {
++                slot.cast::<u32>().write(kind);
++                slot.add(4).cast::<u32>().write(len as u32);
++                slot.add(8).cast::<u64>().write(id);
++                let mut copied = 0;
++                while copied != len {
++                    while cursor.1 == chunks[cursor.0].len() {
++                        cursor.0 += 1;
++                        cursor.1 = 0;
++                    }
++                    let source = &chunks[cursor.0][cursor.1..];
++                    let n = source.len().min(len - copied);
++                    std::ptr::copy_nonoverlapping(source.as_ptr(), payload.add(copied), n);
++                    cursor.1 += n;
++                    copied += n;
++                }
++            }
++            *remaining -= len;
++        }
++        if published != 0 {
++            header
++                .event_head
++                .value
++                .store(index.wrapping_add(published as u32), Ordering::Release);
++        }
++        Ok(published)
++    }
++
+     pub fn notification_fd(&self) -> Result<AsyncFd<OwnedFd>> {
+         let fd = unsafe { libc::fcntl(self.native.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+         if fd < 0 {
+@@ -559,6 +671,161 @@
+ mod tests {
+     use super::*;
+ 
++    #[tokio::test]
++    async fn chunked_publication_preserves_bytes_boundaries_and_wrapping() {
++        for inline in [false, true] {
++            let bridge = Bridge::new().unwrap();
++            let start = u32::MAX - 3;
++            bridge
++                .header()
++                .event_head
++                .value
++                .store(start, Ordering::Relaxed);
++            bridge
++                .header()
++                .event_tail
++                .value
++                .store(start, Ordering::Relaxed);
++            if inline {
++                bridge.header().event_free.store(0, Ordering::Relaxed);
++            }
++            let chunks: Vec<Bytes> = [0, 1, 1400, 70000, 0, 4096, 18000]
++                .into_iter()
++                .enumerate()
++                .map(|(index, len)| Bytes::from(vec![index as u8; len]))
++                .collect();
++            let expected: Vec<u8> = chunks
++                .iter()
++                .flat_map(|bytes| bytes.iter().copied())
++                .collect();
++            let credit = Semaphore::new(4);
++            let sending = bridge.send_payload_chunks(17, &credit, &chunks, PAYLOAD_SIZE);
++            let receiving = async {
++                let mut actual = Vec::new();
++                while actual.len() < expected.len() {
++                    if let Some((kind, id, data)) = bridge.pop(false).unwrap() {
++                        assert_eq!((kind, id), (DATA, 17));
++                        assert_eq!(
++                            data.len(),
++                            (expected.len() - actual.len()).min(PAYLOAD_SIZE)
++                        );
++                        actual.extend_from_slice(&data);
++                        drop(data);
++                        credit.add_permits(1);
++                        bridge.changed.notify_waiters();
++                    } else {
++                        tokio::task::yield_now().await;
++                    }
++                }
++                actual
++            };
++            let (sent, actual) = tokio::join!(sending, receiving);
++            assert_eq!(sent.unwrap(), expected.len());
++            assert_eq!(actual, expected);
++            assert_eq!(credit.available_permits(), 4);
++            assert_eq!(
++                bridge.header().event_free.load(Ordering::Relaxed),
++                if inline { 0 } else { (1 << PAYLOAD_SLOTS) - 1 }
++            );
++            assert!(bridge.pop(false).unwrap().is_none());
++        }
++    }
++
++    #[tokio::test]
++    async fn chunked_publication_uses_single_credit_without_waiting_for_a_group() {
++        let bridge = Bridge::new().unwrap();
++        let credit = Semaphore::new(1);
++        let chunks = [Bytes::from(vec![7; 4 * PAYLOAD_SIZE])];
++        let sending = bridge.send_payload_chunks(7, &credit, &chunks, PAYLOAD_SIZE);
++        tokio::pin!(sending);
++        tokio::select! {
++            biased;
++            _ = &mut sending => panic!("four frames used one flow credit"),
++            _ = tokio::task::yield_now() => (),
++        }
++        let (_, _, first) = bridge
++            .pop(false)
++            .unwrap()
++            .expect("one ready credit must publish");
++        assert_eq!(first.len(), PAYLOAD_SIZE);
++        assert!(bridge.pop(false).unwrap().is_none());
++        assert_eq!(credit.available_permits(), 0);
++        credit.close();
++        assert!(sending.await.is_err());
++        assert!(bridge.pop(false).unwrap().is_none());
++    }
++
++    #[tokio::test]
++    async fn chunked_publication_concurrent_flows_keep_their_payloads() {
++        let bridge = Bridge::new().unwrap();
++        let credit_a = Semaphore::new(4);
++        let credit_b = Semaphore::new(4);
++        let a = [Bytes::from(vec![0xa7; 12 * PAYLOAD_SIZE + 13])];
++        let b = [Bytes::from(vec![0xb8; 11 * PAYLOAD_SIZE + 9])];
++        let receive = async {
++            let mut totals = [0, 0];
++            while totals != [a[0].len(), b[0].len()] {
++                if let Some((kind, id, data)) = bridge.pop(false).unwrap() {
++                    assert_eq!(kind, DATA);
++                    let (index, byte, credit) = match id {
++                        1 => (0, 0xa7, &credit_a),
++                        2 => (1, 0xb8, &credit_b),
++                        _ => panic!("changed flow id"),
++                    };
++                    assert!(data.iter().all(|value| *value == byte));
++                    totals[index] += data.len();
++                    drop(data);
++                    credit.add_permits(1);
++                    bridge.changed.notify_waiters();
++                } else {
++                    tokio::task::yield_now().await;
++                }
++            }
++        };
++        let (sent_a, sent_b, ()) = tokio::join!(
++            bridge.send_payload_chunks(1, &credit_a, &a, PAYLOAD_SIZE),
++            bridge.send_payload_chunks(2, &credit_b, &b, PAYLOAD_SIZE),
++            receive
++        );
++        assert_eq!(sent_a.unwrap(), a[0].len());
++        assert_eq!(sent_b.unwrap(), b[0].len());
++        assert_eq!(credit_a.available_permits(), 4);
++        assert_eq!(credit_b.available_permits(), 4);
++    }
++
++    #[tokio::test]
++    #[ignore = "manual shared publication and credit batching CPU benchmark"]
++    async fn benchmark_chunked_publication() {
++        let reference = std::env::var_os("XHYS_PUBLISH_REFERENCE").is_some();
++        for count in [1, 2, 4] {
++            let bridge = Bridge::new().unwrap();
++            let credit = Semaphore::new(4);
++            let chunks = [Bytes::from(vec![7; count * PAYLOAD_SIZE])];
++            let started = std::time::Instant::now();
++            for _ in 0..65536 {
++                if reference {
++                    for part in chunks[0].chunks(PAYLOAD_SIZE) {
++                        credit.acquire().await.unwrap().forget();
++                        bridge.send(DATA, 1, part).await.unwrap();
++                    }
++                } else {
++                    bridge
++                        .send_payload_chunks(1, &credit, &chunks, PAYLOAD_SIZE)
++                        .await
++                        .unwrap();
++                }
++                for _ in 0..count {
++                    std::hint::black_box(bridge.pop(false).unwrap().unwrap());
++                }
++                credit.add_permits(count);
++            }
++            println!(
++                "reference={reference} frames={count} ns_per_frame={:.3}",
++                started.elapsed().as_nanos() as f64 / (65536 * count) as f64,
++            );
++        }
++    }
++
+     #[test]
+     fn popped_credit_counts_use_static_storage_without_changing_other_payloads() {
+         let bridge = Bridge::new().unwrap();
+@@ -797,25 +1064,33 @@
+                 assert!(bridge.push(false, 3, u64::from(id), b"queued").unwrap());
+             }
+             let sender = bridge.clone();
+-            let mut task = tokio::spawn(async move {
+-                sender.send_vectored(3, 99, &[b"after", b"-full"]).await
+-            });
++            let mut task =
++                tokio::spawn(
++                    async move { sender.send_vectored(3, 99, &[b"after", b"-full"]).await },
++                );
+             assert!(
+                 tokio::time::timeout(std::time::Duration::from_millis(10), &mut task)
+-                    .await.is_err()
++                    .await
++                    .is_err()
+             );
+             assert_eq!(bridge.header().event_waiting.load(Ordering::SeqCst), 1);
+             if close {
+                 bridge.close();
+                 assert!(
+                     tokio::time::timeout(std::time::Duration::from_secs(1), task)
+-                        .await.unwrap().unwrap().is_err()
++                        .await
++                        .unwrap()
++                        .unwrap()
++                        .is_err()
+                 );
+             } else {
+                 assert_eq!(bridge.pop(false).unwrap().unwrap().1, 0);
+                 bridge.changed.notify_waiters();
+                 tokio::time::timeout(std::time::Duration::from_secs(1), task)
+-                    .await.unwrap().unwrap().unwrap();
++                    .await
++                    .unwrap()
++                    .unwrap()
++                    .unwrap();
+                 for expected in 1..CAPACITY {
+                     assert_eq!(bridge.pop(false).unwrap().unwrap().1, u64::from(expected));
+                 }
+diff --git a/transport/internet/xhysteria/engine.go b/transport/internet/xhysteria/engine.go
+--- a/transport/internet/xhysteria/engine.go
++++ b/transport/internet/xhysteria/engine.go
+@@ -1171,10 +1171,31 @@
+ 			}
+ 			reserved = true
+ 		}
++		var remaining time.Duration
++		if !until.IsZero() {
++			remaining = time.Until(until)
++			if remaining <= 0 {
++				return os.ErrDeadlineExceeded
++			}
++		}
++		if f != nil {
++			// The queued path can still complete immediately. Only a full
++			// writer queue needs a timer and the blocking select below.
++			select {
++			case <-c.closed:
++				return net.ErrClosed
++			case <-changed:
++				continue
++			case c.engine.out <- *f:
++				reserved = false
++				return nil
++			default:
++			}
++		}
+ 		var timeout <-chan time.Time
+ 		var timer *time.Timer
+ 		if !until.IsZero() {
+-			timer = time.NewTimer(time.Until(until))
++			timer = time.NewTimer(remaining)
+ 			timeout = timer.C
+ 		}
+ 		var send chan frame
+diff --git a/transport/internet/xhysteria/engine_test.go b/transport/internet/xhysteria/engine_test.go
+--- a/transport/internet/xhysteria/engine_test.go
++++ b/transport/internet/xhysteria/engine_test.go
+@@ -365,6 +365,68 @@
+ 	}
+ }
+ 
++func TestQueuedConnSendAllocatesTimerOnlyWhenBlocked(t *testing.T) {
++	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
++	c := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)
++	c.SetWriteDeadline(time.Now().Add(time.Minute))
++	message := frame{kind: dataFrame, id: c.id, data: []byte("queued")}
++	if n := testing.AllocsPerRun(100, func() {
++		if err := c.sendFrame(message); err != nil {
++			t.Fatal(err)
++		}
++		<-e.out
++		e.queued.Add(-1)
++	}); n != 0 {
++		t.Fatalf("available queue allocated %.1f times", n)
++	}
++	c.SetWriteDeadline(time.Now().Add(-time.Second))
++	if err := c.sendFrame(message); !errors.Is(err, os.ErrDeadlineExceeded) {
++		t.Fatalf("expired send: %v", err)
++	}
++	if len(e.out) != 0 || e.queued.Load() != 0 {
++		t.Fatal("expired send changed queue reservations")
++	}
++	e.out <- message
++	c.SetWriteDeadline(time.Now().Add(5 * time.Millisecond))
++	if err := c.sendFrame(message); !errors.Is(err, os.ErrDeadlineExceeded) {
++		t.Fatalf("full queue deadline: %v", err)
++	}
++	if len(e.out) != 1 || e.queued.Load() != 0 {
++		t.Fatal("timed-out connection send leaked a reservation")
++	}
++	<-e.out
++	c.SetWriteDeadline(time.Now().Add(time.Minute))
++	c.fail(net.ErrClosed)
++	if err := c.sendFrame(message); !errors.Is(err, net.ErrClosed) {
++		t.Fatalf("closed connection send: %v", err)
++	}
++}
++
++func BenchmarkConnQueuedSend(b *testing.B) {
++	for _, deadline := range []bool{false, true} {
++		name := "no_deadline"
++		if deadline {
++			name = "future_deadline"
++		}
++		b.Run(name, func(b *testing.B) {
++			e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
++			c := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)
++			if deadline {
++				c.SetWriteDeadline(time.Now().Add(time.Hour))
++			}
++			message := frame{kind: dataFrame, id: c.id, data: creditCounts[1:2]}
++			b.ReportAllocs()
++			for b.Loop() {
++				if err := c.sendFrame(message); err != nil {
++					b.Fatal(err)
++				}
++				<-e.out
++				e.queued.Add(-1)
++			}
++		})
++	}
++}
++
+ func TestFlowReadCacheDropsClosedConnectionBeforeIDReuse(t *testing.T) {
+ 	e := &Engine{done: make(chan struct{}), flows: make(map[uint64]*Conn)}
+ 	old := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)
+diff --git a/transport/internet/xhysteria/shared.go b/transport/internet/xhysteria/shared.go
+--- a/transport/internet/xhysteria/shared.go
++++ b/transport/internet/xhysteria/shared.go
+@@ -72,12 +72,18 @@
+ 	notify, wake   *os.File
+ 	space          *os.File
+ 	once           sync.Once
+-	wakeRaw        syscall.RawConn
++	wakeWriter     *eventWriter
+ 	notifyReader   *eventReader
+ 	spaceReader    *eventReader
+ 	owner          *sharedOwner
+ 	ownerOnce      sync.Once
+-	payloadRelease [sharedPayloadSlots]func()
++	payloadBuffers [sharedPayloadSlots]payloadBuffer
++}
++
++type payloadBuffer struct {
++	mu      sync.Mutex
++	buffer  buf.ReusableBuffer
++	release func()
+ }
+ 
+ type sharedOwner struct {
+@@ -118,9 +124,14 @@
+ 	}
+ 	b.owner = owner
+ 	for slot := range sharedPayloadSlots {
+-		b.payloadRelease[slot] = func() {
++		payload := &b.payloadBuffers[slot]
++		payload.release = func() {
++			// Synchronize Go metadata reuse independently of the native
++			// slot handshake, which Go's race detector cannot observe.
++			payload.mu.Lock()
+ 			atomic.OrUint32((*uint32)(unsafe.Pointer(&owner.data[60])), 1<<slot)
+ 			owner.release()
++			payload.mu.Unlock()
+ 		}
+ 	}
+ }
+@@ -130,6 +141,48 @@
+ 	value    [8]byte
+ 	err      error
+ 	callback func(uintptr) bool
++}
++
++type eventWriter struct {
++	raw      syscall.RawConn
++	mu       sync.Mutex
++	err      error
++	callback func(uintptr)
++}
++
++func newEventWriter(file *os.File) (*eventWriter, error) {
++	raw, err := file.SyscallConn()
++	if err != nil {
++		return nil, err
++	}
++	writer := &eventWriter{raw: raw}
++	writer.callback = writer.signal
++	return writer, nil
++}
++
++func (w *eventWriter) signal(fd uintptr) {
++	for {
++		_, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, fd, uintptr(unsafe.Pointer(&eventfdSignal[0])), uintptr(len(eventfdSignal)))
++		if errno == unix.EINTR {
++			continue
++		}
++		if errno != 0 && errno != unix.EAGAIN {
++			w.err = errno
++		}
++		return
++	}
++}
++
++func (w *eventWriter) write() error {
++	// A consumer can rearm pending before an earlier Control call returns.
++	// Serialize the reusable callback result, including error paths.
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	w.err = nil
++	if err := w.raw.Control(w.callback); err != nil {
++		return err
++	}
++	return w.err
+ }
+ 
+ func newEventReader(file *os.File) (*eventReader, error) {
+@@ -192,7 +245,7 @@
+ 		}
+ 	}()
+ 	var err error
+-	b.wakeRaw, err = wake.SyscallConn()
++	b.wakeWriter, err = newEventWriter(wake)
+ 	if err != nil {
+ 		b.close()
+ 		return nil, err
+@@ -253,34 +306,18 @@
+ 	if atomic.SwapUint32(b.word(40), 1) != 0 {
+ 		return nil
+ 	}
+-	if b.wakeRaw == nil {
++	if b.wakeWriter == nil {
+ 		_, err := b.wake.Write(eventfdSignal[:])
+ 		if err != nil {
+ 			atomic.SwapUint32(b.word(40), 0)
+ 		}
+ 		return err
+ 	}
+-	var writeErr error
+-	err := b.wakeRaw.Control(func(fd uintptr) {
+-		for {
+-			_, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, fd, uintptr(unsafe.Pointer(&eventfdSignal[0])), uintptr(len(eventfdSignal)))
+-			if errno == unix.EINTR {
+-				continue
+-			}
+-			if errno != 0 && errno != unix.EAGAIN {
+-				writeErr = errno
+-			}
+-			break
+-		}
+-	})
++	err := b.wakeWriter.write()
+ 	if err != nil {
+ 		atomic.SwapUint32(b.word(40), 0)
+-		return err
+-	}
+-	if writeErr != nil {
+-		atomic.SwapUint32(b.word(40), 0)
+-	}
+-	return writeErr
++	}
++	return err
+ }
+ 
+ func (b *sharedBridge) close() error {
+@@ -321,7 +358,10 @@
+ 				owner.refs.Add(1)
+ 				offset := sharedRingBytes + (sharedPayloadSlots+slot)*sharedPayloadSize
+ 				f.data = owner.data[offset : offset+int(n) : offset+int(n)]
+-				f.storage = buf.FromBytesWithRelease(f.data, b.payloadRelease[slot])
++				payload := &b.payloadBuffers[slot]
++				payload.mu.Lock()
++				f.storage = payload.buffer.Reset(f.data, payload.release)
++				payload.mu.Unlock()
+ 			} else if f.kind == writableFrame && n == 1 && d[16] < byte(len(creditCounts)) {
+ 				f.data = creditCounts[d[16] : int(d[16])+1]
+ 			} else if n != 0 {
+diff --git a/transport/internet/xhysteria/shared_test.go b/transport/internet/xhysteria/shared_test.go
+--- a/transport/internet/xhysteria/shared_test.go
++++ b/transport/internet/xhysteria/shared_test.go
+@@ -9,10 +9,13 @@
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"runtime"
+ 	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"testing"
+ 	"time"
++	"unsafe"
+ 
+ 	"github.com/xtls/xray-core/common/buf"
+ 	xnet "github.com/xtls/xray-core/common/net"
+@@ -46,11 +49,103 @@
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	b.wakeRaw, err = b.wake.SyscallConn()
++	b.wakeWriter, err = newEventWriter(b.wake)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	return b
++}
++
++func TestSharedWakeupAllocationsAndErrorRearm(t *testing.T) {
++	b := testSharedBridge(t)
++	if n := testing.AllocsPerRun(100, func() {
++		atomic.StoreUint32(b.word(40), 0)
++		if err := b.notifyRust(); err != nil {
++			t.Fatal(err)
++		}
++	}); n != 0 {
++		t.Fatalf("eventfd notification allocated %.1f times", n)
++	}
++	b.wake.Close()
++	atomic.StoreUint32(b.word(40), 0)
++	if err := b.notifyRust(); err == nil {
++		t.Fatal("closed wake descriptor succeeded")
++	}
++	if atomic.LoadUint32(b.word(40)) != 0 {
++		t.Fatal("failed wake did not rearm pending")
++	}
++}
++
++func TestSharedConcurrentWakeupRearming(t *testing.T) {
++	b := testSharedBridge(t)
++	var workers sync.WaitGroup
++	for range 8 {
++		workers.Add(1)
++		go func() {
++			defer workers.Done()
++			for range 1000 {
++				atomic.StoreUint32(b.word(40), 0)
++				if err := b.notifyRust(); err != nil {
++					t.Error(err)
++					return
++				}
++			}
++		}()
++	}
++	workers.Wait()
++}
++
++func legacyEventSignal(raw syscall.RawConn) error {
++	var writeErr error
++	err := raw.Control(func(fd uintptr) {
++		for {
++			_, _, errno := syscall.RawSyscall(syscall.SYS_WRITE, fd, uintptr(unsafe.Pointer(&eventfdSignal[0])), uintptr(len(eventfdSignal)))
++			if errno == unix.EINTR {
++				continue
++			}
++			if errno != 0 && errno != unix.EAGAIN {
++				writeErr = errno
++			}
++			break
++		}
++	})
++	if err != nil {
++		return err
++	}
++	return writeErr
++}
++
++func BenchmarkEventSignal(b *testing.B) {
++	for _, cached := range []bool{false, true} {
++		name := "legacy"
++		if cached {
++			name = "reused"
++		}
++		b.Run(name, func(b *testing.B) {
++			fd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
++			if err != nil {
++				b.Fatal(err)
++			}
++			file := os.NewFile(uintptr(fd), "benchmark-eventfd")
++			defer file.Close()
++			writer, err := newEventWriter(file)
++			if err != nil {
++				b.Fatal(err)
++			}
++			b.ReportAllocs()
++			for b.Loop() {
++				var err error
++				if cached {
++					err = writer.write()
++				} else {
++					err = legacyEventSignal(writer.raw)
++				}
++				if err != nil {
++					b.Fatal(err)
++				}
++			}
++		})
++	}
+ }
+ 
+ func TestSharedBridgeBatchWraparoundAndWakeups(t *testing.T) {
+@@ -497,6 +592,74 @@
+ 	}
+ }
+ 
++func TestSharedPayloadMetadataReuseAllocatesNothing(t *testing.T) {
++	b := testSharedBridge(t)
++	var first *buf.Buffer
++	if n := testing.AllocsPerRun(100, func() {
++		head := atomic.LoadUint32(b.word(192))
++		atomic.AndUint32(b.word(60), ^uint32(1))
++		d := b.data[sharedHeader+sharedCapacity*sharedStride+int(head&(sharedCapacity-1))*sharedStride:]
++		binary.LittleEndian.PutUint32(d, uint32(dataFrame)|sharedPayloadFlag)
++		binary.LittleEndian.PutUint32(d[4:], 1)
++		b.data[sharedRingBytes+sharedPayloadSlots*sharedPayloadSize] = byte(head)
++		atomic.StoreUint32(b.word(192), head+1)
++		f, err := b.read()
++		if err != nil || f.storage == nil || f.data[0] != byte(head) {
++			t.Fatal("reused payload changed")
++		}
++		if first == nil {
++			first = f.storage
++		} else if f.storage != first {
++			t.Fatal("slot metadata was replaced")
++		}
++		f.release()
++	}); n != 0 {
++		t.Fatalf("reused payload allocated %.1f times", n)
++	}
++	if b.owner.refs.Load() != 1 || atomic.LoadUint32(b.word(60)) != (1<<sharedPayloadSlots)-1 {
++		t.Fatal("payload metadata reuse retained an owner or slot")
++	}
++}
++
++func TestSharedPayloadMetadataConcurrentReuse(t *testing.T) {
++	b := testSharedBridge(t)
++	const count = 2000
++	var producer sync.WaitGroup
++	producer.Go(func() {
++		for head := uint32(0); head < count; head++ {
++			for atomic.LoadUint32(b.word(60))&1 == 0 {
++				if atomic.LoadUint32(b.word(32)) != 0 {
++					return
++				}
++				runtime.Gosched()
++			}
++			atomic.AndUint32(b.word(60), ^uint32(1))
++			d := b.data[sharedHeader+sharedCapacity*sharedStride+int(head&(sharedCapacity-1))*sharedStride:]
++			binary.LittleEndian.PutUint32(d, uint32(datagramFrame)|sharedPayloadFlag)
++			binary.LittleEndian.PutUint32(d[4:], 1)
++			b.data[sharedRingBytes+sharedPayloadSlots*sharedPayloadSize] = byte(head)
++			atomic.StoreUint32(b.word(192), head+1)
++			if _, err := b.notify.Write(eventfdSignal[:]); err != nil {
++				t.Error(err)
++				return
++			}
++		}
++	})
++	target := xnet.UDPDestination(xnet.LocalHostIP, 53)
++	for head := uint32(0); head < count; head++ {
++		f, err := b.read()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if f.data[0] != byte(head) || f.storage.UDP != nil {
++			t.Fatal("reused payload or UDP metadata changed")
++		}
++		f.storage.UDP = &target
++		f.release()
++	}
++	producer.Wait()
++}
++
+ func TestSharedBorrowedWriteAndVectoredPartsCopyOnlyIntoDestination(t *testing.T) {
+ 	bridge := testSharedBridge(t)
+ 	engine := &Engine{bridge: bridge, done: make(chan struct{}), out: make(chan frame, 16), flows: make(map[uint64]*Conn)}
+diff --git a/common/buf/reusable.go b/common/buf/reusable.go
+new file mode 100644
+--- /dev/null
++++ b/common/buf/reusable.go
+@@ -0,0 +1,21 @@
++package buf
++
++// ReusableBuffer stores one owned buffer's metadata. Reset is valid only after
++// the previous buffer has been released. The caller synchronizes reuse with
++// the release callback; a released Buffer pointer must no longer be used.
++type ReusableBuffer struct {
++	buffer Buffer
++	owner  ownership
++}
++
++func (r *ReusableBuffer) Reset(data []byte, release func()) *Buffer {
++	if release == nil {
++		panic("nil buffer release callback")
++	}
++	if r.buffer.v != nil || r.buffer.ownership != nil {
++		panic("reusing a live buffer")
++	}
++	r.owner.release = release
++	r.buffer = Buffer{v: data, end: int32(len(data)), ownership: &r.owner}
++	return &r.buffer
++}
+diff --git a/common/buf/reusable_test.go b/common/buf/reusable_test.go
+new file mode 100644
+--- /dev/null
++++ b/common/buf/reusable_test.go
+@@ -0,0 +1,85 @@
++package buf_test
++
++import (
++	"testing"
++
++	"github.com/xtls/xray-core/common/buf"
++	"github.com/xtls/xray-core/common/net"
++)
++
++func TestReusableBufferTransfersMetadataOnlyAfterRelease(t *testing.T) {
++	var reusable buf.ReusableBuffer
++	var released int
++	data := []byte("borrowed data")
++	first := reusable.Reset(data, func() { released++ })
++	first.Advance(9)
++	if string(first.Bytes()) != "data" || &first.Bytes()[0] != &data[9] {
++		t.Fatal("reusable buffer copied or changed its payload")
++	}
++	first.Release()
++	first.Release()
++	if released != 1 {
++		t.Fatalf("release count=%d", released)
++	}
++	second := reusable.Reset(nil, func() { released++ })
++	if second != first || !second.IsEmpty() {
++		t.Fatal("metadata was not reused")
++	}
++	second.Release()
++	if released != 2 {
++		t.Fatalf("empty release count=%d", released)
++	}
++}
++
++func TestReusableBufferCanRebindFromReleaseCallback(t *testing.T) {
++	var reusable buf.ReusableBuffer
++	var next *buf.Buffer
++	destination := net.UDPDestination(net.LocalHostIP, 53)
++	first := reusable.Reset([]byte("old"), func() {
++		next = reusable.Reset([]byte("new"), func() {})
++		next.UDP = &destination
++	})
++	first.Release()
++	if next != first || string(next.Bytes()) != "new" || next.UDP != &destination {
++		t.Fatal("release modified metadata after returning ownership")
++	}
++	next.Release()
++}
++
++func TestReusableBufferRejectsLiveReuse(t *testing.T) {
++	var reusable buf.ReusableBuffer
++	first := reusable.Reset(nil, func() {})
++	defer first.Release()
++	defer func() {
++		if recover() == nil {
++			t.Fatal("live empty buffer was rebound")
++		}
++	}()
++	reusable.Reset([]byte("replacement"), func() {})
++}
++
++func BenchmarkOwnedBufferMetadata(b *testing.B) {
++	for _, reuse := range []bool{false, true} {
++		name := "allocate"
++		if reuse {
++			name = "reuse"
++		}
++		b.Run(name, func(b *testing.B) {
++			data := make([]byte, 16384)
++			release := func() {}
++			frames := make(chan *buf.Buffer, 1)
++			var reusable buf.ReusableBuffer
++			b.ReportAllocs()
++			for b.Loop() {
++				var frame *buf.Buffer
++				if reuse {
++					frame = reusable.Reset(data, release)
++				} else {
++					frame = buf.FromBytesWithRelease(data, release)
++				}
++				frames <- frame
++				(<-frames).Release()
++			}
++		})
++	}
++}

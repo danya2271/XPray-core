@@ -365,6 +365,68 @@ func TestQueuedEngineSendAllocatesTimerOnlyWhenBlocked(t *testing.T) {
 	}
 }
 
+func TestQueuedConnSendAllocatesTimerOnlyWhenBlocked(t *testing.T) {
+	e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+	c := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)
+	c.SetWriteDeadline(time.Now().Add(time.Minute))
+	message := frame{kind: dataFrame, id: c.id, data: []byte("queued")}
+	if n := testing.AllocsPerRun(100, func() {
+		if err := c.sendFrame(message); err != nil {
+			t.Fatal(err)
+		}
+		<-e.out
+		e.queued.Add(-1)
+	}); n != 0 {
+		t.Fatalf("available queue allocated %.1f times", n)
+	}
+	c.SetWriteDeadline(time.Now().Add(-time.Second))
+	if err := c.sendFrame(message); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired send: %v", err)
+	}
+	if len(e.out) != 0 || e.queued.Load() != 0 {
+		t.Fatal("expired send changed queue reservations")
+	}
+	e.out <- message
+	c.SetWriteDeadline(time.Now().Add(5 * time.Millisecond))
+	if err := c.sendFrame(message); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("full queue deadline: %v", err)
+	}
+	if len(e.out) != 1 || e.queued.Load() != 0 {
+		t.Fatal("timed-out connection send leaked a reservation")
+	}
+	<-e.out
+	c.SetWriteDeadline(time.Now().Add(time.Minute))
+	c.fail(net.ErrClosed)
+	if err := c.sendFrame(message); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed connection send: %v", err)
+	}
+}
+
+func BenchmarkConnQueuedSend(b *testing.B) {
+	for _, deadline := range []bool{false, true} {
+		name := "no_deadline"
+		if deadline {
+			name = "future_deadline"
+		}
+		b.Run(name, func(b *testing.B) {
+			e := &Engine{done: make(chan struct{}), out: make(chan frame, 1)}
+			c := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)
+			if deadline {
+				c.SetWriteDeadline(time.Now().Add(time.Hour))
+			}
+			message := frame{kind: dataFrame, id: c.id, data: creditCounts[1:2]}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := c.sendFrame(message); err != nil {
+					b.Fatal(err)
+				}
+				<-e.out
+				e.queued.Add(-1)
+			}
+		})
+	}
+}
+
 func TestFlowReadCacheDropsClosedConnectionBeforeIDReuse(t *testing.T) {
 	e := &Engine{done: make(chan struct{}), flows: make(map[uint64]*Conn)}
 	old := newConn(e, 7, xnet.Destination{Network: xnet.Network_TCP}, nil)

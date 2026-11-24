@@ -3219,3 +3219,52 @@ with mixed macro results explicitly retained. Methods,56Rust/28Go micros,
 240transport/6capacity samples,hashes and reproduction:
 [bridge fastpaths report](../../docs/hysteria-bridge-fastpaths-performance.md).
 Ignored artifacts: `build_assets/bridge-fastpaths-20261124/`.
+
+## Per-frame publication, credits and metadata work (2026-11-24)
+
+Queued Conn sends avoid deadline timers while the writer queue is available.
+The eventfd writer reuses its protected callback. Shared Rust DATA publication
+groups up to four already-ready frames under one credit acquisition, lock and
+head publication, without waiting to fill a group. TCP receive arrays hold
+16 rather than eight ready Bytes descriptors. Go reuses one buffer-metadata
+entry per payload slot with a ready CAS/store; release completes Go metadata
+before returning the native slot. The earlier per-slot mutex variant is
+superseded, with its complete evidence preserved.
+
+Future-deadline queued sends:776.20→316.70ns,3→0allocations.
+Eventfd callback:195.10→160.00ns,2→0allocations.
+Escaped metadata:122.70→61.66ns,1→0allocations;this micro excludes ready-state
+synchronization. Native groups2/4 save5.85/8.48%;the micro does not rearm
+the eventfd pending flag and is not measured syscall-saving evidence.
+Arena copies remain;ABI6,ring/slot counts,flow credits,byte budgets,workers,
+Tokio7/7 and SeqCst wakeup handshakes stay unchanged. The receive-descriptor
+workspace does grow;not all memory bounds are unchanged.
+
+Accepted for deterministic per-frame work reduction,with mixed macro results.
+One-core pacedp994554→3581µs;two-core1769→1828 worsens.
+All9one-core upload pairs:median183.32→183.92MB/s,mean165.98→166.76,
+slow4/9per revision. Its packetization/scheduling trigger remains unresolved.
+All9two-core duplex pairs:319.84→322.04MB/s,p9943734→47977µs.
+All7eight-core duplex pairs:731.82→703.11MB/s,CPU1049.94→1087.12µs/op,
+p9920876→23371µs. Keep the initial regressions,not just later rechecks.
+Managed1/2core transfer254.34→257.93 /458.14→466.58MB/s.
+1000session peakRSS219.50→222.40MiB,heartbeatp993795→3938.8µs;
+no intrinsic RSS reduction or universal transport improvement established.
+
+137release/137debug Rust tests,releaseClippy-Dwarnings,fresh6package native Go
+race tests,functional/HTTP/mask/100msRTT,third-party shared/socket streams,
+strictUDP8000/8000 and saturatedUDP6000/6000per budget,retained/saturated-drain,
+6capacity observations and Androidarm64/API26 build pass. A separate supervisor
+fix recognizesESRCH during proc-stat races;the original lost-ACK test failure
+is retained along with20focused regression groups and passing full race tests.
+No device/WAN/new15minute-soak/full-repository-green/deployment claim.
+
+All192final/recheck+20mutex-isolation+51historical-screening transport samples,
+6capacity,98micro and24instrumented diagnostic observations,exact-source
+hashes,validation and reproduction:
+[per-frame work report](../../docs/hysteria-bridge-work-performance.md).
+Ignored artifacts:`build_assets/bridge-work-atomic-20261124/`.
+
+Publication retains each branch's regular Go buffer size:android4KiB,
+server branches8KiB. Numeric evidence describes the measured android workspace,
+not a repeated server-branch A/B with its different regular-buffer setting.
